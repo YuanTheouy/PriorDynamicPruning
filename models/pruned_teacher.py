@@ -38,17 +38,15 @@ class PrunedTeacherWrapper(nn.Module):
         batch_size, seq_length = input_ids.shape
         
         # 2. Position Embeddings (RoPE) and Attention Mask
-        # Qwen2 and Llama use Rotary Embeddings, which are usually computed inside the model
-        # and passed to layers as `position_embeddings` (cos, sin) tuple.
-        # If we just call layer(hidden_states, attention_mask=...), it might fail if it expects position_embeddings.
-        
-        # We need to replicate the preparation logic from the base model's forward.
-        # This includes:
-        # - Creating the extended attention mask
-        # - Computing rotary embeddings (cos, sin)
         
         # --- Handle Attention Mask ---
-        # Try to use internal helper if available
+        # The error indicates that Qwen2's scaled_dot_product_attention expects float/bool mask, but got long.
+        # This usually happens when we pass the raw padding mask (0/1 long) directly to SDPA,
+        # instead of the prepared 4D mask (float with -inf) or boolean mask.
+        
+        # `_prepare_decoder_attention_mask` usually returns a 4D float mask (batch, 1, tgt_len, src_len)
+        # suited for adding to attention scores (0.0 for keep, min_dtype for mask).
+        
         extended_attention_mask = None
         if hasattr(base_model, "_prepare_decoder_attention_mask"):
              extended_attention_mask = base_model._prepare_decoder_attention_mask(
@@ -58,8 +56,15 @@ class PrunedTeacherWrapper(nn.Module):
                  0 # past_key_values_length
              )
         else:
-            # Fallback or simple mask (might be insufficient for some models)
-            extended_attention_mask = attention_mask
+            # Fallback: Convert to boolean if it's a padding mask (1 for keep, 0 for ignore)
+            # Or ensure it's float if it's an additive mask.
+            # SDPA usually prefers boolean mask for padding: True to IGNORE (pytorch < 2.0) or True to KEEP?
+            # PyTorch SDPA: "attn_mask: boolean mask where a value of True indicates that the element should take part in attention."
+            # Our `attention_mask` is 1 for keep, 0 for ignore. So (attention_mask > 0.5) works.
+            # But wait, the error says "got attn_mask.dtype: long int".
+            
+            # If we don't have `_prepare_decoder_attention_mask`, let's try to make it boolean.
+            extended_attention_mask = (attention_mask > 0)
 
         # --- Handle Position Embeddings (RoPE) ---
         position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
@@ -85,17 +90,6 @@ class PrunedTeacherWrapper(nn.Module):
             # mask_i: [batch, 1, 1] for broadcasting
             mask_i = layer_mask[:, i].view(batch_size, 1, 1)
             
-            # Prepare arguments for layer forward
-            # Different models have different signatures.
-            # Qwen2/Llama: (hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs)
-            # OR (hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, cache_position=None, position_embeddings=None)
-            
-            # The error `TypeError: cannot unpack non-iterable NoneType object` at `cos, sin = position_embeddings`
-            # suggests that `position_embeddings` was passed as None, or it wasn't passed and the layer tried to compute/unpack it but failed.
-            
-            # Let's try to pass arguments as kwargs to be safe, or explicit if we know them.
-            # For Qwen2/Llama, passing `position_embeddings` explicitly is often required if not computed inside layer.
-            
             layer_kwargs = {
                 "attention_mask": extended_attention_mask,
                 "position_ids": position_ids,
@@ -108,9 +102,7 @@ class PrunedTeacherWrapper(nn.Module):
             try:
                 layer_outputs = layer(hidden_states, **layer_kwargs)
             except TypeError:
-                # Fallback: maybe it doesn't accept position_embeddings directly?
-                # Or maybe it expects it as positional args?
-                # Let's try minimal args
+                # Fallback
                  layer_outputs = layer(
                     hidden_states,
                     attention_mask=extended_attention_mask,
@@ -121,7 +113,6 @@ class PrunedTeacherWrapper(nn.Module):
             new_hidden_states = layer_outputs[0]
             
             # Soft Mixing for Differentiable Pruning (Simulation)
-            # If mask_i is 1, keep new; if 0, keep old (skip)
             hidden_states = mask_i * new_hidden_states + (1 - mask_i) * hidden_states
             
         # 4. Final Norm

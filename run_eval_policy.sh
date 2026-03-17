@@ -16,7 +16,7 @@ TOP_K_ITEMS=50
 OUTPUT_FILE="./results/${CATEGORY}/policy_joint_result.json"
 
 # Check if user passed --unfrozen argument
-UNFROZEN_MODE=false
+UNFROZEN_MODE=true
 for arg in "$@"
 do
     if [ "$arg" == "--unfrozen" ]; then

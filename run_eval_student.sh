@@ -116,14 +116,6 @@ import json
 import math
 import glob
 
-files = glob.glob('$temp_dir/*.json')
-all_preds = []
-for f in files:
-    with open(f, 'r') as file:
-        data = json.load(file)
-        all_preds.extend(data.get('sample_predictions', []))
-
-# We need the ground truth to calculate HR/NDCG. We will just re-evaluate all_preds against the full test_file
 import pandas as pd
 test_df = pd.read_csv('$test_file')
 if 'dedup' in test_df.columns:
@@ -139,6 +131,22 @@ else:
     # Assuming the last column is target if named 'target' or similar, 
     # but based on provided CSV snippet, 'item_sid' seems correct.
     ground_truths = test_df.iloc[:, -1].tolist()
+
+files = glob.glob('$temp_dir/*.json')
+# We need to sort files to ensure order matches ground_truths if order is preserved
+# But parallel execution might scramble file order vs split order.
+# The safest way is to read the 'merge.py' output which is sorted and merged correctly!
+# Or, simply read the predictions in the order of file indices: 0.json, 1.json, ... 7.json
+
+all_preds = []
+# Sort files by numeric index (0.json, 1.json, ...)
+files = sorted(files, key=lambda x: int(x.split('/')[-1].split('.')[0]))
+
+for f in files:
+    with open(f, 'r') as file:
+        data = json.load(file)
+        all_preds.extend(data.get('sample_predictions', []))
+
 
 
 valid_topk = [1, 3, 5, 10, 20, 50]

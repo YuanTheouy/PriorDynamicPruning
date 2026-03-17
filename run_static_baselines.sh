@@ -11,6 +11,31 @@ TOP_K_ITEMS=50
 BASE_OUTPUT_DIR="./results/${CATEGORY}/static_baselines"
 mkdir -p "$BASE_OUTPUT_DIR"
 
+# Parse arguments to select strategies
+# Available strategies: uniform, first_k, last_k, ends_heavy, middle_heavy
+STRATEGIES_TO_RUN=()
+
+# If no arguments provided, run all
+if [ "$#" -eq 0 ]; then
+    STRATEGIES_TO_RUN=("uniform" "first_k" "last_k" "ends_heavy" "middle_heavy")
+    echo "No strategies specified. Will run all 5 baselines."
+else
+    # Parse provided strategies
+    for arg in "$@"; do
+        if [[ "$arg" == "uniform" || "$arg" == "first_k" || "$arg" == "last_k" || "$arg" == "ends_heavy" || "$arg" == "middle_heavy" ]]; then
+            STRATEGIES_TO_RUN+=("$arg")
+        else
+            echo "⚠️ Warning: Unknown strategy '$arg'. Ignoring."
+            echo "Valid strategies: uniform, first_k, last_k, ends_heavy, middle_heavy"
+        fi
+    done
+fi
+
+if [ ${#STRATEGIES_TO_RUN[@]} -eq 0 ]; then
+    echo "❌ Error: No valid strategies selected to run."
+    exit 1
+fi
+
 # Check dependencies
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "❌ Error: Teacher model path does not exist: $MODEL_PATH"
@@ -28,6 +53,7 @@ fi
 echo "Test File: $test_file"
 echo "Info File: $info_file"
 echo "Top-K Layers: $TOP_K_LAYERS"
+echo "Strategies to run: ${STRATEGIES_TO_RUN[*]}"
 echo "--------------------------------------------------------"
 
 # Function to run a single baseline strategy
@@ -106,11 +132,9 @@ print(f'[${STRATEGY}] HR:   {[round(x, 4) for x in hr]}')
 "
 }
 
-# Run all requested baselines
-run_baseline "uniform"       # 均匀保留
-run_baseline "first_k"       # 保前层
-run_baseline "last_k"        # 保后层
-run_baseline "ends_heavy"    # 保两头（前+后）
-run_baseline "middle_heavy"  # 保中间
+# Run selected baselines
+for strategy in "${STRATEGIES_TO_RUN[@]}"; do
+    run_baseline "$strategy"
+done
 
-echo "=== All Baselines Completed! ==="
+echo "=== All Selected Baselines Completed! ==="

@@ -159,6 +159,7 @@ for index, sample_preds in enumerate(all_preds):
             ALLHR[i] += 1
             
 num_samples = len(all_preds)
+print(f'\n=== Final Aggregated Results (Epoch: {EPOCH}) ===')
 print(f'Evaluated on {num_samples} samples.')
 print(f'TopK: {valid_topk}')
 

@@ -340,7 +340,8 @@ def main():
                 all_predictions.append(sample_preds)
 
     # 5. Evaluate Metrics (Full 3-token sequence)
-    print("\n--- Full 3-Token Sequence Evaluation ---")
+    ckpt_name = os.path.basename(args.student_ckpt)
+    print(f"\n--- Full 3-Token Sequence Evaluation (Ckpt: {ckpt_name}) ---")
     topk_list = [1, 3, 5, 10, 20, 50]
     valid_topk = [k for k in topk_list if k <= args.top_k]
     ALLNDCG = [0.0] * len(valid_topk)

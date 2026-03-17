@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import argparse
 from tqdm import tqdm
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 from models.one_layer_student import OneLayerStudentModel
 from models.router import LayerRouter
@@ -50,7 +51,9 @@ def main():
     args = parser.parse_args()
 
     # Initialize Accelerator
-    accelerator = Accelerator()
+    # Fix unused parameters error in DDP
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     
     if accelerator.is_main_process:

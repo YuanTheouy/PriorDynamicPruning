@@ -97,19 +97,10 @@ output_dir="./results/student_eval"
 mkdir -p "$output_dir"
 final_output="$output_dir/student_result_${CATEGORY}_epoch${EPOCH}.json"
 
-actual_cuda_list=$(ls "$temp_dir"/*.json 2>/dev/null | sed 's/.*\///g' | sed 's/\.json//g' | tr '\n' ',' | sed 's/,$//')
+# We skip merge.py because it doesn't handle the dict format of eval_student.py output.
+# The aggregation is done in the inline python script below.
 
-python ./merge.py \
-    --input_path "$temp_dir" \
-    --output_path "$final_output" \
-    --cuda_list "$actual_cuda_list"
-
-# We don't need step 4 (calc.py) here because eval_student.py already computes and prints the metrics internally for the merged dataset.
-# Wait, actually eval_student.py computes metrics for its chunk. If we run it in parallel, each GPU prints its own metrics.
-# To get the global metrics, we should modify the merging script or just rely on a separate script.
-# Since eval_student.py saves the predictions in a specific format, we need a small script to aggregate them, or we can just let calc.py handle it if we format it right.
-
-# Let's write a quick inline python script to aggregate the JSON metrics from all parts
+# 4. Aggregate Metrics
 echo ">>> [4/4] Aggregating final metrics..."
 python -c "
 import json

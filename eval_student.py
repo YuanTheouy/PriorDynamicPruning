@@ -84,6 +84,14 @@ def main():
 
     for key in hash_dict.keys():
         hash_dict[key] = list(hash_dict[key])
+        
+    # Identify the common prefix key for Step 1
+    # We assume all items share the same prefix structure "### Response:\n"
+    first_ID = prefixID[0]
+    prefix_key = get_hash(first_ID[:prefix_index])
+    valid_start_globals = hash_dict.get(prefix_key, [])
+    valid_start_locals = [global2local_sid[g] for g in valid_start_globals if g in global2local_sid]
+    print(f"Constraining Step 1 to {len(valid_start_locals)} valid start tokens (Key: {prefix_key})")
 
     # 2. Load Student Model
     print(f"Loading Student Model from {args.student_ckpt}...")
@@ -174,10 +182,18 @@ def main():
                 
                 # We'll just take the top 50 valid local tokens
                 b_log_probs = log_probs[b]
+                
+                # Apply constraints for Step 1
+                mask = torch.full_like(b_log_probs, float('-inf'))
+                if valid_start_locals:
+                    mask[valid_start_locals] = 0
+                b_log_probs = b_log_probs + mask
+                
                 topk_vals, topk_indices = torch.topk(b_log_probs, args.top_k, dim=-1)
                 
                 candidates = []
                 for k in range(args.top_k):
+                    if topk_vals[k] == float('-inf'): continue # Skip invalid paths
                     local_idx = topk_indices[k].item()
                     global_id = local2global_sid[local_idx]
                     candidates.append({"tokens": [global_id], "score": topk_vals[k].item()})
@@ -364,7 +380,7 @@ def main():
                 "full_sequence_ndcg": ndcg_res,
                 "full_sequence_hr": hr_res
             },
-            "sample_predictions": all_predictions[:10] # Save a few for inspection
+            "sample_predictions": all_predictions  # Save all predictions for aggregation
         }, f, indent=4)
         
     print(f"Results saved to {args.output_file}")

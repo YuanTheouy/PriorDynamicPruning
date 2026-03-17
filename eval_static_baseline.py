@@ -125,7 +125,8 @@ def main():
 
     # 4. Construct Static Mask
     static_mask_cpu = get_static_mask(args.strategy, num_layers, args.top_k_layers)
-    static_mask = static_mask_cpu.to(device).unsqueeze(0) # [1, num_layers]
+    # Ensure static mask has correct dtype (BFloat16) to match model
+    static_mask = static_mask_cpu.to(dtype=torch.bfloat16).to(device).unsqueeze(0) # [1, num_layers]
     
     if accelerator.is_main_process:
         print(f"Static Mask: {static_mask_cpu.tolist()}")

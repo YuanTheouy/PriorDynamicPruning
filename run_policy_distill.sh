@@ -3,7 +3,7 @@
 # ================= Configuration =================
 
 # 🔴 Option 1: Office Products
-MODEL_PATH="/workspace/ckpts/MiniOneRec/Office_ckpt_unfrozon"
+MODEL_PATH="/workspace/ckpts/MiniOneRec/Office_ckpt"
 CATEGORY="Office_Products"
 
 # 🔴 Option 2: Industrial and Scientific (Uncomment to use)
@@ -21,7 +21,7 @@ TEMPERATURE=1.0
 TOP_K_LAYERS=12
 
 # Output Directory
-OUTPUT_DIR="./policy_ckpts/${CATEGORY}"
+OUTPUT_DIR="./policy_ckpts/unfrozon/${CATEGORY}"
 
 # =================================================
 

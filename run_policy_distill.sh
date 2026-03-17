@@ -74,9 +74,11 @@ echo "Info File: $info_file"
 echo "Student Checkpoint: $latest_student_ckpt"
 echo "Output Directory: $OUTPUT_DIR"
 echo "Target Layers: $TOP_K_LAYERS"
+echo "Strategy: Training Policy Router AND Fine-tuning Student Encoder"
 echo "--------------------------------------------------------"
 
 # Run the policy distillation script using accelerate for multi-GPU
+# Added --train_student flag to enable joint training
 accelerate launch --num_processes $NUM_GPUS ./train_policy_distill.py \
     --teacher_model "$MODEL_PATH" \
     --student_ckpt "$latest_student_ckpt" \
@@ -88,6 +90,7 @@ accelerate launch --num_processes $NUM_GPUS ./train_policy_distill.py \
     --lr $LEARNING_RATE \
     --temperature $TEMPERATURE \
     --top_k_layers $TOP_K_LAYERS \
-    --output_dir "$OUTPUT_DIR"
+    --output_dir "$OUTPUT_DIR" \
+    --train_student
 
 echo "=== Policy Distillation Completed! Checkpoints saved to $OUTPUT_DIR ==="

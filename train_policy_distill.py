@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k_layers", type=int, default=12, help="Number of layers to keep in Teacher")
     parser.add_argument("--output_dir", type=str, default="./policy_ckpts")
+    parser.add_argument("--train_student", action="store_true", help="Whether to unfreeze and train the student model")
     args = parser.parse_args()
 
     # Initialize Accelerator
@@ -54,6 +55,10 @@ def main():
     
     if accelerator.is_main_process:
         print(f"Using device: {device}, Total processes: {accelerator.num_processes}")
+        if args.train_student:
+            print("🚀 Training Strategy: Jointly training Student Encoder + Policy Router")
+        else:
+            print("🧊 Training Strategy: Frozen Student Encoder, Training Policy Router Only")
 
     # 1. Prepare Tokenizer & SID Vocab
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
@@ -113,7 +118,7 @@ def main():
     if accelerator.is_main_process:
         print(f"Teacher has {num_layers} layers. Target Top-K: {args.top_k_layers}")
 
-    # 4. Load Student (Frozen)
+    # 4. Load Student
     if accelerator.is_main_process:
         print("Loading Student model...")
     student = OneLayerStudentModel(args.teacher_model, sid_token_ids)
@@ -126,10 +131,23 @@ def main():
         student.load_state_dict(checkpoint)
         
     student.to(torch.bfloat16)
-    student.eval()
     student.to(device)
-    for param in student.parameters():
-        param.requires_grad = False
+    
+    if args.train_student:
+        student.train()
+        # Unfreeze student parameters (backbone)
+        # Assuming backbone is the main part we want to fine-tune
+        for param in student.backbone.parameters():
+            param.requires_grad = True
+        # Keep embeddings frozen? Usually yes to align with teacher, but here we can unfreeze if needed.
+        # Let's unfreeze backbone layers. Embeddings might be shared/frozen.
+        # For simplicity, unfreeze everything except maybe embeddings if they were tied.
+        # User request: "transformer and mlp together unfreeze".
+        # So we allow gradients on student.
+    else:
+        student.eval()
+        for param in student.parameters():
+            param.requires_grad = False
 
     # 5. Initialize Router (Policy Network)
     # Input size is hidden size of student
@@ -139,12 +157,20 @@ def main():
     router.to(device)
     router.train()
 
-    # Optimizer - Only optimize Router
-    optimizer = torch.optim.AdamW(router.parameters(), lr=args.lr)
+    # Optimizer
+    # If training student, include its parameters
+    if args.train_student:
+        params_to_optimize = list(router.parameters()) + list(student.parameters())
+    else:
+        params_to_optimize = list(router.parameters())
+        
+    optimizer = torch.optim.AdamW(params_to_optimize, lr=args.lr)
 
     # Prepare with Accelerate
-    # We don't prepare teacher or student as they are frozen/eval
-    router, optimizer, dataloader = accelerator.prepare(router, optimizer, dataloader)
+    if args.train_student:
+        router, student, optimizer, dataloader = accelerator.prepare(router, student, optimizer, dataloader)
+    else:
+        router, optimizer, dataloader = accelerator.prepare(router, optimizer, dataloader)
 
     # 6. Training Loop
     if accelerator.is_main_process:
@@ -169,28 +195,18 @@ def main():
                 continue
 
             # --- 1. Get Student State ---
-            with torch.no_grad():
+            # If training student, we need gradients
+            if args.train_student:
                 student_outputs = student(input_ids=input_ids, attention_mask=attention_mask)
-                last_hidden_state = student_outputs["last_hidden_state"]
-                
-                # Use the state of the LAST token in the sequence (or prompt end)
-                # Here we use the last token of the input sequence
-                # shape: [batch, hidden_size]
-                # Note: input_ids includes prompt + target?
-                # In SFTDataset, input_ids is full sequence.
-                # However, for routing, we want to route based on the context.
-                # Since we use Sequence-level mask, we can use the representation of the last token.
-                # Or pooling. Let's stick to last token as discussed.
-                
-                # To get the true last token (ignoring padding), we use attention_mask
-                # last_indices = attention_mask.sum(dim=1) - 1
-                # state = last_hidden_state[torch.arange(batch_size), last_indices]
-                
-                # Simpler approximation if left-padded or right-padded correctly:
-                # If right-padded (standard), last non-pad token.
-                # If we assume `input_ids` are right-padded (collator does that).
-                last_indices = attention_mask.sum(dim=1) - 1
-                state = last_hidden_state[torch.arange(input_ids.size(0), device=device), last_indices]
+            else:
+                with torch.no_grad():
+                    student_outputs = student(input_ids=input_ids, attention_mask=attention_mask)
+            
+            last_hidden_state = student_outputs["last_hidden_state"]
+            
+            # Use the state of the LAST token in the sequence
+            last_indices = attention_mask.sum(dim=1) - 1
+            state = last_hidden_state[torch.arange(input_ids.size(0), device=device), last_indices]
 
             # --- 2. Router Forward ---
             # mask: [batch, num_layers]
@@ -244,8 +260,17 @@ def main():
             # Save Checkpoint
             save_path = os.path.join(args.output_dir, f"policy_epoch_{epoch+1}.pt")
             unwrapped_router = accelerator.unwrap_model(router)
+            
+            # Save Policy
             torch.save(unwrapped_router.state_dict(), save_path)
             print(f"Saved policy checkpoint to {save_path}")
+            
+            # If we trained student, we should save it too!
+            if args.train_student:
+                student_save_path = os.path.join(args.output_dir, f"finetuned_student_epoch_{epoch+1}.pt")
+                unwrapped_student = accelerator.unwrap_model(student)
+                torch.save(unwrapped_student.state_dict(), student_save_path)
+                print(f"Saved fine-tuned student to {student_save_path}")
 
 if __name__ == "__main__":
     main()

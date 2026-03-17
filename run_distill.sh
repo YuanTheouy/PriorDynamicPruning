@@ -15,7 +15,7 @@ NUM_GPUS=8
 
 # Training Hyperparameters
 BATCH_SIZE=8 # This will be per-GPU batch size
-EPOCHS=3
+EPOCHS=20
 LEARNING_RATE=5e-5
 TEMPERATURE=1.0
 

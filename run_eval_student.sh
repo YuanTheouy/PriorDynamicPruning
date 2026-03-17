@@ -14,21 +14,24 @@ CATEGORY="Office_Products"
 EPOCH=3
 STUDENT_CKPT="./student_ckpts/${CATEGORY}/student_epoch_${EPOCH}.pt"
 
-# GPU to use for evaluation (single GPU is usually enough for inference)
-GPU_ID=0
+# GPU Settings
+# Number of GPUs for parallel evaluation
+NUM_GPUS=8
 
 # Evaluation Hyperparameters
 BATCH_SIZE=32
 TOP_K=50
-OUTPUT_FILE="./results/student_${CATEGORY}_epoch${EPOCH}_eval.json"
 
 # =================================================
+
+CUDA_LIST=$(seq -s, 0 $(($NUM_GPUS - 1)))
+CUDA_SPACE_LIST=$(seq -s " " 0 $(($NUM_GPUS - 1)))
 
 echo "=== Starting Student Model Evaluation ==="
 echo "Teacher Model (for Tokenizer): $TEACHER_MODEL_PATH"
 echo "Student Checkpoint: $STUDENT_CKPT"
 echo "Category: $CATEGORY"
-echo "Using GPU: $GPU_ID"
+echo "Using $NUM_GPUS GPUs"
 
 # Check if teacher model exists
 if [[ ! -d "$TEACHER_MODEL_PATH" ]]; then
@@ -58,18 +61,113 @@ fi
 
 echo "Test File: $test_file"
 echo "Info File: $info_file"
-echo "Output File: $OUTPUT_FILE"
 echo "--------------------------------------------------------"
 
-# Run the evaluation script
-CUDA_VISIBLE_DEVICES=$GPU_ID python -u ./eval_student.py \
-    --teacher_model "$TEACHER_MODEL_PATH" \
-    --student_ckpt "$STUDENT_CKPT" \
-    --test_file "$test_file" \
-    --info_file "$info_file" \
-    --category "$CATEGORY" \
-    --batch_size $BATCH_SIZE \
-    --top_k $TOP_K \
-    --output_file "$OUTPUT_FILE"
+exp_name_clean=$(basename "$TEACHER_MODEL_PATH")
+temp_dir="./temp_student_eval/${CATEGORY}-${exp_name_clean}_epoch${EPOCH}"
+mkdir -p "$temp_dir"
+
+# 1. Split Data
+echo ">>> [1/4] Splitting test data for $NUM_GPUS GPUs..."
+python ./split.py --input_path "$test_file" --output_path "$temp_dir" --cuda_list "$CUDA_LIST"
+
+# 2. Parallel Evaluation
+echo ">>> [2/4] Running Evaluation..."
+for i in $CUDA_SPACE_LIST
+do
+    echo "    Starting GPU $i ..."
+    CUDA_VISIBLE_DEVICES=$i python -u ./eval_student.py \
+        --teacher_model "$TEACHER_MODEL_PATH" \
+        --student_ckpt "$STUDENT_CKPT" \
+        --test_file "$temp_dir/${i}.csv" \
+        --info_file "$info_file" \
+        --category "$CATEGORY" \
+        --batch_size $BATCH_SIZE \
+        --top_k $TOP_K \
+        --output_file "$temp_dir/${i}.json" &
+done
+
+# Wait for all background processes
+wait
+echo ">>> All GPU inference completed"
+
+# 3. Merge Results
+echo ">>> [3/4] Merging results..."
+output_dir="./results/student_eval"
+mkdir -p "$output_dir"
+final_output="$output_dir/student_result_${CATEGORY}_epoch${EPOCH}.json"
+
+actual_cuda_list=$(ls "$temp_dir"/*.json 2>/dev/null | sed 's/.*\///g' | sed 's/\.json//g' | tr '\n' ',' | sed 's/,$//')
+
+python ./merge.py \
+    --input_path "$temp_dir" \
+    --output_path "$final_output" \
+    --cuda_list "$actual_cuda_list"
+
+# We don't need step 4 (calc.py) here because eval_student.py already computes and prints the metrics internally for the merged dataset.
+# Wait, actually eval_student.py computes metrics for its chunk. If we run it in parallel, each GPU prints its own metrics.
+# To get the global metrics, we should modify the merging script or just rely on a separate script.
+# Since eval_student.py saves the predictions in a specific format, we need a small script to aggregate them, or we can just let calc.py handle it if we format it right.
+
+# Let's write a quick inline python script to aggregate the JSON metrics from all parts
+echo ">>> [4/4] Aggregating final metrics..."
+python -c "
+import json
+import math
+import glob
+
+files = glob.glob('$temp_dir/*.json')
+all_preds = []
+for f in files:
+    with open(f, 'r') as file:
+        data = json.load(file)
+        all_preds.extend(data.get('sample_predictions', []))
+
+# We need the ground truth to calculate HR/NDCG. We will just re-evaluate all_preds against the full test_file
+import pandas as pd
+test_df = pd.read_csv('$test_file')
+if 'dedup' in test_df.columns:
+    test_df = test_df[test_df['dedup'] == 0]
+ground_truths = test_df['output'].tolist()
+
+valid_topk = [1, 3, 5, 10, 20, 50]
+ALLNDCG = [0.0] * len(valid_topk)
+ALLHR = [0.0] * len(valid_topk)
+
+for index, sample_preds in enumerate(all_preds):
+    target_item = ground_truths[index].strip(' \n\"')
+    
+    minID = 1000000
+    for i, pred_token_str in enumerate(sample_preds):
+        if pred_token_str == target_item:
+            minID = i
+            break
+            
+    for i, topk in enumerate(valid_topk):
+        if minID < topk:
+            ALLNDCG[i] += (1 / math.log(minID + 2))
+            ALLHR[i] += 1
+            
+num_samples = len(all_preds)
+print(f'Evaluated on {num_samples} samples.')
+print(f'TopK: {valid_topk}')
+
+ndcg_res = [val / num_samples / (1.0 / math.log(2)) for val in ALLNDCG]
+hr_res = [val / num_samples for val in ALLHR]
+
+print(f'Full-Sequence NDCG: {[round(x, 4) for x in ndcg_res]}')
+print(f'Full-Sequence HR:   {[round(x, 4) for x in hr_res]}')
+
+# Save final aggregated results
+with open('$final_output', 'w') as f:
+    json.dump({
+        'metrics': {
+            'topk': valid_topk,
+            'full_sequence_ndcg': ndcg_res,
+            'full_sequence_hr': hr_res
+        },
+        'sample_predictions': all_preds[:10]
+    }, f, indent=4)
+"
 
 echo "=== Evaluation Completed! ==="

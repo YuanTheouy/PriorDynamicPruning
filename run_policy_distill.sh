@@ -3,7 +3,7 @@
 # ================= Configuration =================
 
 # 🔴 Option 1: Office Products
-MODEL_PATH="/workspace/ckpts/MiniOneRec/Office_ckpt"
+MODEL_PATH="/workspace/ckpts/MiniOneRec/Office_ckpt_unfrozon"
 CATEGORY="Office_Products"
 
 # 🔴 Option 2: Industrial and Scientific (Uncomment to use)

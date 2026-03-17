@@ -10,13 +10,11 @@ CATEGORY="Office_Products"
 # MODEL_PATH="/workspace/ckpts/MiniOneRec/Industrial_ckpt"
 # CATEGORY="Industrial_and_Scientific"
 
-# GPU Settings
-# This script is currently designed for single GPU training (or DataParallel if you extend it)
-# Set the GPU ID you want to use
-GPU_ID=0
+# Number of GPUs to use
+NUM_GPUS=8
 
 # Training Hyperparameters
-BATCH_SIZE=8
+BATCH_SIZE=8 # This will be per-GPU batch size
 EPOCHS=3
 LEARNING_RATE=5e-5
 TEMPERATURE=1.0
@@ -29,7 +27,7 @@ OUTPUT_DIR="./student_ckpts/${CATEGORY}"
 echo "=== Starting Teacher-Student Single Layer Distillation ==="
 echo "Teacher Model: $MODEL_PATH"
 echo "Category: $CATEGORY"
-echo "Using GPU: $GPU_ID"
+echo "Using $NUM_GPUS GPUs"
 
 # Check if teacher model exists
 if [[ ! -d "$MODEL_PATH" ]]; then
@@ -56,8 +54,8 @@ echo "Info File: $info_file"
 echo "Output Directory: $OUTPUT_DIR"
 echo "--------------------------------------------------------"
 
-# Run the distillation script
-CUDA_VISIBLE_DEVICES=$GPU_ID python -u ./train_student_distill.py \
+# Run the distillation script using accelerate for multi-GPU
+accelerate launch --num_processes $NUM_GPUS ./train_student_distill.py \
     --teacher_model "$MODEL_PATH" \
     --train_file "$train_file" \
     --info_file "$info_file" \

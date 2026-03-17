@@ -18,7 +18,7 @@ class OneLayerStudentModel(nn.Module):
         # 3. Build our streamlined LM Head
         hidden_size = config.hidden_size
         vocab_size = len(sid_token_ids)
-        self.sid_lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.sid_lm_head = nn.Linear(hidden_size, vocab_size, bias=False, dtype=config.torch_dtype)
         
         # 4. Store aux info
         self.sid_token_ids = sid_token_ids

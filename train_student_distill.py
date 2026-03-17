@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import argparse
 from tqdm import tqdm
+from accelerate import Accelerator
 
 from models.one_layer_student import OneLayerStudentModel
 from utils_distill import get_sid_token_ids_from_info
@@ -42,8 +43,12 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./student_ckpts")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Initialize Accelerator
+    accelerator = Accelerator()
+    device = accelerator.device
+    
+    if accelerator.is_main_process:
+        print(f"Using device: {device}, Total processes: {accelerator.num_processes}")
 
     # 1. Prepare Tokenizer & SID Vocab
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
@@ -52,7 +57,8 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
     sid_token_ids = get_sid_token_ids_from_info(tokenizer, args.info_file)
-    print(f"Extracted {len(sid_token_ids)} active SID tokens.")
+    if accelerator.is_main_process:
+        print(f"Extracted {len(sid_token_ids)} active SID tokens.")
     
     # Create a mapping from global token id to local sid index
     global2local_sid = {global_id: local_idx for local_idx, global_id in enumerate(sid_token_ids)}
@@ -81,7 +87,8 @@ def main():
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=custom_collate)
 
     # 3. Load Teacher
-    print("Loading Teacher model...")
+    if accelerator.is_main_process:
+        print("Loading Teacher model...")
     teacher = AutoModelForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
     teacher.eval()
     teacher.to(device)
@@ -89,25 +96,37 @@ def main():
         param.requires_grad = False
 
     # 4. Load & Initialize Student
-    print("Initializing Student model...")
+    if accelerator.is_main_process:
+        print("Initializing Student model...")
     student = OneLayerStudentModel(args.teacher_model, sid_token_ids)
     student.init_from_teacher(teacher)
+    student.to(torch.bfloat16) # Ensure student is in bfloat16 to match teacher
     student.to(device)
     student.train()
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr)
 
+    # Prepare with Accelerate
+    student, optimizer, dataloader = accelerator.prepare(student, optimizer, dataloader)
+
     # 5. Training Loop
-    os.makedirs(args.output_dir, exist_ok=True)
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
     
     for epoch in range(args.epochs):
         total_loss = 0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
         
+        # Only show progress bar on main process
+        if accelerator.is_main_process:
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        else:
+            pbar = dataloader
+            
         for batch in pbar:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            # Data is already on device thanks to accelerator
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
 
             # Mask indicating which positions are targets (i.e. predicting SID tokens)
             # labels is -100 for prompt, and contains the actual token id for the target
@@ -162,22 +181,28 @@ def main():
             
             # Backward
             optimizer.zero_grad()
-            loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
             
             total_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            if accelerator.is_main_process:
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
-        print(f"Epoch {epoch+1} finished. Avg Loss: {total_loss / len(dataloader):.4f}")
-        
-        # Save Checkpoint
-        save_path = os.path.join(args.output_dir, f"student_epoch_{epoch+1}.pt")
-        torch.save({
-            'model_state_dict': student.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'sid_token_ids': sid_token_ids
-        }, save_path)
-        print(f"Saved checkpoint to {save_path}")
+        if accelerator.is_main_process:
+            print(f"Epoch {epoch+1} finished. Avg Loss: {total_loss / len(dataloader):.4f}")
+            
+            # Save Checkpoint
+            save_path = os.path.join(args.output_dir, f"student_epoch_{epoch+1}.pt")
+            
+            # Unwrap the model to save without DDP/Accelerate wrappers
+            unwrapped_model = accelerator.unwrap_model(student)
+            
+            torch.save({
+                'model_state_dict': unwrapped_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'sid_token_ids': sid_token_ids
+            }, save_path)
+            print(f"Saved checkpoint to {save_path}")
 
 if __name__ == "__main__":
     main()

@@ -11,7 +11,7 @@ CATEGORY="Office_Products"
 # CATEGORY="Industrial_and_Scientific"
 
 # Which student checkpoint to evaluate
-EPOCH=3
+EPOCH=20
 STUDENT_CKPT="./student_ckpts/${CATEGORY}/student_epoch_${EPOCH}.pt"
 
 # GPU Settings
@@ -128,7 +128,18 @@ import pandas as pd
 test_df = pd.read_csv('$test_file')
 if 'dedup' in test_df.columns:
     test_df = test_df[test_df['dedup'] == 0]
-ground_truths = test_df['output'].tolist()
+
+# Check column names
+if 'item_sid' in test_df.columns:
+    ground_truths = test_df['item_sid'].tolist()
+elif 'output' in test_df.columns:
+    ground_truths = test_df['output'].tolist()
+else:
+    # Fallback: try to find a column that looks like SID
+    # Assuming the last column is target if named 'target' or similar, 
+    # but based on provided CSV snippet, 'item_sid' seems correct.
+    ground_truths = test_df.iloc[:, -1].tolist()
+
 
 valid_topk = [1, 3, 5, 10, 20, 50]
 ALLNDCG = [0.0] * len(valid_topk)

@@ -20,6 +20,7 @@ echo "=== Starting Joint Policy Evaluation ==="
 echo "Teacher Model: $MODEL_PATH"
 echo "Category: $CATEGORY"
 echo "Top-K Layers: $TOP_K_LAYERS"
+echo "Output File: $OUTPUT_FILE"
 
 # Check if teacher model exists
 if [[ ! -d "$MODEL_PATH" ]]; then
@@ -63,11 +64,13 @@ echo "Test File: $test_file"
 echo "Info File: $info_file"
 echo "Student Checkpoint: $latest_student_ckpt"
 echo "Policy Checkpoint: $latest_policy_ckpt"
-echo "Output File: $OUTPUT_FILE"
 echo "--------------------------------------------------------"
 
-# Run the evaluation script
-python ./eval_policy_joint.py \
+# Run the evaluation script using accelerate for multi-GPU
+# We use 8 processes by default
+NUM_GPUS=8
+
+accelerate launch --num_processes $NUM_GPUS ./eval_policy_joint.py \
     --teacher_model "$MODEL_PATH" \
     --student_ckpt "$latest_student_ckpt" \
     --policy_ckpt "$latest_policy_ckpt" \
@@ -78,5 +81,119 @@ python ./eval_policy_joint.py \
     --output_file "$OUTPUT_FILE" \
     --top_k_layers $TOP_K_LAYERS \
     --top_k_items $TOP_K_ITEMS
+
+# Wait for all processes to finish (accelerate launch usually waits)
+echo "=== Aggregating Results & Calculating Metrics... ==="
+
+# Python script to merge rank files and calculate NDCG/HR
+python3 -c "
+import json
+import glob
+import os
+import math
+import pandas as pd
+
+output_file = '${OUTPUT_FILE}'
+rank_files = glob.glob(output_file.replace('.json', '_rank*.json'))
+print(f'Found {len(rank_files)} rank files to merge.')
+
+all_data = []
+# Sort files to ensure deterministic order if possible, though 'sample_predictions' order matters vs ground truth
+rank_files = sorted(rank_files)
+
+for f in rank_files:
+    try:
+        with open(f, 'r') as fd:
+            data = json.load(fd)
+            all_data.extend(data)
+    except Exception as e:
+        print(f'Error reading {f}: {e}')
+
+# Remove rank files
+for f in rank_files:
+    os.remove(f)
+
+# Save merged file
+os.makedirs(os.path.dirname(output_file), exist_ok=True)
+with open(output_file, 'w') as f:
+    json.dump(all_data, f, indent=2)
+
+print(f'Successfully merged {len(all_data)} predictions into {output_file}')
+
+# --- Calculate Metrics (NDCG/HR) ---
+test_file = '${test_file}'
+test_df = pd.read_csv(test_file)
+
+# Handle dedup if present (align with eval_student.py)
+if 'dedup' in test_df.columns:
+    test_df = test_df[test_df['dedup'] == 0]
+
+# Extract Ground Truths
+if 'item_sid' in test_df.columns:
+    ground_truths = test_df['item_sid'].astype(str).tolist()
+else:
+    ground_truths = test_df.iloc[:, -1].astype(str).tolist()
+
+# Ensure length alignment
+# If accelerate split data, we might have slightly different count if drop_last or padding
+# eval_policy_joint.py doesn't drop_last, but might have padding?
+# Actually EvalSidDataset with test=True returns all rows.
+# But Accelerator might have padded to be divisible by num_processes.
+# We should truncate to len(ground_truths) if preds > gt
+if len(all_data) > len(ground_truths):
+    print(f'Warning: Predictions ({len(all_data)}) > Ground Truths ({len(ground_truths)}). Truncating.')
+    all_data = all_data[:len(ground_truths)]
+elif len(all_data) < len(ground_truths):
+    print(f'Warning: Predictions ({len(all_data)}) < Ground Truths ({len(ground_truths)}). Using available subset.')
+    ground_truths = ground_truths[:len(all_data)]
+
+valid_topk = [1, 3, 5, 10, 20, 50]
+ALLNDCG = [0.0] * len(valid_topk)
+ALLHR = [0.0] * len(valid_topk)
+
+for index, item_data in enumerate(all_data):
+    target_item = ground_truths[index].strip(' \n\"')
+    sample_preds = item_data.get('sample_predictions', [])
+    
+    # Find rank of target_item in predictions
+    minID = 1000000
+    for i, pred_token_str in enumerate(sample_preds):
+        if pred_token_str == target_item:
+            minID = i
+            break
+            
+    for i, topk in enumerate(valid_topk):
+        if minID < topk:
+            ALLNDCG[i] += (1 / math.log(minID + 2))
+            ALLHR[i] += 1
+
+num_samples = len(all_data)
+ndcg_res = [val / num_samples / (1.0 / math.log(2)) for val in ALLNDCG]
+hr_res = [val / num_samples for val in ALLHR]
+
+print(f'\n=== Final Metrics (Pruned Top-{${TOP_K_LAYERS}} Layers) ===')
+print(f'Evaluated on {num_samples} samples.')
+print(f'TopK: {valid_topk}')
+print(f'Full-Sequence NDCG: {[round(x, 4) for x in ndcg_res]}')
+print(f'Full-Sequence HR:   {[round(x, 4) for x in hr_res]}')
+
+# --- Analyze Mask Usage ---
+if len(all_data) > 0:
+    num_layers = len(all_data[0]['layer_mask'])
+    avg_layers = 0
+    layer_counts = [0] * num_layers
+    
+    for p in all_data:
+        mask = p['layer_mask']
+        current_sum = sum(mask)
+        avg_layers += current_sum
+        for i, val in enumerate(mask):
+            layer_counts[i] += val
+            
+    avg_layers /= len(all_data)
+    print(f'\n=== Layer Usage ===')
+    print(f'Average Layers Kept: {avg_layers:.2f} / {num_layers}')
+    print(f'Layer Usage Distribution: {layer_counts}')
+"
 
 echo "=== Evaluation Completed! Results saved to $OUTPUT_FILE ==="

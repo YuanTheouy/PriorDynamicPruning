@@ -43,6 +43,8 @@ def main():
     
     # Map local index back to global token id
     local2global_sid = {local_idx: global_id for local_idx, global_id in enumerate(sid_token_ids)}
+    # And global token id to local index
+    global2local_sid = {global_id: local_idx for local_idx, global_id in enumerate(sid_token_ids)}
     
     # Also load the item info mapping (SID -> item title/id) for HR/NDCG evaluation
     item_dict = {}

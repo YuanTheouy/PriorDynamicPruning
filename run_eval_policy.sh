@@ -14,6 +14,15 @@ TOP_K_ITEMS=50
 # Output
 OUTPUT_FILE="./results/${CATEGORY}/policy_joint_result.json"
 
+# Check if user passed --unfrozen argument
+UNFROZEN_MODE=false
+for arg in "$@"
+do
+    if [ "$arg" == "--unfrozen" ]; then
+        UNFROZEN_MODE=true
+    fi
+done
+
 # =================================================
 
 echo "=== Starting Joint Policy Evaluation ==="
@@ -42,22 +51,47 @@ if [[ ! -f "$info_file" ]]; then
     exit 1
 fi
 
-# Automatically find the latest student checkpoint
-STUDENT_CKPT_DIR="./student_ckpts/${CATEGORY}"
-latest_student_ckpt=$(ls -v ${STUDENT_CKPT_DIR}/student_epoch_*.pt 2>/dev/null | tail -1)
+# =========================================================================
+# Checkpoint Detection Logic
+# =========================================================================
 
-if [[ -z "$latest_student_ckpt" ]]; then
-    echo "❌ Error: No student checkpoints found in $STUDENT_CKPT_DIR"
+# 1. Look for Policy Checkpoint
+if [ "$UNFROZEN_MODE" = true ]; then
+    POLICY_CKPT_DIR="./policy_ckpts/unfrozon/${CATEGORY}"
+    echo "🔍 Mode: Unfrozen (Looking in $POLICY_CKPT_DIR)"
+else
+    POLICY_CKPT_DIR="./policy_ckpts/${CATEGORY}"
+    echo "🔍 Mode: Standard (Looking in $POLICY_CKPT_DIR)"
+fi
+
+if [[ ! -d "$POLICY_CKPT_DIR" ]]; then
+    echo "❌ Error: Policy checkpoint directory not found: $POLICY_CKPT_DIR"
     exit 1
 fi
 
-# Automatically find the latest policy checkpoint
-POLICY_CKPT_DIR="./policy_ckpts/${CATEGORY}"
 latest_policy_ckpt=$(ls -v ${POLICY_CKPT_DIR}/policy_epoch_*.pt 2>/dev/null | tail -1)
 
 if [[ -z "$latest_policy_ckpt" ]]; then
     echo "❌ Error: No policy checkpoints found in $POLICY_CKPT_DIR"
     exit 1
+fi
+
+# 2. Look for Student Checkpoint
+# Priority: Fine-tuned student in Policy dir > Pre-trained student in Student dir
+latest_student_ckpt=$(ls -v ${POLICY_CKPT_DIR}/finetuned_student_epoch_*.pt 2>/dev/null | tail -1)
+
+if [[ -n "$latest_student_ckpt" ]]; then
+    echo "✅ Found Fine-tuned Student: $latest_student_ckpt"
+else
+    # Fallback to pre-trained student
+    STUDENT_CKPT_DIR="./student_ckpts/${CATEGORY}"
+    latest_student_ckpt=$(ls -v ${STUDENT_CKPT_DIR}/student_epoch_*.pt 2>/dev/null | tail -1)
+    
+    if [[ -z "$latest_student_ckpt" ]]; then
+        echo "❌ Error: No student checkpoints found in $STUDENT_CKPT_DIR"
+        exit 1
+    fi
+    echo "⚠️  Using Pre-trained Student (No fine-tuning detected): $latest_student_ckpt"
 fi
 
 echo "Test File: $test_file"
@@ -135,11 +169,6 @@ else:
     ground_truths = test_df.iloc[:, -1].astype(str).tolist()
 
 # Ensure length alignment
-# If accelerate split data, we might have slightly different count if drop_last or padding
-# eval_policy_joint.py doesn't drop_last, but might have padding?
-# Actually EvalSidDataset with test=True returns all rows.
-# But Accelerator might have padded to be divisible by num_processes.
-# We should truncate to len(ground_truths) if preds > gt
 if len(all_data) > len(ground_truths):
     print(f'Warning: Predictions ({len(all_data)}) > Ground Truths ({len(ground_truths)}). Truncating.')
     all_data = all_data[:len(ground_truths)]

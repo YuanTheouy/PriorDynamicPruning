@@ -18,6 +18,29 @@ def get_hash(x):
     x = [str(_) for _ in x]
     return '-'.join(x)
 
+def collate_fn(batch):
+    # Filter out None values
+    batch = [b for b in batch if b is not None]
+    
+    # EvalSidDataset returns {"input_ids": tokens, "attention_mask": mask} for test=True
+    input_ids = [torch.tensor(b["input_ids"]) for b in batch]
+    attention_mask = [torch.tensor(b["attention_mask"]) for b in batch]
+    
+    # Pad sequences
+    # Note: Tokenizer pad_token_id should be available. 
+    # If not passed in args, we assume 0 or handle it.
+    # We can get pad_token_id from the tokenizer used in main, but here it's global?
+    # Better to pass tokenizer or use a default.
+    pad_token_id = 0 # Default fallback
+    
+    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
+    attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask
+    }
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_model", type=str, required=True, help="Path to the teacher model checkpoint")
@@ -42,6 +65,10 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
     
+    # Update collate_fn's pad token
+    global pad_token_id
+    pad_token_id = tokenizer.pad_token_id
+    
     sid_token_ids = get_sid_token_ids_from_info(tokenizer, args.info_file)
     print(f"Extracted {len(sid_token_ids)} active SID tokens.")
     
@@ -62,9 +89,6 @@ def main():
         prefixID = [tokenizer(_).input_ids for _ in info_semantic]
         
     # Heuristic for prefix length
-    # Adjust based on tokenizer behavior.
-    # For <a_X><b_Y><c_Z>, typically prefix_index=3 or 4
-    # Let's use the logic from eval_student.py
     if args.teacher_model.lower().find("gpt2") > -1:
         prefix_index = 4
     else:
@@ -131,8 +155,11 @@ def main():
     router.to(torch.bfloat16).to(device).eval()
 
     # 3. Dataset
-    dataset = EvalSidDataset(args.test_file, tokenizer, max_len=1024)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=dataset.collate_fn)
+    # Pass test=True to get only input_ids and attention_mask without labels
+    dataset = EvalSidDataset(args.test_file, tokenizer, max_len=1024, test=True)
+    
+    # Use custom collate_fn defined above
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
     # 4. Evaluation Loop
     all_predictions = []
@@ -162,37 +189,6 @@ def main():
             # Current sequence starts as input_ids
             curr_input_ids = input_ids
             curr_attention_mask = attention_mask
-            
-            # Store scores for the beam/top-k
-            # Simplified: Greedy / Top-K sampling token by token
-            # To perform Beam Search properly with dynamic masks is complex.
-            # Here we implement a simple Top-K selection at each step, similar to eval_student.py
-            # But wait, eval_student.py implements a beam search logic or just top-k?
-            # User description: "Step 2 & 3 ... Top-K Beam Search"
-            # For simplicity in this verification script, let's do Greedy or Simple Top-K.
-            # Let's stick to Greedy/Argmax for now to verify the pipeline works, or simple Top-K.
-            
-            # However, we need to output Top-K candidates for NDCG calculation.
-            # So we need to keep Top-K paths.
-            
-            # Since implementing full Beam Search here is heavy, let's look at eval_student.py again.
-            # It seems eval_student does a custom logic.
-            # Let's implement a simplified version: Just predict 1 best path or use Student logic?
-            # The goal is to see "what effect the policy has".
-            # Let's use the Pruned Teacher to predict the NEXT token distribution.
-            
-            # For this evaluation script, let's just do "Teacher Forcing" style evaluation or
-            # simple generation to see if it works.
-            # Wait, the user wants to "see the effect".
-            # Let's compute the perplexity/loss on the test set first?
-            # Or run the actual generation.
-            
-            # Let's implement the generation loop (Batch size > 1 is tricky for custom beam search).
-            # Let's assume Batch Size = 1 for safety if implementing Beam Search, or use simple generation.
-            
-            # Actually, let's just do standard generation using the Pruned Teacher.
-            # We append the predicted token and feed back.
-            # Since `PrunedTeacherWrapper` is just a `nn.Module`, not a `GenerationMixin`, we handle loop manually.
             
             batch_preds = []
             

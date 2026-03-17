@@ -104,7 +104,25 @@ def main():
     student.to(device)
     student.train()
 
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr)
+    # 4.1 Freeze everything EXCEPT the single Transformer layer
+    if accelerator.is_main_process:
+        print("Freezing Embedding and LM Head. Only training the Transformer layer.")
+    for name, param in student.named_parameters():
+        # Llama uses 'embed_tokens' for embedding. We also freeze our custom 'sid_lm_head'
+        # We only want to train parameters in 'backbone.layers.0' and possibly 'backbone.norm'
+        if "embed_tokens" in name or "sid_lm_head" in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+
+    # Count trainable parameters for verification
+    if accelerator.is_main_process:
+        trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
+        all_params = sum(p.numel() for p in student.parameters())
+        print(f"Trainable parameters: {trainable_params:,} / {all_params:,} ({100 * trainable_params / all_params:.2f}%)")
+
+    # Pass only the trainable parameters to the optimizer
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, student.parameters()), lr=args.lr)
 
     # Prepare with Accelerate
     student, optimizer, dataloader = accelerator.prepare(student, optimizer, dataloader)

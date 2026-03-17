@@ -40,15 +40,36 @@ class PrunedTeacherWrapper(nn.Module):
         # 2. Position Embeddings (RoPE) and Attention Mask
         
         # --- Handle Attention Mask ---
-        # The error indicates that Qwen2's scaled_dot_product_attention expects float/bool mask, but got long.
-        # This usually happens when we pass the raw padding mask (0/1 long) directly to SDPA,
-        # instead of the prepared 4D mask (float with -inf) or boolean mask.
+        # The error "The expanded size of the tensor (125) must match the existing size (8) at non-singleton dimension 2"
+        # indicates a shape mismatch in broadcasting.
+        # This usually happens when _prepare_decoder_attention_mask creates a 4D mask [batch, 1, seq_len, seq_len],
+        # but the attention implementation (SDPA) expects a different shape or broadcasting behavior.
         
-        # `_prepare_decoder_attention_mask` usually returns a 4D float mask (batch, 1, tgt_len, src_len)
-        # suited for adding to attention scores (0.0 for keep, min_dtype for mask).
+        # Qwen2's implementation might be using SDPA which handles broadcasting differently depending on PyTorch version
+        # and whether a causal mask is automatically applied.
+        
+        # If we use _prepare_decoder_attention_mask, it returns a [batch, 1, seq_len, seq_len] mask.
+        # However, for SDPA with causal masking, sometimes we just need the padding mask [batch, seq_len]?
+        # Or a causal mask is needed.
+        
+        # Let's try to trust the model's internal preparation fully, BUT:
+        # If the error is about broadcasting [8, 12, 125, 125] vs [8, 125], it implies the mask is [8, 1, 125, 125]
+        # and something else is [8, 125].
+        # Wait, "Target sizes: [8, 12, 125, 125]. Tensor sizes: [8, 125]"
+        # This suggests the `attention_mask` being passed is likely the raw [8, 125] tensor, NOT the expanded one.
+        
+        # Wait, if `_prepare_decoder_attention_mask` was called successfully, `extended_attention_mask` should be 4D.
+        # If it wasn't called (e.g. method doesn't exist on this version of Qwen/Transformers?), we fell back to boolean mask [8, 125].
+        # SDPA might be trying to broadcast [8, 125] against [8, 12, 125, 125] (batch, heads, q, k).
+        # [8, 125] broadcasts to [8, 1, 1, 125] -> [8, 12, 125, 125]? No.
+        # [8, 125] usually means [batch, key_len].
+        
+        # Let's explicitly look for `_prepare_decoder_attention_mask`.
+        # If it fails, we need to manually create the causal mask + padding mask.
         
         extended_attention_mask = None
         if hasattr(base_model, "_prepare_decoder_attention_mask"):
+             # This returns [batch, 1, tgt_len, src_len]
              extended_attention_mask = base_model._prepare_decoder_attention_mask(
                  attention_mask, 
                  (batch_size, seq_length), 
@@ -56,15 +77,24 @@ class PrunedTeacherWrapper(nn.Module):
                  0 # past_key_values_length
              )
         else:
-            # Fallback: Convert to boolean if it's a padding mask (1 for keep, 0 for ignore)
-            # Or ensure it's float if it's an additive mask.
-            # SDPA usually prefers boolean mask for padding: True to IGNORE (pytorch < 2.0) or True to KEEP?
-            # PyTorch SDPA: "attn_mask: boolean mask where a value of True indicates that the element should take part in attention."
-            # Our `attention_mask` is 1 for keep, 0 for ignore. So (attention_mask > 0.5) works.
-            # But wait, the error says "got attn_mask.dtype: long int".
+            # Fallback: Create 4D causal mask manually
+            # This is safer for SDPA in many HF models which expect the full mask if passed.
+            # Mask shape: [batch, 1, seq_len, seq_len]
             
-            # If we don't have `_prepare_decoder_attention_mask`, let's try to make it boolean.
-            extended_attention_mask = (attention_mask > 0)
+            # 1. Create Causal Mask (Lower Triangular)
+            # [seq_len, seq_len]
+            causal_mask = torch.tril(torch.ones((seq_length, seq_length), device=input_ids.device, dtype=torch.bool))
+            
+            # 2. Combine with Padding Mask
+            # attention_mask is [batch, seq_len] (1 for keep, 0 for pad)
+            # [batch, 1, 1, seq_len]
+            padding_mask = attention_mask[:, None, None, :].bool()
+            
+            # Final mask: Keep if (Causal AND Padding)
+            # [batch, 1, seq_len, seq_len]
+            combined_mask = causal_mask & padding_mask
+            
+            extended_attention_mask = combined_mask
 
         # --- Handle Position Embeddings (RoPE) ---
         position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)

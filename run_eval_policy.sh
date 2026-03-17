@@ -6,6 +6,7 @@
 MODEL_PATH="/workspace/ckpts/MiniOneRec/Office_ckpt"
 CATEGORY="Office_Products"
 
+
 # Policy Hyperparameters
 BATCH_SIZE=8 
 TOP_K_LAYERS=12

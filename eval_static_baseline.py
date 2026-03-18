@@ -177,7 +177,11 @@ def main():
         hash_dict[key] = list(hash_dict[key])
         
     def prefix_allowed_tokens_fn_semantic(batch_id, input_ids):
-        hash_number = get_hash(input_ids.tolist())
+        # Convert input_ids to list if it is a tensor
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+            
+        hash_number = get_hash(input_ids)
         if hash_number in hash_dict:
             return hash_dict[hash_number]
         return []

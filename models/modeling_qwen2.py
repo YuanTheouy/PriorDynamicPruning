@@ -13,7 +13,19 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.modeling_attn_mask_utils import create_causal_mask, create_sliding_window_causal_mask
+
+# 修复：不同 transformers 版本的 import 路径差异
+try:
+    # 较新版本 (e.g. 4.40+)
+    from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask as create_causal_mask
+    from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa as create_sliding_window_causal_mask
+except ImportError:
+    try:
+        from transformers.modeling_attn_mask_utils import create_causal_mask, create_sliding_window_causal_mask
+    except ImportError:
+        # Fallback to older versions
+        from transformers.models.llama.modeling_llama import _prepare_4d_causal_attention_mask as create_causal_mask
+        create_sliding_window_causal_mask = create_causal_mask # Approximation for fallback
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS

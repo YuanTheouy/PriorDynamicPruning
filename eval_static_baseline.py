@@ -250,7 +250,7 @@ def main():
                     sample_preds.append(pred_str)
                 
                 # Original input string
-                input_ids_clean = [t for t in input_ids[b].tolist() if t != tokenizer.pad_token_id]
+                input_ids_clean = [int(t) for t in input_ids[b].tolist() if t != tokenizer.pad_token_id]
                 input_str = tokenizer.decode(input_ids_clean, skip_special_tokens=True)
                 
                 all_predictions.append({

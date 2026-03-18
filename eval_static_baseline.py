@@ -336,6 +336,12 @@ def main():
                 top_p=None,
                 return_dict_in_generate=True,
                 output_scores=False,
+                
+                # CRITICAL: Force use of provided logits_processor even if beam search uses its own
+                # But wait, Qwen2ForCausalLM uses GenerationMixin.
+                # In GenerationMixin.generate, logits_processor is merged with default ones.
+                # If we use beam search, BeamSearchLogitsProcessor is added.
+                # Our custom processor should be there.
             )
             
             # Extract generated tokens

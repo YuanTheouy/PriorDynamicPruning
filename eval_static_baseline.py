@@ -143,8 +143,9 @@ def main():
     else:
         num_layers = 24
     
-    pruned_teacher = PrunedTeacherWrapper(raw_teacher)
-    pruned_teacher.to(device)
+    # PrunedTeacherWrapper is not needed if we use Qwen2ForCausalLM directly
+    # pruned_teacher = PrunedTeacherWrapper(raw_teacher)
+    # pruned_teacher.to(device)
 
     # 4. Construct Static Mask
     static_mask_cpu = get_static_mask(args.strategy, num_layers, args.top_k_layers)
@@ -229,6 +230,8 @@ def main():
         top_p=None,
     )
 
+    debug_cnt = 0
+
     with torch.no_grad():
         for batch in pbar:
             clp = ConstrainedLogitsProcessor(
@@ -247,6 +250,14 @@ def main():
             # Use fixed mask for all samples in batch
             mask = static_mask.repeat(batch_size, 1) # [batch, num_layers]
             
+            # DEBUG PRINT
+            if accelerator.is_main_process and debug_cnt == 0:
+                print(f"DEBUG: Input IDs Shape: {input_ids.shape}")
+                print(f"DEBUG: Input IDs Sample 0: {input_ids[0].tolist()}")
+                print(f"DEBUG: Attention Mask Sample 0: {attention_mask[0].tolist()}")
+                print(f"DEBUG: Layer Mask Shape: {mask.shape}")
+                debug_cnt += 1
+
             # We call the underlying raw_teacher (Qwen2ForCausalLM), passing our custom layer_mask!
             generation_output = raw_teacher.generate(
                 input_ids,
@@ -261,6 +272,12 @@ def main():
             # Extract generated tokens
             batched_completions = generation_output.sequences[:, max_len:]
             
+            # DEBUG PRINT GENERATION
+            if accelerator.is_main_process and debug_cnt == 1:
+                print(f"DEBUG: Generated Sequences Shape: {generation_output.sequences.shape}")
+                print(f"DEBUG: Generated Sample 0: {generation_output.sequences[0, max_len:].tolist()}")
+                debug_cnt += 1
+
             # Group back into batch_size x top_k_items
             batched_completions = batched_completions.view(batch_size, args.top_k_items, -1)
             

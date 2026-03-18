@@ -166,8 +166,12 @@ class Qwen2Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        layer_idx: Optional[int] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if layer_idx is None:
+            layer_idx = self.layer_idx
+            
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -181,7 +185,7 @@ class Qwen2Attention(nn.Module):
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -248,6 +252,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         layer_mask_i: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         original_hidden_states = hidden_states
@@ -262,6 +267,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            layer_idx=layer_idx,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -402,20 +408,44 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 "position_ids": position_ids,
             }
             # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
+            # Fix: Different versions of transformers expect different kwargs for the mask creation functions
+            import inspect
+            sig = inspect.signature(create_causal_mask)
+            valid_kwargs = {k: v for k, v in mask_kwargs.items() if k in sig.parameters}
+            # Fallback for some versions that take specific args
+            if len(valid_kwargs) == 0:
+                # older fallback signature typically takes: attention_mask, input_shape, inputs_embeds, past_key_values_length
+                batch_size, seq_length = inputs_embeds.shape[:2]
+                past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+                causal_mask_mapping = {
+                    "full_attention": create_causal_mask(attention_mask, (batch_size, seq_length), inputs_embeds, past_length),
+                }
+            else:
+                causal_mask_mapping = {
+                    "full_attention": create_causal_mask(**valid_kwargs),
+                }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                sig_sliding = inspect.signature(create_sliding_window_causal_mask)
+                valid_kwargs_sliding = {k: v for k, v in mask_kwargs.items() if k in sig_sliding.parameters}
+                if len(valid_kwargs_sliding) == 0:
+                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(attention_mask, (batch_size, seq_length), inputs_embeds, past_length)
+                else:
+                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**valid_kwargs_sliding)
 
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        active_layer_idx = 0
         for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None
+            
+            # Optimization: If layer_mask_i is all zeros, skip the layer entirely
+            if layer_mask_i is not None and torch.all(layer_mask_i == 0):
+                continue
+
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -425,8 +455,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 layer_mask_i=layer_mask_i,
+                layer_idx=active_layer_idx,
                 **kwargs,
             )
+            active_layer_idx += 1
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
@@ -449,6 +481,55 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        # Omit tokens covered by past_key_values
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values.seen_tokens
+                max_cache_length = past_key_values.get_max_length()
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            # Keep only the unprocessed tokens:
+            # 1. If the length of the cache is different from the input_ids length, then we only want the new tokens
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+
+            # If we are about to go beyond the maximum length, we need to crop the input_ids
+            if (
+                max_cache_length is not None
+                and input_ids.shape[1] > max_cache_length
+            ):
+                input_ids = input_ids[:, :max_cache_length]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # Extract layer_mask if present in kwargs
+        layer_mask = kwargs.get("layer_mask", None)
+
+        model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
+            "inputs_embeds": inputs_embeds,
+            "layer_mask": layer_mask,
+        }
+        return model_inputs
 
     @can_return_tuple
     @auto_docstring

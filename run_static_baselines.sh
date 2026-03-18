@@ -4,7 +4,7 @@
 MODEL_PATH="/workspace/ckpts/MiniOneRec/Office_ckpt"
 CATEGORY="Office_Products"
 BATCH_SIZE=8 
-TOP_K_LAYERS=12
+TOP_K_LAYERS=${TOP_K_LAYERS:-28} # Allow environment variable override, default to 28
 TOP_K_ITEMS=50
 
 # Output Base Dir
@@ -15,20 +15,30 @@ mkdir -p "$BASE_OUTPUT_DIR"
 # Available strategies: uniform, first_k, last_k, ends_heavy, middle_heavy
 STRATEGIES_TO_RUN=()
 
-# If no arguments provided, run all
-if [ "$#" -eq 0 ]; then
+# Basic Argument Parsing Loop
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    uniform|first_k|last_k|ends_heavy|middle_heavy)
+      STRATEGIES_TO_RUN+=("$1")
+      shift
+      ;;
+    --top_k_layers)
+      TOP_K_LAYERS="$2"
+      shift
+      shift
+      ;;
+    *)
+      # Ignore other flags or warn
+      echo "⚠️ Warning: Unknown argument '$1'. Ignoring."
+      shift
+      ;;
+  esac
+done
+
+# If no strategies specified, run all
+if [ ${#STRATEGIES_TO_RUN[@]} -eq 0 ]; then
     STRATEGIES_TO_RUN=("uniform" "first_k" "last_k" "ends_heavy" "middle_heavy")
     echo "No strategies specified. Will run all 5 baselines."
-else
-    # Parse provided strategies
-    for arg in "$@"; do
-        if [[ "$arg" == "uniform" || "$arg" == "first_k" || "$arg" == "last_k" || "$arg" == "ends_heavy" || "$arg" == "middle_heavy" ]]; then
-            STRATEGIES_TO_RUN+=("$arg")
-        else
-            echo "⚠️ Warning: Unknown strategy '$arg'. Ignoring."
-            echo "Valid strategies: uniform, first_k, last_k, ends_heavy, middle_heavy"
-        fi
-    done
 fi
 
 if [ ${#STRATEGIES_TO_RUN[@]} -eq 0 ]; then

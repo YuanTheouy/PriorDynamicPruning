@@ -126,7 +126,7 @@ def main():
         student.load_state_dict(ckpt)
     student.to(torch.bfloat16).to(device).eval()
     
-    from models.modeling_qwen2 import Qwen2ForCausalLM
+    from transformers import Qwen2ForCausalLM
     raw_teacher = Qwen2ForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
     raw_teacher.eval()
     

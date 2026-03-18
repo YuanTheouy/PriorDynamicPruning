@@ -166,6 +166,13 @@ def main(
             padding_encodings["input_ids"].append([tokenizer.pad_token_id] * (maxLen - L) + _["input_ids"])
             attention_mask.append([0] * (maxLen - L) + [1] * L) 
         
+        # DEBUG PRINT
+        if not hasattr(evaluate, "debug_printed"):
+            print("DEBUG: Evaluate Input IDs Shape:", len(padding_encodings["input_ids"]), len(padding_encodings["input_ids"][0]))
+            print("DEBUG: Evaluate Input IDs Sample 0:", padding_encodings["input_ids"][0])
+            print("DEBUG: Evaluate Attention Mask Sample 0:", attention_mask[0])
+            evaluate.debug_printed = True
+
         # print(f"num_beams: {num_beams}")
         generation_config = GenerationConfig(
             num_beams=num_beams,

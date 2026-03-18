@@ -317,14 +317,25 @@ def main():
                 debug_cnt += 1
 
             # We call the underlying raw_teacher (Qwen2ForCausalLM), passing our custom layer_mask!
+            # FIX: Ensure logits_processor is not overridden by generation_config defaults
+            # Try passing all arguments explicitly and NOT passing generation_config
             generation_output = raw_teacher.generate(
                 input_ids,
                 attention_mask=attention_mask,
-                generation_config=generation_config,
+                # generation_config=generation_config, # DISABLE THIS to avoid conflicts
+                logits_processor=logits_processor,
+                layer_mask=mask, 
+                
+                # Explicitly pass generation args
+                num_beams=args.top_k_items,
+                num_return_sequences=args.top_k_items,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                max_new_tokens=3,
+                top_k=None,
+                top_p=None,
                 return_dict_in_generate=True,
                 output_scores=False,
-                logits_processor=logits_processor,
-                layer_mask=mask, # Pass the ORIGINAL mask, let generate expand it!
             )
             
             # Extract generated tokens

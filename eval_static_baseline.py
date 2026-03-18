@@ -206,15 +206,15 @@ def main():
     )
 
     with torch.no_grad():
-        clp = ConstrainedLogitsProcessor(
-            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
-            num_beams=args.top_k_items,
-            base_model=args.teacher_model,
-            eos_token_id=tokenizer.eos_token_id
-        )
-        logits_processor = LogitsProcessorList([clp])
-
         for batch in pbar:
+            clp = ConstrainedLogitsProcessor(
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
+                num_beams=args.top_k_items,
+                base_model=args.teacher_model,
+                eos_token_id=tokenizer.eos_token_id
+            )
+            logits_processor = LogitsProcessorList([clp])
+
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             batch_size = input_ids.size(0)

@@ -283,41 +283,25 @@ def main():
             # unless we hook into `prepare_inputs_for_generation` properly or pass it pre-expanded?
             # NO, `prepare_inputs_for_generation` is called inside generate.
             # If we pass `layer_mask` via kwargs to generate, it is passed to `prepare_inputs_for_generation`.
-            # Let's check `models/modeling_qwen2.py`:
-            # `prepare_inputs_for_generation` receives `layer_mask` and puts it into `model_inputs`.
-            # Then `model.forward` receives `model_inputs`.
-            # Inside `generate`, the inputs are expanded for beam search (interleave_repeat).
-            # Does `generate` expand arbitrary kwargs? 
-            # Usually NO. It expands `input_ids`, `attention_mask`, `token_type_ids`, etc.
-            # BUT it expands `model_kwargs`.
-            # If we pass `layer_mask` as a kwarg to `generate`, it goes into `model_kwargs`.
             # `GenerationMixin._expand_inputs_for_generation` handles expansion.
             # It expands items in `model_kwargs` if they match batch size.
             
-            # Let's verify if `layer_mask` (batch_size, num_layers) is correctly expanded to (batch_size * num_beams, num_layers).
-            # If not, the model will see a mismatch in batch dimension during beam search!
-            # Batch size is 8. Num beams is 50.
-            # Forward pass 1: input (8*50, seq_len). layer_mask (8, 28).
-            # ERROR or Broadcasting?
-            # In modeling_qwen2.py:
-            # layer_mask_i = layer_mask[:, idx] -> (8,)
-            # hidden_states -> (400, seq, hidden)
-            # layer_mask_i * hidden_states -> (8, 1, 1) * (400, ...) -> Broadcasting?
-            # (8, 1, 1) broadcasts to (8, ..., ...). 
-            # But (400, ...) cannot broadcast with (8, ...)! 400 is not a multiple of 8 in a way that aligns unless 400 % 8 == 0.
-            # Wait, 400 = 8 * 50.
-            # PyTorch broadcasting: (8, 1, 1) and (400, S, H). 
-            # 8 != 400. This should FAIL with shape mismatch!
+            # The previous RuntimeError (20000 vs 400) suggests that `model.generate` IS automatically expanding `layer_mask`!
+            # Why? Because `layer_mask` has shape (batch_size, num_layers).
+            # `model.generate` sees that dimension 0 matches batch_size (8), so it repeats it `num_beams` (50) times.
+            # Result: (8 * 50, num_layers) = (400, 28).
             
-            # Why did it NOT fail?
-            # Maybe `generate` IS expanding it?
-            # Or maybe `layer_mask` became None?
-            # Or maybe `forward` wasn't called with the mask?
+            # BUT, we manually expanded it to (400, 28) BEFORE passing it!
+            # So `model.generate` saw (400, 28). Since batch_size=8, 400 != 8.
+            # So `model.generate` probably treated it as a non-batch argument?
+            # Wait, `RuntimeError: The size of tensor a (20000) must match the size of tensor b (400)`.
+            # 20000 = 400 * 50.
+            # This means `model.generate` DID expand our already-expanded mask!
+            # It saw (400, 28) and expanded it 50 times -> (20000, 28).
+            # But `hidden_states` was (400, ...).
+            # So we should NOT manually expand it. `model.generate` is smart enough to do it for us because dim 0 matches batch_size.
             
-            # Let's proactively expand it to be safe.
-            # The correct behavior is to repeat each element `num_beams` times (interleave).
-            # [A, B] -> [A, A, ..., B, B, ...]
-            expanded_mask = mask.repeat_interleave(args.top_k_items, dim=0) # [batch * beams, num_layers]
+            # Revert manual expansion.
             
             # DEBUG PRINT
             if accelerator.is_main_process and debug_cnt == 0:
@@ -325,7 +309,7 @@ def main():
                 print(f"DEBUG: Input IDs Sample 0: {input_ids[0].tolist()}")
                 print(f"DEBUG: Attention Mask Sample 0: {attention_mask[0].tolist()}")
                 print(f"DEBUG: Layer Mask Shape (Original): {mask.shape}")
-                print(f"DEBUG: Layer Mask Shape (Expanded): {expanded_mask.shape}")
+                # print(f"DEBUG: Layer Mask Shape (Expanded): {expanded_mask.shape}")
                 debug_cnt += 1
 
             # We call the underlying raw_teacher (Qwen2ForCausalLM), passing our custom layer_mask!
@@ -336,7 +320,7 @@ def main():
                 return_dict_in_generate=True,
                 output_scores=False,
                 logits_processor=logits_processor,
-                layer_mask=expanded_mask, # Pass the expanded mask!
+                layer_mask=mask, # Pass the ORIGINAL mask, let generate expand it!
             )
             
             # Extract generated tokens

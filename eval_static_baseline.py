@@ -20,11 +20,17 @@ def get_hash(x):
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
-    input_ids = [torch.tensor(b["input_ids"]) for b in batch]
+    
+    # Extract input_ids from the dataset output
+    # Note: evaluate.py uses 'input_ids' from EvalSidDataset directly
+    input_ids = [b["input_ids"] for b in batch]
     
     # Let padding be handled correctly by finding max len in batch
     max_len = max([len(ids) for ids in input_ids])
-    pad_token_id = 0 # Will be updated dynamically
+    
+    # Important: In evaluate.py, tokenizer.pad_token_id is used.
+    # We rely on the global pad_token_id set in main()
+    global pad_token_id 
     
     padded_input_ids = []
     attention_mask = []
@@ -32,8 +38,13 @@ def collate_fn(batch):
     for ids in input_ids:
         L = len(ids)
         # Left padding as required by HF generate for decoder-only models
-        padded_input_ids.append(torch.cat([torch.tensor([pad_token_id] * (max_len - L)), ids]))
-        attention_mask.append(torch.cat([torch.tensor([0] * (max_len - L)), torch.tensor([1] * L)]))
+        # Match evaluate.py logic: [pad] * (max - L) + ids
+        # Use simple list concatenation then tensor conversion for consistency
+        padded_ids = [pad_token_id] * (max_len - L) + ids
+        padded_mask = [0] * (max_len - L) + [1] * L
+        
+        padded_input_ids.append(torch.tensor(padded_ids, dtype=torch.long))
+        attention_mask.append(torch.tensor(padded_mask, dtype=torch.long))
         
     return {
         "input_ids": torch.stack(padded_input_ids),
@@ -149,11 +160,20 @@ def main():
     with open(args.info_file, 'r') as f:
         items = f.readlines()
         item_names = [_.split('\t')[0].strip() for _ in items]
-    info_semantic = [f'''### Response:\n{_}\n''' for _ in item_names]
+    info_semantic = [f'''### Response:\n{_}\n''' for _ in item_names] # Original format: ends with \n
+    # evaluate.py uses: info_semantic = [f'''### Response:\n{_}''' for _ in semantic_ids]
+    # But wait! evaluate.py semantic_ids ALREADY have "\n" appended:
+    # semantic_ids = [line.split('\t')[0].strip() + "\n" for line in info]
+    # So effectively it is "### Response:\nSID\n"
+    
+    # Let's align exactly with evaluate.py
+    info_semantic = [f'''### Response:\n{_}\n''' for _ in item_names] 
     
     if args.teacher_model.lower().find("llama") > -1:
+        # evaluate.py: prefixID = [tokenizer(_).input_ids[1:] for _ in info_semantic]
         prefixID = [tokenizer(_).input_ids[1:] for _ in info_semantic]
     else:
+        # evaluate.py: prefixID = [tokenizer(_).input_ids for _ in info_semantic]
         prefixID = [tokenizer(_).input_ids for _ in info_semantic]
         
     if args.teacher_model.lower().find("gpt2") > -1:
@@ -162,6 +182,10 @@ def main():
         prefix_index = 3
         
     hash_dict = dict()
+    # evaluate.py: 
+    # for index, ID in enumerate(prefixID):
+    #     ID.append(tokenizer.eos_token_id)
+    #     for i in range(prefix_index, len(ID)): ...
     for index, ID in enumerate(prefixID):
         ID.append(tokenizer.eos_token_id)
         for i in range(prefix_index, len(ID)):

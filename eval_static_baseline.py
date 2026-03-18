@@ -120,6 +120,16 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
     
+    # CRITICAL FIX: evaluate.py seems to be using 151645 for padding (repetition_penalty/eos related?)
+    # or tokenizer.pad_token_id might be different.
+    # From debug log: evaluate.py uses 151645.
+    # Let's force check what tokenizer.pad_token_id is, or align it.
+    # Qwen2 tokenizer: <|endoftext|> is 151643. 151645 is <|im_start|>? No.
+    # Let's trust the tokenizer unless we see divergence.
+    # Wait, in the user provided log for eval_static_baseline.py:
+    # DEBUG: Input IDs Sample 0: [151645, 151645, ...]
+    # So eval_static_baseline.py IS ALREADY using 151645!
+    
     global pad_token_id
     pad_token_id = tokenizer.pad_token_id
     
@@ -241,6 +251,17 @@ def main():
 
     with torch.no_grad():
         for batch in pbar:
+            # IMPORTANT FIX: In evaluate.py, num_beams=50 is passed to ConstrainedLogitsProcessor.
+            # But the input_ids passed to it are NOT yet expanded by beam search in the first step?
+            # Actually, `model.generate` handles beam search expansion internally.
+            # However, LogitsProcessor is called AFTER beam expansion.
+            # So `input_ids` seen by LogitsProcessor will have shape (batch_size * num_beams, seq_len).
+            # Our `ConstrainedLogitsProcessor` expects this structure and reshapes it:
+            # input_ids.view(-1, self._num_beams, input_ids.shape[-1])
+            
+            # So we must ensure `num_beams` passed to CLP matches `generation_config.num_beams`.
+            # args.top_k_items is used for both. This seems correct.
+            
             clp = ConstrainedLogitsProcessor(
                 prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
                 num_beams=args.top_k_items,
@@ -257,12 +278,54 @@ def main():
             # Use fixed mask for all samples in batch
             mask = static_mask.repeat(batch_size, 1) # [batch, num_layers]
             
+            # CRITICAL: If using beam search, layer_mask needs to be expanded to match beam size!
+            # model.generate expands input_ids and attention_mask, but it DOES NOT know how to expand `layer_mask` automatically
+            # unless we hook into `prepare_inputs_for_generation` properly or pass it pre-expanded?
+            # NO, `prepare_inputs_for_generation` is called inside generate.
+            # If we pass `layer_mask` via kwargs to generate, it is passed to `prepare_inputs_for_generation`.
+            # Let's check `models/modeling_qwen2.py`:
+            # `prepare_inputs_for_generation` receives `layer_mask` and puts it into `model_inputs`.
+            # Then `model.forward` receives `model_inputs`.
+            # Inside `generate`, the inputs are expanded for beam search (interleave_repeat).
+            # Does `generate` expand arbitrary kwargs? 
+            # Usually NO. It expands `input_ids`, `attention_mask`, `token_type_ids`, etc.
+            # BUT it expands `model_kwargs`.
+            # If we pass `layer_mask` as a kwarg to `generate`, it goes into `model_kwargs`.
+            # `GenerationMixin._expand_inputs_for_generation` handles expansion.
+            # It expands items in `model_kwargs` if they match batch size.
+            
+            # Let's verify if `layer_mask` (batch_size, num_layers) is correctly expanded to (batch_size * num_beams, num_layers).
+            # If not, the model will see a mismatch in batch dimension during beam search!
+            # Batch size is 8. Num beams is 50.
+            # Forward pass 1: input (8*50, seq_len). layer_mask (8, 28).
+            # ERROR or Broadcasting?
+            # In modeling_qwen2.py:
+            # layer_mask_i = layer_mask[:, idx] -> (8,)
+            # hidden_states -> (400, seq, hidden)
+            # layer_mask_i * hidden_states -> (8, 1, 1) * (400, ...) -> Broadcasting?
+            # (8, 1, 1) broadcasts to (8, ..., ...). 
+            # But (400, ...) cannot broadcast with (8, ...)! 400 is not a multiple of 8 in a way that aligns unless 400 % 8 == 0.
+            # Wait, 400 = 8 * 50.
+            # PyTorch broadcasting: (8, 1, 1) and (400, S, H). 
+            # 8 != 400. This should FAIL with shape mismatch!
+            
+            # Why did it NOT fail?
+            # Maybe `generate` IS expanding it?
+            # Or maybe `layer_mask` became None?
+            # Or maybe `forward` wasn't called with the mask?
+            
+            # Let's proactively expand it to be safe.
+            # The correct behavior is to repeat each element `num_beams` times (interleave).
+            # [A, B] -> [A, A, ..., B, B, ...]
+            expanded_mask = mask.repeat_interleave(args.top_k_items, dim=0) # [batch * beams, num_layers]
+            
             # DEBUG PRINT
             if accelerator.is_main_process and debug_cnt == 0:
                 print(f"DEBUG: Input IDs Shape: {input_ids.shape}")
                 print(f"DEBUG: Input IDs Sample 0: {input_ids[0].tolist()}")
                 print(f"DEBUG: Attention Mask Sample 0: {attention_mask[0].tolist()}")
-                print(f"DEBUG: Layer Mask Shape: {mask.shape}")
+                print(f"DEBUG: Layer Mask Shape (Original): {mask.shape}")
+                print(f"DEBUG: Layer Mask Shape (Expanded): {expanded_mask.shape}")
                 debug_cnt += 1
 
             # We call the underlying raw_teacher (Qwen2ForCausalLM), passing our custom layer_mask!
@@ -273,7 +336,7 @@ def main():
                 return_dict_in_generate=True,
                 output_scores=False,
                 logits_processor=logits_processor,
-                layer_mask=mask, # THIS IS THE MAGIC SAUCE!
+                layer_mask=expanded_mask, # Pass the expanded mask!
             )
             
             # Extract generated tokens

@@ -99,7 +99,8 @@ def main():
     if accelerator.is_main_process:
         print("Loading Teacher model...")
     # Load raw teacher
-    raw_teacher = AutoModelForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
+    from models.modeling_qwen2 import Qwen2ForCausalLM
+    raw_teacher = Qwen2ForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
     raw_teacher.eval()
     
     # Wrap teacher for pruning

@@ -110,7 +110,8 @@ def main():
     # 3. Load Teacher
     if accelerator.is_main_process:
         print("Loading Teacher model...")
-    raw_teacher = AutoModelForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
+    from models.modeling_qwen2 import Qwen2ForCausalLM
+    raw_teacher = Qwen2ForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
     raw_teacher.eval()
     
     if hasattr(raw_teacher, "model") and hasattr(raw_teacher.model, "layers"):
@@ -187,47 +188,88 @@ def main():
             mask = static_mask.repeat(batch_size, 1) # [batch, num_layers]
             
             # --- Autoregressive Generation with Flattened Batching ---
-            batch_candidates = [[{"tokens": [], "score": 0.0}] for _ in range(batch_size)]
+            batch_candidates = [[{"tokens": [], "score": 0.0, "past_key_values": None}] for _ in range(batch_size)]
             
             for step in range(3):
                 flat_input_ids = []
                 flat_attention_mask = []
                 flat_layer_mask = []
+                flat_past_key_values = []
                 flat_map = [] 
                 
                 for b in range(batch_size):
                     for c_idx, cand in enumerate(batch_candidates[b]):
                         curr_tokens = cand["tokens"]
-                        if len(curr_tokens) > 0:
-                            curr_input = torch.cat([input_ids[b], torch.tensor(curr_tokens, device=device)])
-                            curr_mask = torch.cat([attention_mask[b], torch.tensor([1]*len(curr_tokens), device=device)])
-                        else:
+                        past_kv = cand["past_key_values"]
+                        
+                        if step == 0:
+                            # Step 0: Input the full prompt
                             curr_input = input_ids[b]
                             curr_mask = attention_mask[b]
+                        else:
+                            # Step > 0: Only input the newly generated token
+                            # The length of input is 1, and attention mask adds 1
+                            curr_input = torch.tensor([curr_tokens[-1]], device=device)
+                            # Attention mask needs to cover the past + 1
+                            past_seq_len = past_kv[0][0].shape[2] if past_kv is not None else attention_mask[b].shape[0]
+                            curr_mask = torch.cat([attention_mask[b], torch.ones(step, device=device)], dim=0)
                             
                         flat_input_ids.append(curr_input)
                         flat_attention_mask.append(curr_mask)
                         flat_layer_mask.append(mask[b])
+                        flat_past_key_values.append(past_kv)
                         flat_map.append((b, c_idx))
                 
                 if not flat_input_ids: continue
 
+                # Pad sequences (Only needed in step 0, in step > 0 all inputs are length 1)
                 flat_input_ids = torch.nn.utils.rnn.pad_sequence(flat_input_ids, batch_first=True, padding_value=pad_token_id)
                 flat_attention_mask = torch.nn.utils.rnn.pad_sequence(flat_attention_mask, batch_first=True, padding_value=0)
                 flat_layer_mask = torch.stack(flat_layer_mask)
                 
+                # Assemble past_key_values for the batch if step > 0
+                batched_past_key_values = None
+                if step > 0:
+                    # Qwen2 past_key_values is a tuple of tuples: ( (k_layer0, v_layer0), (k_layer1, v_layer1), ... )
+                    num_layers_kv = len(flat_past_key_values[0])
+                    batched_past_key_values = []
+                    for l in range(num_layers_kv):
+                        k_list = [kv[l][0] for kv in flat_past_key_values]
+                        v_list = [kv[l][1] for kv in flat_past_key_values]
+                        batched_past_key_values.append((torch.cat(k_list, dim=0), torch.cat(v_list, dim=0)))
+                    batched_past_key_values = tuple(batched_past_key_values)
+                
                 mini_batch_size = 16 
                 num_items = flat_input_ids.size(0)
                 all_next_logits = []
+                all_new_past_kvs = []
                 
                 for i in range(0, num_items, mini_batch_size):
                     mb_input = flat_input_ids[i:i+mini_batch_size]
                     mb_mask = flat_attention_mask[i:i+mini_batch_size]
                     mb_layer_mask = flat_layer_mask[i:i+mini_batch_size]
                     
-                    logits = pruned_teacher(mb_input, mb_mask, mb_layer_mask)
+                    mb_past_kv = None
+                    if batched_past_key_values is not None:
+                        mb_past_kv = tuple(
+                            (k[i:i+mini_batch_size], v[i:i+mini_batch_size]) 
+                            for (k, v) in batched_past_key_values
+                        )
+                    
+                    logits, new_past_kv = pruned_teacher(
+                        mb_input, 
+                        mb_mask, 
+                        mb_layer_mask, 
+                        past_key_values=mb_past_kv, 
+                        use_cache=True
+                    )
                     next_logits = logits[:, -1, :] 
                     all_next_logits.append(next_logits)
+                    
+                    # Unpack mini-batch past_key_values into individual samples
+                    for j in range(mb_input.size(0)):
+                        sample_kv = tuple((k[j:j+1], v[j:j+1]) for k, v in new_past_kv)
+                        all_new_past_kvs.append(sample_kv)
                     
                 all_next_logits = torch.cat(all_next_logits, dim=0)
                 
@@ -238,6 +280,7 @@ def main():
                     cand = batch_candidates[b][c_idx]
                     curr_tokens = cand["tokens"]
                     curr_score = cand["score"]
+                    new_kv = all_new_past_kvs[i]
                     
                     if step == 0:
                         hash_key = prefix_key
@@ -264,7 +307,8 @@ def main():
                         
                         new_batch_candidates[b].append({
                             "tokens": curr_tokens + [idx],
-                            "score": curr_score + val
+                            "score": curr_score + val,
+                            "past_key_values": new_kv
                         })
                 
                 for b in range(batch_size):

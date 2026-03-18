@@ -451,6 +451,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        layer_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -478,6 +479,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            layer_mask=layer_mask,
             **kwargs,
         )
 

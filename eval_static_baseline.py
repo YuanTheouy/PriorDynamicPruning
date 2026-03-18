@@ -40,7 +40,7 @@ def collate_fn(batch):
         # Left padding as required by HF generate for decoder-only models
         # Match evaluate.py logic: [pad] * (max - L) + ids
         # Use simple list concatenation then tensor conversion for consistency
-        padded_ids = [pad_token_id] * (max_len - L) + ids
+        padded_ids = [pad_token_id] * (max_len - L) + ids.tolist()
         padded_mask = [0] * (max_len - L) + [1] * L
         
         padded_input_ids.append(torch.tensor(padded_ids, dtype=torch.long))

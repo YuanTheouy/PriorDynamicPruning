@@ -416,7 +416,100 @@ class Qwen2Model(Qwen2PreTrainedModel):
             # _prepare_4d_causal_attention_mask(attention_mask, input_shape, inputs_embeds, past_key_values_length, sliding_window=None)
             if "input_shape" in sig.parameters and "past_key_values_length" in sig.parameters:
                 batch_size, seq_length = inputs_embeds.shape[:2]
-                past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+                if past_key_values is not None:
+                     past_length = past_key_values.get_seq_length()
+                else:
+                     past_length = 0
+                
+                # The actual fix:
+                # If we are in generation (seq_length=1) and using cache, the `attention_mask` passed might be 2D (B, L+1).
+                # `create_causal_mask` calculates `key_value_length = seq_length + past_length` = 1 + L = L+1.
+                # Then it calls `AttentionMaskConverter.to_4d`.
+                # `to_4d` creates a causal mask of size (1, L+1).
+                # And tries to combine it with `attention_mask` (B, L+1).
+                
+                # If `attention_mask` is 4D, `_prepare_4d_causal_attention_mask` expects (B, 1, seq_length, key_value_length).
+                # If seq_length=1, (B, 1, 1, L+1).
+                
+                # If the error is 121 vs 120, it means off-by-one.
+                # Maybe `past_length` is double counting the current token?
+                # `get_seq_length()` returns TOTAL tokens in cache.
+                # If `DynamicCache` was just updated with the new token BEFORE this forward call, then `past_length` includes current token!
+                # BUT `prepare_inputs_for_generation` calls `forward`.
+                # In `forward`, `past_key_values` are passed.
+                # Usually `model.forward` updates the cache at the END.
+                # So `past_key_values` should NOT contain current token.
+                
+                # HOWEVER, `DynamicCache` in `transformers` updates IN-PLACE if passed to forward?
+                # No, `forward` calls `layer.forward` which calls `self_attn` which calls `past_key_values.update`.
+                # So at the BEGINNING of `Qwen2Model.forward`, `past_key_values` does NOT contain current token.
+                
+                # Let's look at `input_shape`.
+                # `inputs_embeds.shape[:2]`.
+                # If we are using `cache_position`, we might be passing full `input_ids` but masking via `cache_position`?
+                # No, `prepare_inputs_for_generation` slices `input_ids`.
+                
+                # Wait, the error `size of tensor a (121) must match size of tensor b (120)` at dimension 3.
+                # Dimension 3 is the last dimension (key_value_length).
+                # One tensor thinks length is 121, other thinks 120.
+                
+                # Hypotheses:
+                # 1. `attention_mask` has length 121 (correct full length).
+                # 2. `create_causal_mask` thinks length is 120.
+                #    key_value_length = 1 + past_length.
+                #    So 1 + past_length = 120 => past_length = 119.
+                #    But maybe `attention_mask` includes padding?
+                #    Or maybe `past_length` is wrong.
+                
+                # If we look at `_prepare_4d_causal_attention_mask`:
+                # `key_value_length = input_shape[-1] + past_key_values_length`
+                # It uses `key_value_length` to expand `attention_mask` if it's 2D.
+                # `attn_mask_converter.to_4d(..., key_value_length=key_value_length)`
+                # Inside `to_4d`:
+                # `mask.expand(..., key_value_length)`
+                # If `mask` (attention_mask) has shape (B, 121) and we ask to expand to (..., 120), it fails?
+                # No, expand doesn't fail like that usually unless dimensions don't match.
+                
+                # Wait, `RuntimeError: The size of tensor a (121) must match the size of tensor b (120) at non-singleton dimension 3`
+                # This usually happens in element-wise operations like `+` or `masked_fill`.
+                # In `to_4d`:
+                # `expanded_attn_mask = causal_4d_mask.masked_fill(expanded_attn_mask.bool(), ...)`
+                # `causal_4d_mask` is created with `key_value_length` (120).
+                # `expanded_attn_mask` comes from `attention_mask` (121).
+                # So `attention_mask` is 121, but we calculated `key_value_length` as 120.
+                
+                # So `past_length` (119) + `seq_length` (1) = 120.
+                # But `attention_mask` provided is 121.
+                # This means `attention_mask` has one more token than `past + current`.
+                # Why?
+                # Maybe `attention_mask` includes the NEXT token position? Unlikely.
+                # Maybe `past_length` is UNDER-reporting?
+                
+                # Ah! In `prepare_inputs_for_generation`:
+                # We calculate `past_length = past_key_values.get_seq_length()`.
+                # And we slice `input_ids`.
+                
+                # If `attention_mask` passed to `generate` includes Padding?
+                # `attention_mask` shape is (Batch, Total_Sequence_Length_Including_Padding).
+                # If we are at step 120 (0-indexed), total length is 121.
+                
+                # If `past_length` is correct (119), and we process 1 token.
+                # Then total valid tokens = 120.
+                # If `attention_mask` is 121, maybe there is 1 padding token?
+                # Or maybe `attention_mask` was prepared for the WHOLE sequence including future? No.
+                
+                # CRITICAL: `attention_mask` in `forward` is expected to match the current step's effective sequence length.
+                # If `attention_mask` is larger, `_prepare_4d...` fails.
+                
+                # Fix: We should slice `attention_mask` to match `key_value_length` if it's 2D and larger.
+                # `key_value_length = seq_length + past_length`.
+                
+                current_total_len = seq_length + past_length
+                if attention_mask is not None and len(attention_mask.shape) == 2:
+                     if attention_mask.shape[1] > current_total_len:
+                         # Slice the mask to match the expected length
+                         attention_mask = attention_mask[:, :current_total_len]
+                
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(attention_mask, (batch_size, seq_length), inputs_embeds, past_length),
                 }

@@ -310,6 +310,10 @@ def main():
                 print(f"DEBUG: Attention Mask Sample 0: {attention_mask[0].tolist()}")
                 print(f"DEBUG: Layer Mask Shape (Original): {mask.shape}")
                 # print(f"DEBUG: Layer Mask Shape (Expanded): {expanded_mask.shape}")
+                
+                # Check LogitsProcessor
+                print(f"DEBUG: Logits Processor List: {logits_processor}")
+                
                 debug_cnt += 1
 
             # We call the underlying raw_teacher (Qwen2ForCausalLM), passing our custom layer_mask!

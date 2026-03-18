@@ -411,26 +411,30 @@ class Qwen2Model(Qwen2PreTrainedModel):
             # Fix: Different versions of transformers expect different kwargs for the mask creation functions
             import inspect
             sig = inspect.signature(create_causal_mask)
-            valid_kwargs = {k: v for k, v in mask_kwargs.items() if k in sig.parameters}
-            # Fallback for some versions that take specific args
-            if len(valid_kwargs) == 0:
-                # older fallback signature typically takes: attention_mask, input_shape, inputs_embeds, past_key_values_length
+            
+            # Map parameters for older signature manually if needed
+            # _prepare_4d_causal_attention_mask(attention_mask, input_shape, inputs_embeds, past_key_values_length, sliding_window=None)
+            if "input_shape" in sig.parameters and "past_key_values_length" in sig.parameters:
                 batch_size, seq_length = inputs_embeds.shape[:2]
                 past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(attention_mask, (batch_size, seq_length), inputs_embeds, past_length),
                 }
             else:
+                valid_kwargs = {k: v for k, v in mask_kwargs.items() if k in sig.parameters}
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**valid_kwargs),
                 }
+            
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 sig_sliding = inspect.signature(create_sliding_window_causal_mask)
-                valid_kwargs_sliding = {k: v for k, v in mask_kwargs.items() if k in sig_sliding.parameters}
-                if len(valid_kwargs_sliding) == 0:
-                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(attention_mask, (batch_size, seq_length), inputs_embeds, past_length)
+                if "input_shape" in sig_sliding.parameters and "past_key_values_length" in sig_sliding.parameters:
+                     batch_size, seq_length = inputs_embeds.shape[:2]
+                     past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+                     causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(attention_mask, (batch_size, seq_length), inputs_embeds, past_length)
                 else:
+                    valid_kwargs_sliding = {k: v for k, v in mask_kwargs.items() if k in sig_sliding.parameters}
                     causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**valid_kwargs_sliding)
 
         hidden_states = inputs_embeds

@@ -134,6 +134,9 @@ def main():
     # from transformers import Qwen2ForCausalLM
     from models.modeling_qwen2 import Qwen2ForCausalLM
     raw_teacher = Qwen2ForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
+    # Explicitly move model to device (Accelerator usually handles this via prepare, but we are using raw_teacher for generate)
+    # Since we are not using accelerator.prepare_model(raw_teacher), we must move it manually.
+    raw_teacher.to(device)
     raw_teacher.eval()
     
     # Make sure pad_token_id is correctly set in model config

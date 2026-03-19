@@ -179,7 +179,8 @@ def main(
 
             batch_size = len(padding_encodings["input_ids"])
             
-            # Pass layer_mask to generate. It will be passed to prepare_inputs_for_generation
+            # We ALREADY mounted layer_mask to model.model.layer_mask in main()
+            # DO NOT pass it to generate(), otherwise _validate_model_kwargs will crash!
             generation_output = model.generate(
                 torch.tensor(padding_encodings["input_ids"]).to(device),
                 attention_mask=torch.tensor(attention_mask).to(device),
@@ -187,7 +188,6 @@ def main(
                 return_dict_in_generate=True,
                 output_scores=False, # Save memory
                 logits_processor=logits_processor,
-                layer_mask=layer_mask.repeat(batch_size, 1), # [batch_size, num_layers]
             )
        
         batched_completions = generation_output.sequences[:, maxLen:]

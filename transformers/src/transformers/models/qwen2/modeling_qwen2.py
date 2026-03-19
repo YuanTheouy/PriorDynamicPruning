@@ -389,8 +389,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # Extract layer_mask safely
-        layer_mask = kwargs.pop("layer_mask", None)
+        # Extract layer_mask securely (first check kwargs, then check if it was mounted to self)
+        layer_mask = kwargs.pop("layer_mask", getattr(self, "layer_mask", None))
 
         for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None

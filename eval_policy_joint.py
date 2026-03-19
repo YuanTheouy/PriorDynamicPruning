@@ -137,7 +137,10 @@ def main():
     student.to(torch.bfloat16).to(device).eval()
     
     from transformers import Qwen2ForCausalLM
+    # Important: use device_map="auto" or explicitly map to accelerator device
+    # so that the model parameters are actually moved to the correct GPU
     raw_teacher = Qwen2ForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
+    raw_teacher.to(device)
     raw_teacher.eval()
     
     if hasattr(raw_teacher, "model") and hasattr(raw_teacher.model, "layers"):

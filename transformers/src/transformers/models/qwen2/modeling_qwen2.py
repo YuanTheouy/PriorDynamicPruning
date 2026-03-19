@@ -424,7 +424,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+            layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
@@ -434,6 +434,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(

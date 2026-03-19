@@ -207,6 +207,8 @@ class Qwen2RMSNorm(nn.Module):
 class Qwen2DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
         self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
@@ -257,7 +259,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         custom_layer_mask = getattr(self.config, "custom_layer_mask", None)
         if custom_layer_mask is not None:
             # custom_layer_mask is a list of floats [1.0, 1.0, 0.0, ...]
-            if hasattr(self, "layer_idx") and self.layer_idx < len(custom_layer_mask):
+            if self.layer_idx < len(custom_layer_mask):
                 if custom_layer_mask[self.layer_idx] == 0.0:
                     hidden_states = original_hidden_states
         elif layer_mask_i is not None and torch.all(layer_mask_i == 0):
@@ -396,10 +398,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # Force read from self.layer_mask if it exists, ignoring whatever None was passed down
-        layer_mask = getattr(self, "layer_mask", None)
-        if layer_mask is None:
-            layer_mask = kwargs.pop("layer_mask", None)
+        # [CRITICAL FIX] Read mask from self.config (mounted in evaluate_pruned.py)
+        # config is global and survives device_map/accelerate hooks.
+        custom_layer_mask_list = getattr(self.config, "custom_layer_mask", None)
+        if custom_layer_mask_list is not None:
+            layer_mask = torch.tensor(custom_layer_mask_list, device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(0)
+        else:
+            # Fallback to other methods
+            layer_mask = getattr(self, "layer_mask", None)
+            if layer_mask is None:
+                layer_mask = kwargs.pop("layer_mask", None)
 
         for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None
@@ -412,7 +420,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                layer_mask_i=layer_mask_i, # Pass it down
+                layer_mask_i=layer_mask_i, # Pass it down explicitly
                 **kwargs,
             )
 

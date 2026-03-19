@@ -4,7 +4,7 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_qwen2.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-from typing import Callable, Optional, Union, Tuple
+from typing import Callable, Optional, Union
 
 import torch
 from torch import nn
@@ -207,8 +207,6 @@ class Qwen2RMSNorm(nn.Module):
 class Qwen2DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
         self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
@@ -231,7 +229,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        # Extract custom layer_mask_i safely (legacy, kept for fallback)
+        # Extract custom layer_mask_i safely
         layer_mask_i = kwargs.pop("layer_mask_i", None)
         original_hidden_states = hidden_states
         
@@ -257,15 +255,13 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        # [CRITICAL FIX] Read mask from self.config directly using self.layer_idx
+        # [CRITICAL FIX] Identity Replacement with config
         custom_layer_mask = getattr(self.config, "custom_layer_mask", None)
         if custom_layer_mask is not None:
-            # custom_layer_mask is a list of floats [1.0, 1.0, 0.0, ...]
-            if self.layer_idx < len(custom_layer_mask):
+            if hasattr(self, "layer_idx") and self.layer_idx < len(custom_layer_mask):
                 if custom_layer_mask[self.layer_idx] == 0.0:
                     hidden_states = original_hidden_states
         elif layer_mask_i is not None and torch.all(layer_mask_i == 0):
-            # Fallback to kwargs method
             hidden_states = original_hidden_states
             
         outputs = (hidden_states,)
@@ -415,12 +411,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # [CRITICAL FIX] Read mask from self.config (mounted in evaluate_pruned.py)
-        # config is global and survives device_map/accelerate hooks.
         custom_layer_mask_list = getattr(self.config, "custom_layer_mask", None)
         if custom_layer_mask_list is not None:
             layer_mask = torch.tensor(custom_layer_mask_list, device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(0)
         else:
-            # Fallback to other methods
             layer_mask = getattr(self, "layer_mask", None)
             if layer_mask is None:
                 layer_mask = kwargs.pop("layer_mask", None)
@@ -443,7 +437,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                layer_mask_i=layer_mask_i, # Pass it down explicitly
+                layer_mask_i=layer_mask_i, # Pass it down
                 **kwargs,
             )
 

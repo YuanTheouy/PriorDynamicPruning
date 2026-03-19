@@ -535,13 +535,18 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # active_layer_idx = 0  <-- Removed
+        # Fast Path Optimization: If layer_mask is all 1s (No pruning), 
+        # skip the layer_mask_i overhead completely to restore native speed and kernel fusion
+        is_full_layers = (layer_mask is None) or torch.all(layer_mask == 1)
+
         for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None
-            
-            # Optimization: If layer_mask_i is all zeros, skip the layer entirely
-            if layer_mask_i is not None and torch.all(layer_mask_i == 0):
-                continue
+            if is_full_layers:
+                layer_mask_i = None
+            else:
+                layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None
+                # Optimization: If layer_mask_i is all zeros, skip the layer entirely
+                if layer_mask_i is not None and torch.all(layer_mask_i == 0):
+                    continue
 
             hidden_states = decoder_layer(
                 hidden_states,
@@ -555,7 +560,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 layer_idx=idx,  # Use physical layer index `idx`
                 **kwargs,
             )
-            # active_layer_idx += 1 <-- Removed
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(

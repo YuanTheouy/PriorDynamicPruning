@@ -235,8 +235,8 @@ def main():
     def evaluate(
             encodings,
             num_beams=10,
-            max_new_tokens=64,
-            length_penalty=1.0,
+            max_new_tokens=256,  # Fix: Match evaluate.py
+            length_penalty=0.0,  # Fix: Match evaluate.py
             **kwargs,
     ):
         maxLen = max([len(_["input_ids"]) for _ in encodings])
@@ -339,9 +339,9 @@ def main():
         # Use standard evaluation
         real_outputs, padded_input_ids = evaluate(
             batch_encodings, 
-            max_new_tokens=64, 
+            max_new_tokens=256, # Fix: Match evaluate.py
             num_beams=args.top_k_items, 
-            length_penalty=1.0
+            length_penalty=0.0  # Fix: Match evaluate.py
         )
         
         for i, preds in enumerate(real_outputs):

@@ -207,6 +207,8 @@ class Qwen2RMSNorm(nn.Module):
 class Qwen2DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
         self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)

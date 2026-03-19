@@ -1,3 +1,15 @@
 /transformers-ori/
 /LayerSkip/
 /Flexidepth/
+
+# ====================================================
+# Transformers local library exclusions
+# Only track the 'src/' directory to avoid bloat
+# ====================================================
+transformers/*
+!transformers/src/
+!transformers/src/**
+
+# Optionally, you can also keep the license and readme if you want
+!transformers/LICENSE
+!transformers/README.md

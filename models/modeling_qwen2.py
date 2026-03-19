@@ -535,7 +535,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        active_layer_idx = 0
+        # active_layer_idx = 0  <-- Removed
         for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None
             
@@ -552,10 +552,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 layer_mask_i=layer_mask_i,
-                layer_idx=active_layer_idx,
+                layer_idx=idx,  # Use physical layer index `idx`
                 **kwargs,
             )
-            active_layer_idx += 1
+            # active_layer_idx += 1 <-- Removed
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(

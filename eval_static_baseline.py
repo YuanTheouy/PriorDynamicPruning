@@ -251,25 +251,6 @@ def main():
 
     with torch.no_grad():
         for batch in pbar:
-            # IMPORTANT FIX: In evaluate.py, num_beams=50 is passed to ConstrainedLogitsProcessor.
-            # But the input_ids passed to it are NOT yet expanded by beam search in the first step?
-            # Actually, `model.generate` handles beam search expansion internally.
-            # However, LogitsProcessor is called AFTER beam expansion.
-            # So `input_ids` seen by LogitsProcessor will have shape (batch_size * num_beams, seq_len).
-            # Our `ConstrainedLogitsProcessor` expects this structure and reshapes it:
-            # input_ids.view(-1, self._num_beams, input_ids.shape[-1])
-            
-            # So we must ensure `num_beams` passed to CLP matches `generation_config.num_beams`.
-            # args.top_k_items is used for both. This seems correct.
-            
-            clp = ConstrainedLogitsProcessor(
-                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
-                num_beams=args.top_k_items,
-                base_model=args.teacher_model,
-                eos_token_id=tokenizer.eos_token_id
-            )
-            logits_processor = LogitsProcessorList([clp])
-
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             batch_size = input_ids.size(0)
@@ -278,70 +259,44 @@ def main():
             # Use fixed mask for all samples in batch
             mask = static_mask.repeat(batch_size, 1) # [batch, num_layers]
             
-            # CRITICAL: If using beam search, layer_mask needs to be expanded to match beam size!
-            # model.generate expands input_ids and attention_mask, but it DOES NOT know how to expand `layer_mask` automatically
-            # unless we hook into `prepare_inputs_for_generation` properly or pass it pre-expanded?
-            # NO, `prepare_inputs_for_generation` is called inside generate.
-            # If we pass `layer_mask` via kwargs to generate, it is passed to `prepare_inputs_for_generation`.
-            # `GenerationMixin._expand_inputs_for_generation` handles expansion.
-            # It expands items in `model_kwargs` if they match batch size.
-            
-            # The previous RuntimeError (20000 vs 400) suggests that `model.generate` IS automatically expanding `layer_mask`!
-            # Why? Because `layer_mask` has shape (batch_size, num_layers).
-            # `model.generate` sees that dimension 0 matches batch_size (8), so it repeats it `num_beams` (50) times.
-            # Result: (8 * 50, num_layers) = (400, 28).
-            
-            # BUT, we manually expanded it to (400, 28) BEFORE passing it!
-            # So `model.generate` saw (400, 28). Since batch_size=8, 400 != 8.
-            # So `model.generate` probably treated it as a non-batch argument?
-            # Wait, `RuntimeError: The size of tensor a (20000) must match the size of tensor b (400)`.
-            # 20000 = 400 * 50.
-            # This means `model.generate` DID expand our already-expanded mask!
-            # It saw (400, 28) and expanded it 50 times -> (20000, 28).
-            # But `hidden_states` was (400, ...).
-            # So we should NOT manually expand it. `model.generate` is smart enough to do it for us because dim 0 matches batch_size.
-            
-            # Revert manual expansion.
-            
+            # Define prefix_allowed_tokens_fn wrapper for generate
+            # Captures prefix_index and prompt length (max_len)
+            def custom_prefix_allowed_tokens_fn(batch_id, sent):
+                # sent is tensor of shape [seq_len] containing generated tokens so far
+                # including the prompt? Yes, generate passes full sequence.
+                
+                curr_len = sent.shape[0]
+                gen_len = curr_len - max_len
+                
+                if gen_len == 0:
+                    # Step 0: use last `prefix_index` tokens of prompt
+                    hash_key = sent[-prefix_index:].tolist()
+                else:
+                    # Step > 0: use last `gen_len` tokens
+                    # Corresponds to: hash_key = sent[-self.count:]
+                    # where count increments 1, 2, 3...
+                    hash_key = sent[-gen_len:].tolist()
+                
+                # prefix_allowed_tokens_fn_semantic expects list of ints
+                return prefix_allowed_tokens_fn_semantic(batch_id, hash_key)
+
             # DEBUG PRINT
             if accelerator.is_main_process and debug_cnt == 0:
                 print(f"DEBUG: Input IDs Shape: {input_ids.shape}")
                 print(f"DEBUG: Input IDs Sample 0: {input_ids[0].tolist()}")
                 print(f"DEBUG: Attention Mask Sample 0: {attention_mask[0].tolist()}")
                 print(f"DEBUG: Layer Mask Shape (Original): {mask.shape}")
-                # print(f"DEBUG: Layer Mask Shape (Expanded): {expanded_mask.shape}")
-                
-                # Check LogitsProcessor
-                print(f"DEBUG: Logits Processor List: {logits_processor}")
                 
                 debug_cnt += 1
 
-            # We call the underlying raw_teacher (Qwen2ForCausalLM), passing our custom layer_mask!
-            # FIX: Ensure logits_processor is not overridden by generation_config defaults
-            # Try passing all arguments explicitly and NOT passing generation_config
             generation_output = raw_teacher.generate(
                 input_ids,
                 attention_mask=attention_mask,
-                # generation_config=generation_config, # DISABLE THIS to avoid conflicts
-                logits_processor=logits_processor,
-                layer_mask=mask, 
-                
-                # Explicitly pass generation args
-                num_beams=args.top_k_items,
-                num_return_sequences=args.top_k_items,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                max_new_tokens=3,
-                top_k=None,
-                top_p=None,
+                generation_config=generation_config, # Use the config object
                 return_dict_in_generate=True,
                 output_scores=False,
-                
-                # CRITICAL: Force use of provided logits_processor even if beam search uses its own
-                # But wait, Qwen2ForCausalLM uses GenerationMixin.
-                # In GenerationMixin.generate, logits_processor is merged with default ones.
-                # If we use beam search, BeamSearchLogitsProcessor is added.
-                # Our custom processor should be there.
+                prefix_allowed_tokens_fn=custom_prefix_allowed_tokens_fn, # Use native parameter
+                layer_mask=mask, 
             )
             
             # Extract generated tokens

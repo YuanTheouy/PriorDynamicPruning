@@ -228,7 +228,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        # Extract custom layer_mask_i safely
+        # Extract custom layer_mask_i safely (legacy, kept for fallback)
         layer_mask_i = kwargs.pop("layer_mask_i", None)
         original_hidden_states = hidden_states
         
@@ -253,8 +253,15 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        # Naive LayerSkip: Identity Replacement
-        if layer_mask_i is not None and torch.all(layer_mask_i == 0):
+        # [CRITICAL FIX] Read mask from self.config directly using self.layer_idx
+        custom_layer_mask = getattr(self.config, "custom_layer_mask", None)
+        if custom_layer_mask is not None:
+            # custom_layer_mask is a list of floats [1.0, 1.0, 0.0, ...]
+            if hasattr(self, "layer_idx") and self.layer_idx < len(custom_layer_mask):
+                if custom_layer_mask[self.layer_idx] == 0.0:
+                    hidden_states = original_hidden_states
+        elif layer_mask_i is not None and torch.all(layer_mask_i == 0):
+            # Fallback to kwargs method
             hidden_states = original_hidden_states
             
         return hidden_states

@@ -79,8 +79,8 @@ def main(
     # Move mask to device
     layer_mask = mask.to(dtype=torch.bfloat16).to(device).unsqueeze(0) # [1, num_layers]
 
-    # Mount mask to model so our modified Qwen2Model.forward can pick it up if kwargs fails
-    model.model.layer_mask = layer_mask
+    # [CRITICAL FIX] Mount to model.config instead of model.model to survive device_map and accelerate
+    model.config.custom_layer_mask = mask.tolist()
 
     with open(info_file, 'r') as f:
         info = f.readlines()

@@ -1,9 +1,19 @@
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# [CRITICAL] Inject local transformers library dynamically based on script location
+current_dir = os.path.dirname(os.path.abspath(__file__))
+transformers_src_path = os.path.join(current_dir, "transformers", "src")
+sys.path.insert(0, transformers_src_path)
+
+import transformers
+print(f"DEBUG: Transformers library path: {transformers.__file__}")
+
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen2ForCausalLM
 import argparse
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -99,7 +109,6 @@ def main():
     if accelerator.is_main_process:
         print("Loading Teacher model...")
     # Load raw teacher
-    from transformers import Qwen2ForCausalLM
     raw_teacher = Qwen2ForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
     raw_teacher.eval()
     
@@ -249,6 +258,14 @@ def main():
             # --- 5. Loss ---
             loss = F.kl_div(log_pruned_probs, target_probs, reduction='batchmean') * (args.temperature ** 2)
             
+            # --- DEBUG: Print requires_grad ---
+            if accelerator.is_main_process:
+                print(f"DEBUG: mask.requires_grad = {mask.requires_grad}")
+                print(f"DEBUG: pruned_logits.requires_grad = {pruned_logits.requires_grad}")
+                print(f"DEBUG: loss.requires_grad = {loss.requires_grad}")
+                if not loss.requires_grad:
+                    print("CRITICAL ERROR: Loss does not require grad. The backward pass will fail!")
+
             # Backward
             optimizer.zero_grad()
             accelerator.backward(loss)

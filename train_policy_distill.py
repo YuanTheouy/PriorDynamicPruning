@@ -257,14 +257,6 @@ def main():
 
             # --- 5. Loss ---
             loss = F.kl_div(log_pruned_probs, target_probs, reduction='batchmean') * (args.temperature ** 2)
-            
-            # --- DEBUG: Print requires_grad ---
-            if accelerator.is_main_process:
-                print(f"DEBUG: mask.requires_grad = {mask.requires_grad}")
-                print(f"DEBUG: pruned_logits.requires_grad = {pruned_logits.requires_grad}")
-                print(f"DEBUG: loss.requires_grad = {loss.requires_grad}")
-                if not loss.requires_grad:
-                    print("CRITICAL ERROR: Loss does not require grad. The backward pass will fail!")
 
             # Backward
             optimizer.zero_grad()

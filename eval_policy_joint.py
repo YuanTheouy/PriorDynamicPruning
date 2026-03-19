@@ -225,7 +225,10 @@ def main():
                 for i in range(0, num_items, mini_batch_size):
                     mb_input = flat_input_ids[i:i+mini_batch_size]
                     mb_mask = flat_attention_mask[i:i+mini_batch_size]
-                    mb_layer_mask = flat_layer_mask[i:i+mini_batch_size]
+                    
+                    # [CRITICAL FIX] Convert Tensor mask to List of Floats to trigger Ghost Cache (Physical Skip)
+                    # instead of Soft Mixing which is slow during evaluation.
+                    mb_layer_mask = flat_layer_mask[i:i+mini_batch_size].cpu().tolist()
                     
                     logits = pruned_teacher(mb_input, mb_mask, mb_layer_mask)
                     # Take logits of the last token

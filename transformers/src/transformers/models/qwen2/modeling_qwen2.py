@@ -432,6 +432,54 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        # Omit tokens covered by past_key_values
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values.get_seq_length()
+                max_cache_length = past_key_values.get_max_cache_shape()
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            # Keep only the unprocessed tokens:
+            # 1. If the length of the cache is different from the input_ids length, then we only want the new tokens
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+
+            # If we are about to go beyond the maximum length, we need to crop the input_ids
+            if (
+                max_cache_length is not None
+                and input_ids.shape[1] > max_cache_length
+            ):
+                input_ids = input_ids[:, :max_cache_length]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        layer_mask = kwargs.get("layer_mask", None)
+
+        model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
+            "inputs_embeds": inputs_embeds,
+            "layer_mask": layer_mask,
+        }
+        return model_inputs
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -472,6 +520,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            layer_mask=kwargs.pop("layer_mask", None),
             **kwargs,
         )
 

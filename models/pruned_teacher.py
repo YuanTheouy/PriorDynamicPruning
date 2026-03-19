@@ -22,6 +22,12 @@ class PrunedTeacherWrapper(nn.Module):
         # 将 layer_mask 挂载到 teacher.config 上，避免修改 forward 的 kwargs 传参
         self.teacher.config.custom_layer_mask = layer_mask
         
+        # 为了绝对安全，遍历所有 layer 的 config 进行挂载，防止 config 对象不一致导致掩码丢失
+        if hasattr(self.teacher, "model") and hasattr(self.teacher.model, "layers"):
+            for layer in self.teacher.model.layers:
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                    layer.self_attn.config.custom_layer_mask = layer_mask
+        
         # 调用 teacher_model 的 forward 方法
         outputs = self.teacher(
             input_ids=input_ids,
@@ -33,6 +39,11 @@ class PrunedTeacherWrapper(nn.Module):
         
         # 清理挂载的 mask，防止影响其他前向传播
         self.teacher.config.custom_layer_mask = None
+        if hasattr(self.teacher, "model") and hasattr(self.teacher.model, "layers"):
+            for layer in self.teacher.model.layers:
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                    layer.self_attn.config.custom_layer_mask = None
+        
         
         # 根据是否 use_cache 返回不同结果，适配推理循环
         if use_cache:

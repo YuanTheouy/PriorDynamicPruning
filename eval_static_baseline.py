@@ -239,10 +239,11 @@ def main():
         
     generation_config = GenerationConfig(
         num_beams=args.top_k_items,
+        length_penalty=1.0,
         num_return_sequences=args.top_k_items,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        max_new_tokens=3,  # Since SID is 3 tokens long
+        max_new_tokens=64,  # Aligned with evaluate.py
         top_k=None,
         top_p=None,
     )
@@ -259,26 +260,14 @@ def main():
             # Use fixed mask for all samples in batch
             mask = static_mask.repeat(batch_size, 1) # [batch, num_layers]
             
-            # Define prefix_allowed_tokens_fn wrapper for generate
-            # Captures prefix_index and prompt length (max_len)
-            def custom_prefix_allowed_tokens_fn(batch_id, sent):
-                # sent is tensor of shape [seq_len] containing generated tokens so far
-                # including the prompt? Yes, generate passes full sequence.
-                
-                curr_len = sent.shape[0]
-                gen_len = curr_len - max_len
-                
-                if gen_len == 0:
-                    # Step 0: use last `prefix_index` tokens of prompt
-                    hash_key = sent[-prefix_index:].tolist()
-                else:
-                    # Step > 0: use last `gen_len` tokens
-                    # Corresponds to: hash_key = sent[-self.count:]
-                    # where count increments 1, 2, 3...
-                    hash_key = sent[-gen_len:].tolist()
-                
-                # prefix_allowed_tokens_fn_semantic expects list of ints
-                return prefix_allowed_tokens_fn_semantic(batch_id, hash_key)
+            # Restore ConstrainedLogitsProcessor to exactly match evaluate.py
+            clp = ConstrainedLogitsProcessor(
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
+                num_beams=args.top_k_items,
+                base_model=args.teacher_model,
+                eos_token_id=tokenizer.eos_token_id
+            )
+            logits_processor = LogitsProcessorList([clp])
 
             # DEBUG PRINT
             if accelerator.is_main_process and debug_cnt == 0:
@@ -295,30 +284,32 @@ def main():
                 generation_config=generation_config, # Use the config object
                 return_dict_in_generate=True,
                 output_scores=False,
-                prefix_allowed_tokens_fn=custom_prefix_allowed_tokens_fn, # Use native parameter
+                logits_processor=logits_processor, # Use ConstrainedLogitsProcessor
                 layer_mask=mask, 
             )
             
             # Extract generated tokens
             batched_completions = generation_output.sequences[:, max_len:]
             
+            # Align decoding with evaluate.py
+            if args.teacher_model.lower().find("llama") > -1:
+                output = tokenizer.batch_decode(batched_completions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            else:
+                output = tokenizer.batch_decode(batched_completions, skip_special_tokens=True)
+                
+            output = [_.split("Response:\n")[-1].strip() for _ in output]
+            
             # DEBUG PRINT GENERATION
             if accelerator.is_main_process and debug_cnt == 1:
                 print(f"DEBUG: Generated Sequences Shape: {generation_output.sequences.shape}")
-                print(f"DEBUG: Generated Sample 0: {generation_output.sequences[0, max_len:].tolist()}")
+                print(f"DEBUG: Generated Sample 0: {output[0]}")
                 debug_cnt += 1
 
             # Group back into batch_size x top_k_items
-            batched_completions = batched_completions.view(batch_size, args.top_k_items, -1)
+            real_outputs = [output[i * args.top_k_items: (i + 1) * args.top_k_items] for i in range(batch_size)]
             
             for b in range(batch_size):
-                sample_preds = []
-                for k in range(args.top_k_items):
-                    pred_tokens = batched_completions[b, k].tolist()
-                    # Clean up padding/eos tokens
-                    pred_tokens = [t for t in pred_tokens if t != tokenizer.eos_token_id and t != tokenizer.pad_token_id]
-                    pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True).replace('Ġ', '')
-                    sample_preds.append(pred_str)
+                sample_preds = real_outputs[b]
                 
                 # Original input string
                 input_ids_clean = [int(t) for t in input_ids[b].tolist() if t != tokenizer.pad_token_id]

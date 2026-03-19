@@ -223,21 +223,57 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        original_hidden_states = hidden_states
+    ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        # --- PHYSICAL ACCELERATION (GHOST CACHE) ---
+        # Before doing any heavy computation, check if we need to skip this layer
+        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
+            layer_idx = self.self_attn.layer_idx
+            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
+            
+            if custom_layer_mask is not None and layer_idx < len(custom_layer_mask) and custom_layer_mask[layer_idx] == 0.0:
+                # We want to SKIP this layer to save time.
+                # BUT we must maintain the KV cache length for Beam Search.
+                # So we push "ghost" (all zero) keys and values into the cache.
+                if use_cache and past_key_values is not None:
+                    # Figure out the shape of the K/V tensors for this layer
+                    # Qwen2 shape: (batch_size, num_key_value_heads, seq_len, head_dim)
+                    batch_size = hidden_states.shape[0]
+                    seq_len = hidden_states.shape[1]
+                    num_kv_heads = self.self_attn.config.num_key_value_heads
+                    head_dim = self.self_attn.head_dim
+                    
+                    # Create ghost tensors (zeros) on the correct device and dtype
+                    ghost_k = torch.zeros((batch_size, num_kv_heads, seq_len, head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+                    ghost_v = torch.zeros((batch_size, num_kv_heads, seq_len, head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+                    
+                    # Update the cache for THIS layer with ghost data
+                    cos, sin = position_embeddings
+                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                    past_key_values.update(ghost_k, ghost_v, layer_idx, cache_kwargs)
+                
+                # Directly return the input (Identity) without computing Self-Attention and MLP!
+                # This achieves TRUE PHYSICAL ACCELERATION.
+                outputs = (hidden_states,)
+                if output_attentions:
+                    # Return empty attention weights if requested
+                    outputs += (None,)
+                return outputs
+        # --------------------------------------------
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
@@ -251,18 +287,11 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # [CRITICAL FIX] Non-invasive Identity Replacement
-        # To avoid modifying __init__ (which breaks accelerate/device_map), 
-        # we dynamically get the layer index from self.self_attn.layer_idx
-        # and the mask from the global configuration if it exists.
-        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
-            layer_idx = self.self_attn.layer_idx
-            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
-            if custom_layer_mask is not None and layer_idx < len(custom_layer_mask):
-                if custom_layer_mask[layer_idx] == 0.0:
-                    hidden_states = original_hidden_states
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
 
-        return hidden_states
+        return outputs
 
 
 @auto_docstring

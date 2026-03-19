@@ -228,6 +228,8 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        original_hidden_states = hidden_states
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -248,6 +250,18 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        # [CRITICAL FIX] Non-invasive Identity Replacement
+        # To avoid modifying __init__ (which breaks accelerate/device_map), 
+        # we dynamically get the layer index from self.self_attn.layer_idx
+        # and the mask from the global configuration if it exists.
+        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
+            layer_idx = self.self_attn.layer_idx
+            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
+            if custom_layer_mask is not None and layer_idx < len(custom_layer_mask):
+                if custom_layer_mask[layer_idx] == 0.0:
+                    hidden_states = original_hidden_states
+
         return hidden_states
 
 

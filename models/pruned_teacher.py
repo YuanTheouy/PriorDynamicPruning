@@ -19,17 +19,20 @@ class PrunedTeacherWrapper(nn.Module):
             past_key_values: tuple of KV caches for generation
             use_cache: whether to return past_key_values
         """
-        # 直接调用魔改后的 teacher_model 的 forward 方法，传入 layer_mask
-        # 由于我们已经在 modeling_qwen2.py 中支持了 layer_mask 参数及 Soft Mixing，
-        # 外部不再需要手动提取 embedding, RoPE, 和进行 Layer 循环。
+        # 将 layer_mask 挂载到 teacher.config 上，避免修改 forward 的 kwargs 传参
+        self.teacher.config.custom_layer_mask = layer_mask
+        
+        # 调用 teacher_model 的 forward 方法
         outputs = self.teacher(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            layer_mask=layer_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=False # 推理时不需要隐藏层，节省显存
         )
+        
+        # 清理挂载的 mask，防止影响其他前向传播
+        self.teacher.config.custom_layer_mask = None
         
         # 根据是否 use_cache 返回不同结果，适配推理循环
         if use_cache:

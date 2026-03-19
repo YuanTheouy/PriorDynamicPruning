@@ -229,13 +229,14 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        original_hidden_states = hidden_states
         # --- PHYSICAL ACCELERATION (GHOST CACHE) ---
         # Before doing any heavy computation, check if we need to skip this layer
         if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
             layer_idx = self.self_attn.layer_idx
             custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
             
-            if custom_layer_mask is not None and layer_idx < len(custom_layer_mask) and custom_layer_mask[layer_idx] == 0.0:
+            if custom_layer_mask is not None and isinstance(custom_layer_mask, list) and layer_idx < len(custom_layer_mask) and custom_layer_mask[layer_idx] == 0.0:
                 # We want to SKIP this layer to save time.
                 # BUT we must maintain the KV cache length for Beam Search.
                 # So we push "ghost" (all zero) keys and values into the cache.
@@ -286,6 +287,18 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        # --- SOFT MIXING (STE) FOR TRAINING ---
+        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
+            layer_idx = self.self_attn.layer_idx
+            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
+            
+            if custom_layer_mask is not None and isinstance(custom_layer_mask, torch.Tensor):
+                if layer_idx < custom_layer_mask.size(1):
+                    # extract mask for this layer: [batch_size]
+                    layer_mask_i = custom_layer_mask[:, layer_idx].view(-1, 1, 1).to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    # apply soft mixing
+                    hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
 
         outputs = (hidden_states,)
         if output_attentions:

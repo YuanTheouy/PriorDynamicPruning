@@ -207,8 +207,6 @@ class Qwen2RMSNorm(nn.Module):
 class Qwen2DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
         self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
@@ -250,7 +248,6 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
         return hidden_states
 
 
@@ -383,16 +380,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # [CRITICAL FIX] Read mask from self.config (mounted in evaluate_pruned.py)
-        custom_layer_mask_list = getattr(self.config, "custom_layer_mask", None)
-        if custom_layer_mask_list is not None:
-            layer_mask = torch.tensor(custom_layer_mask_list, device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(0)
-        else:
-            layer_mask = getattr(self, "layer_mask", None)
-            if layer_mask is None:
-                layer_mask = kwargs.pop("layer_mask", None)
-
-        for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -426,54 +414,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-    ):
-        # Omit tokens covered by past_key_values
-        if past_key_values is not None:
-            if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.get_seq_length()
-                max_cache_length = past_key_values.get_max_cache_shape()
-            else:
-                cache_length = past_length = past_key_values[0][0].shape[2]
-                max_cache_length = None
-
-            # Keep only the unprocessed tokens:
-            # 1. If the length of the cache is different from the input_ids length, then we only want the new tokens
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-
-            # If we are about to go beyond the maximum length, we need to crop the input_ids
-            if (
-                max_cache_length is not None
-                and input_ids.shape[1] > max_cache_length
-            ):
-                input_ids = input_ids[:, :max_cache_length]
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-        layer_mask = kwargs.get("layer_mask", None)
-
-        model_inputs = {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache"),
-            "attention_mask": attention_mask,
-            "inputs_embeds": inputs_embeds,
-            "layer_mask": layer_mask,
-        }
-        return model_inputs
-
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -506,9 +446,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        # Remove layer_mask if it exists in kwargs so it doesn't get passed to self.model
-        kwargs.pop("layer_mask", None)
-        
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

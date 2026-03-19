@@ -195,6 +195,25 @@ def main(
             )
             logits_processor = LogitsProcessorList([clp])
 
+            # ================= DEBUG INFO START ================
+            if not hasattr(evaluate, "debug_printed_full"):
+                print("\n================ EVALUATE.PY DEBUG INFO START ================")
+                print(f"[Model Config] bos_token_id: {model.config.bos_token_id}, eos_token_id: {model.config.eos_token_id}, pad_token_id: {model.config.pad_token_id}")
+                print(f"[Tokenizer] bos: {tokenizer.bos_token_id}, eos: {tokenizer.eos_token_id}, pad: {tokenizer.pad_token_id}")
+                
+                input_tensor = torch.tensor(padding_encodings["input_ids"])
+                print(f"[Input IDs] Shape: {input_tensor.shape}")
+                print(f"[Input IDs Sample 0 (Last 15 tokens)]: {input_tensor[0, -15:].tolist()}")
+                
+                attn_tensor = torch.tensor(attention_mask)
+                print(f"[Attention Mask Sample 0 (Last 15 tokens)]: {attn_tensor[0, -15:].tolist()}")
+                
+                print(f"[Hash Dict Size] Semantic: {len(hash_dict)}")
+                print(f"[Generation Config] num_beams: {generation_config.num_beams}, max_new_tokens: {generation_config.max_new_tokens}, length_penalty: {generation_config.length_penalty}")
+                print("================ EVALUATE.PY DEBUG INFO END ================\n")
+                evaluate.debug_printed_full = True
+            # ================= DEBUG INFO END ================
+
             generation_output = model.generate(
                 torch.tensor(padding_encodings["input_ids"]).to(device),
                 attention_mask=torch.tensor(attention_mask).to(device),

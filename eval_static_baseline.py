@@ -115,9 +115,10 @@ def main():
 
     # 1. Prepare Tokenizer & SID Vocab
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # evaluate.py does NOT do this immediately, but does it later. 
+    # Let's match evaluate.py exactly.
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
     
     # CRITICAL FIX: evaluate.py seems to be using 151645 for padding (repetition_penalty/eos related?)
@@ -143,15 +144,18 @@ def main():
         print("Loading Teacher model...")
     # from transformers import Qwen2ForCausalLM
     from models.modeling_qwen2 import Qwen2ForCausalLM
+    # FIX: evaluate.py uses device_map="auto" and loads model via AutoModelForCausalLM
+    # We must ensure Qwen2ForCausalLM loads exactly the same way.
     raw_teacher = Qwen2ForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.bfloat16)
-    # Explicitly move model to device (Accelerator usually handles this via prepare, but we are using raw_teacher for generate)
-    # Since we are not using accelerator.prepare_model(raw_teacher), we must move it manually.
     raw_teacher.to(device)
     raw_teacher.eval()
     
     # Make sure pad_token_id is correctly set in model config
     raw_teacher.config.pad_token_id = tokenizer.pad_token_id
     raw_teacher.config.eos_token_id = tokenizer.eos_token_id
+    # evaluate.py does: model.config.pad_token_id = model.config.eos_token_id = tokenizer.eos_token_id
+    # AND model.config.bos_token_id = tokenizer.bos_token_id
+    raw_teacher.config.bos_token_id = tokenizer.bos_token_id
     
     if hasattr(raw_teacher, "model") and hasattr(raw_teacher.model, "layers"):
         num_layers = len(raw_teacher.model.layers)
@@ -228,98 +232,126 @@ def main():
             return hash_dict[hash_number]
         return []
 
-    # 5. Inference Loop with Native generate()
+    def evaluate(
+            encodings,
+            num_beams=10,
+            max_new_tokens=64,
+            length_penalty=1.0,
+            **kwargs,
+    ):
+        maxLen = max([len(_["input_ids"]) for _ in encodings])
+
+        padding_encodings = {"input_ids": []}
+        attention_mask = []
+
+        for  _ in encodings:
+            L = len(_["input_ids"])
+            padding_encodings["input_ids"].append([tokenizer.pad_token_id] * (maxLen - L) + _["input_ids"])
+            attention_mask.append([0] * (maxLen - L) + [1] * L) 
+
+        # print(f"num_beams: {num_beams}")
+        generation_config = GenerationConfig(
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+            num_return_sequences=num_beams,
+            pad_token_id = raw_teacher.config.pad_token_id,
+            eos_token_id = raw_teacher.config.eos_token_id,
+            max_new_tokens = max_new_tokens,
+            top_k=None,
+            top_p=None,
+            **kwargs
+        )
+        
+        with torch.no_grad():
+            clp = ConstrainedLogitsProcessor(
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
+                num_beams=num_beams,
+                base_model=args.teacher_model,
+                eos_token_id=raw_teacher.config.eos_token_id
+            )
+            logits_processor = LogitsProcessorList([clp])
+
+            batch_size = len(padding_encodings["input_ids"])
+            # Use fixed mask for all samples in batch
+            mask = static_mask.repeat(batch_size, 1) # [batch, num_layers]
+
+            # ================= DEBUG INFO START ================
+            if not hasattr(evaluate, "debug_printed") and accelerator.is_main_process:
+                print("\n================ EVAL_STATIC_BASELINE DEBUG INFO START ================")
+                print(f"[Model Config] bos_token_id: {raw_teacher.config.bos_token_id}, eos_token_id: {raw_teacher.config.eos_token_id}, pad_token_id: {raw_teacher.config.pad_token_id}")
+                print(f"[Tokenizer] bos: {tokenizer.bos_token_id}, eos: {tokenizer.eos_token_id}, pad: {tokenizer.pad_token_id}")
+                
+                input_tensor = torch.tensor(padding_encodings["input_ids"])
+                print(f"[Input IDs] Shape: {input_tensor.shape}")
+                print(f"[Input IDs Sample 0 (Last 15 tokens)]: {input_tensor[0, -15:].tolist()}")
+                
+                attn_tensor = torch.tensor(attention_mask)
+                print(f"[Attention Mask Sample 0 (Last 15 tokens)]: {attn_tensor[0, -15:].tolist()}")
+                
+                print(f"[Hash Dict Size] Semantic: {len(hash_dict)}")
+                print(f"[Generation Config] num_beams: {generation_config.num_beams}, max_new_tokens: {generation_config.max_new_tokens}, length_penalty: {generation_config.length_penalty}")
+                print("================ EVAL_STATIC_BASELINE DEBUG INFO END ================\n")
+                evaluate.debug_printed = True
+            # ================= DEBUG INFO END ================
+
+            generation_output = raw_teacher.generate(
+                torch.tensor(padding_encodings["input_ids"]).to(device),
+                attention_mask=torch.tensor(attention_mask).to(device),
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=False,
+                logits_processor=logits_processor,
+                layer_mask=mask,
+            )
+       
+        batched_completions = generation_output.sequences[:, maxLen:]
+       
+        
+        if args.teacher_model.lower().find("llama") > -1:
+            output = tokenizer.batch_decode(batched_completions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        else:
+            output = tokenizer.batch_decode(batched_completions, skip_special_tokens=True)
+            
+        output = [_.split("Response:\n")[-1].strip() for _ in output]
+        real_outputs = [output[i * num_beams: (i + 1) * num_beams] for i in range(len(output) // num_beams)]
+        return real_outputs, padding_encodings["input_ids"]
+
+    # 5. Inference Loop
     all_predictions = []
     
     if accelerator.is_main_process:
         print("Starting Static Baseline Inference (Accelerated via model.generate)...")
-        pbar = tqdm(dataloader)
+    
+    # We need to manually batch to use evaluate function
+    # Instead of dataloader, we iterate over dataset manually to match evaluate.py
+    encodings = [dataset[i] for i in range(len(dataset))]
+    new_encodings = []
+    BLOCK = (len(encodings) + args.batch_size - 1) // args.batch_size
+    for i in range(BLOCK):
+        new_encodings.append(encodings[i * args.batch_size: (i + 1) * args.batch_size])
+
+    if accelerator.is_main_process:
+        pbar = tqdm(new_encodings)
     else:
-        pbar = dataloader
+        pbar = new_encodings
+
+    for batch_encodings in pbar:
+        # Use standard evaluation
+        real_outputs, padded_input_ids = evaluate(
+            batch_encodings, 
+            max_new_tokens=64, 
+            num_beams=args.top_k_items, 
+            length_penalty=1.0
+        )
         
-    generation_config = GenerationConfig(
-        num_beams=args.top_k_items,
-        length_penalty=1.0,
-        num_return_sequences=args.top_k_items,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        max_new_tokens=64,  # Aligned with evaluate.py
-        top_k=None,
-        top_p=None,
-    )
-
-    debug_cnt = 0
-
-    with torch.no_grad():
-        for batch in pbar:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            batch_size = input_ids.size(0)
-            max_len = input_ids.size(1)
-            
-            # Use fixed mask for all samples in batch
-            mask = static_mask.repeat(batch_size, 1) # [batch, num_layers]
-            
-            # Restore ConstrainedLogitsProcessor to exactly match evaluate.py
-            clp = ConstrainedLogitsProcessor(
-                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
-                num_beams=args.top_k_items,
-                base_model=args.teacher_model,
-                eos_token_id=tokenizer.eos_token_id
-            )
-            logits_processor = LogitsProcessorList([clp])
-
-            # DEBUG PRINT
-            if accelerator.is_main_process and debug_cnt == 0:
-                print(f"DEBUG: Input IDs Shape: {input_ids.shape}")
-                print(f"DEBUG: Input IDs Sample 0: {input_ids[0].tolist()}")
-                print(f"DEBUG: Attention Mask Sample 0: {attention_mask[0].tolist()}")
-                print(f"DEBUG: Layer Mask Shape (Original): {mask.shape}")
-                
-                debug_cnt += 1
-
-            generation_output = raw_teacher.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                generation_config=generation_config, # Use the config object
-                return_dict_in_generate=True,
-                output_scores=False,
-                logits_processor=logits_processor, # Use ConstrainedLogitsProcessor
-                layer_mask=mask, 
-            )
-            
-            # Extract generated tokens
-            batched_completions = generation_output.sequences[:, max_len:]
-            
-            # Align decoding with evaluate.py
-            if args.teacher_model.lower().find("llama") > -1:
-                output = tokenizer.batch_decode(batched_completions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            else:
-                output = tokenizer.batch_decode(batched_completions, skip_special_tokens=True)
-                
-            output = [_.split("Response:\n")[-1].strip() for _ in output]
-            
-            # DEBUG PRINT GENERATION
-            if accelerator.is_main_process and debug_cnt == 1:
-                print(f"DEBUG: Generated Sequences Shape: {generation_output.sequences.shape}")
-                print(f"DEBUG: Generated Sample 0: {output[0]}")
-                debug_cnt += 1
-
-            # Group back into batch_size x top_k_items
-            real_outputs = [output[i * args.top_k_items: (i + 1) * args.top_k_items] for i in range(batch_size)]
-            
-            for b in range(batch_size):
-                sample_preds = real_outputs[b]
-                
-                # Original input string
-                input_ids_clean = [int(t) for t in input_ids[b].tolist() if t != tokenizer.pad_token_id]
-                input_str = tokenizer.decode(input_ids_clean, skip_special_tokens=True)
-                
-                all_predictions.append({
-                    "input": input_str,
-                    "sample_predictions": sample_preds,
-                    "layer_mask": mask[b].cpu().tolist()
-                })
+        for i, preds in enumerate(real_outputs):
+            input_ids_clean = [t for t in padded_input_ids[i] if t != tokenizer.pad_token_id]
+            input_str = tokenizer.decode(input_ids_clean, skip_special_tokens=True)
+            all_predictions.append({
+                "input": input_str,
+                "sample_predictions": preds,
+                "layer_mask": static_mask_cpu.tolist()
+            })
 
     rank_output_file = args.output_file.replace(".json", f"_rank{accelerator.process_index}.json")
     os.makedirs(os.path.dirname(rank_output_file), exist_ok=True)

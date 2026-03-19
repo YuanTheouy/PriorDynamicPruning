@@ -1,7 +1,14 @@
 
 import sys
-# [CRITICAL] Inject local transformers library at the very beginning
-sys.path.insert(0, "/Users/bytedance/Documents/MiniOneRec/transformers/src")
+import os
+
+# [CRITICAL] Inject local transformers library dynamically based on script location
+current_dir = os.path.dirname(os.path.abspath(__file__))
+transformers_src_path = os.path.join(current_dir, "transformers", "src")
+sys.path.insert(0, transformers_src_path)
+
+import transformers
+print(f"DEBUG: Transformers library path: {transformers.__file__}")
 
 import pandas as pd
 import fire

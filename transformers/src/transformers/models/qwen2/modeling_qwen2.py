@@ -230,9 +230,6 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        # Extract custom layer_mask_i safely
-        layer_mask_i = kwargs.pop("layer_mask_i", None)
-        
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -396,8 +393,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 layer_mask = kwargs.pop("layer_mask", None)
 
         for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None
-            
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -406,7 +401,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                layer_mask_i=layer_mask_i, # Pass it down explicitly
                 **kwargs,
             )
 
@@ -512,6 +506,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        # Remove layer_mask if it exists in kwargs so it doesn't get passed to self.model
+        kwargs.pop("layer_mask", None)
+        
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -520,7 +517,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
-            layer_mask=kwargs.pop("layer_mask", None),
             **kwargs,
         )
 

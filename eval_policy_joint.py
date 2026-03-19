@@ -1,8 +1,18 @@
+import sys
 import os
+
+# [CRITICAL] Inject local transformers library dynamically based on script location
+current_dir = os.path.dirname(os.path.abspath(__file__))
+transformers_src_path = os.path.join(current_dir, "transformers", "src")
+sys.path.insert(0, transformers_src_path)
+
+import transformers
+print(f"DEBUG: Transformers library path: {transformers.__file__}")
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, LogitsProcessorList
 import argparse
 from tqdm import tqdm
 import json
@@ -11,9 +21,9 @@ from accelerate import Accelerator
 
 from models.one_layer_student import OneLayerStudentModel
 from models.router import LayerRouter
-from models.pruned_teacher import PrunedTeacherWrapper
 from utils_distill import get_sid_token_ids_from_info
 from data import EvalSidDataset
+from LogitProcessor import ConstrainedLogitsProcessor
 
 def get_hash(x):
     x = [str(_) for _ in x]
@@ -139,8 +149,9 @@ def main():
     if accelerator.is_main_process:
         print(f"Teacher has {num_layers} layers.")
 
-    pruned_teacher = PrunedTeacherWrapper(raw_teacher)
-    pruned_teacher.to(device)
+    raw_teacher.config.pad_token_id = tokenizer.eos_token_id
+    raw_teacher.config.eos_token_id = tokenizer.eos_token_id
+    raw_teacher.config.bos_token_id = tokenizer.bos_token_id
     
     hidden_size = student.backbone.config.hidden_size
     router = LayerRouter(hidden_size, num_layers, args.top_k_layers)
@@ -164,136 +175,83 @@ def main():
         pbar = tqdm(dataloader)
     else:
         pbar = dataloader
+
+    def prefix_allowed_tokens_fn_semantic(batch_id, input_ids):
+        hash_number = get_hash(input_ids)
+        if hash_number in hash_dict:
+            return hash_dict[hash_number]
+        return []
         
     with torch.no_grad():
         for batch in pbar:
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
             batch_size = input_ids.size(0)
+            max_len = input_ids.size(1)
             
-            # --- Step 0: Get Router Mask ---
+            # --- Step 1: Get Router Mask via Student ---
             student_out = student(input_ids, attention_mask)
             last_hidden_state = student_out["last_hidden_state"]
             last_indices = attention_mask.sum(dim=1) - 1
             state = last_hidden_state[torch.arange(batch_size, device=device), last_indices]
-            mask, _ = router(state) # [batch, num_layers]
+            mask, _ = router(state) # [batch, num_layers] Tensor
             
-            # --- Autoregressive Generation with Flattened Batching ---
+            # Convert mask to 2D list for modeling_qwen2.py
+            list_mask = mask.cpu().tolist()
+            raw_teacher.config.custom_layer_mask = list_mask
+
+            # --- Step 2: Native model.generate() with Beam Search ---
+            generation_config = GenerationConfig(
+                num_beams=args.top_k_items,
+                length_penalty=1.0,
+                num_return_sequences=args.top_k_items,
+                pad_token_id = raw_teacher.config.pad_token_id,
+                eos_token_id = raw_teacher.config.eos_token_id,
+                max_new_tokens = 256,
+                top_k=None,
+                top_p=None,
+            )
             
-            # Current Candidates: List of Top-K candidates for each sample in batch
-            # Structure: batch_candidates[b] = list of {"tokens": [...], "score": ...}
-            batch_candidates = [[{"tokens": [], "score": 0.0}] for _ in range(batch_size)]
+            clp = ConstrainedLogitsProcessor(
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn_semantic,
+                num_beams=args.top_k_items,
+                base_model=args.teacher_model,
+                eos_token_id=raw_teacher.config.eos_token_id
+            )
+            logits_processor = LogitsProcessorList([clp])
             
-            # We will perform 3 generation steps
-            for step in range(3):
-                # Flatten all candidates to run a single large batch
-                flat_input_ids = []
-                flat_attention_mask = []
-                flat_layer_mask = []
-                
-                # Metadata to reconstruct batch structure
-                # Mapping from flat_idx -> (batch_idx, candidate_idx)
-                flat_map = [] 
-                
-                for b in range(batch_size):
-                    for c_idx, cand in enumerate(batch_candidates[b]):
-                        curr_tokens = cand["tokens"]
-                        # Construct input: prompt + generated tokens
-                        if len(curr_tokens) > 0:
-                            curr_input = torch.cat([input_ids[b], torch.tensor(curr_tokens, device=device)])
-                            curr_mask = torch.cat([attention_mask[b], torch.tensor([1]*len(curr_tokens), device=device)])
-                        else:
-                            curr_input = input_ids[b]
-                            curr_mask = attention_mask[b]
-                            
-                        flat_input_ids.append(curr_input)
-                        flat_attention_mask.append(curr_mask)
-                        flat_layer_mask.append(mask[b])
-                        flat_map.append((b, c_idx))
-                
-                # Pad flattened batch
-                flat_input_ids = torch.nn.utils.rnn.pad_sequence(flat_input_ids, batch_first=True, padding_value=pad_token_id)
-                flat_attention_mask = torch.nn.utils.rnn.pad_sequence(flat_attention_mask, batch_first=True, padding_value=0)
-                flat_layer_mask = torch.stack(flat_layer_mask)
-                
-                # Split into mini-batches to avoid OOM
-                # Teacher model is large, so we process e.g. 16 at a time
-                mini_batch_size = 16 
-                num_items = flat_input_ids.size(0)
-                all_next_logits = []
-                
-                for i in range(0, num_items, mini_batch_size):
-                    mb_input = flat_input_ids[i:i+mini_batch_size]
-                    mb_mask = flat_attention_mask[i:i+mini_batch_size]
-                    
-                    # [CRITICAL FIX] Convert Tensor mask to List of Floats to trigger Ghost Cache (Physical Skip)
-                    # instead of Soft Mixing which is slow during evaluation.
-                    mb_layer_mask = flat_layer_mask[i:i+mini_batch_size].cpu().tolist()
-                    
-                    logits = pruned_teacher(mb_input, mb_mask, mb_layer_mask)
-                    # Take logits of the last token
-                    next_logits = logits[:, -1, :] # [mini_batch, vocab]
-                    all_next_logits.append(next_logits)
-                    
-                all_next_logits = torch.cat(all_next_logits, dim=0) # [total_candidates, vocab]
-                
-                # Process logits and update candidates
-                new_batch_candidates = [[] for _ in range(batch_size)]
-                
-                for i, (b, c_idx) in enumerate(flat_map):
-                    logits = all_next_logits[i]
-                    cand = batch_candidates[b][c_idx]
-                    curr_tokens = cand["tokens"]
-                    curr_score = cand["score"]
-                    
-                    # Constraint
-                    if step == 0:
-                        hash_key = prefix_key
-                        # For step 0, we use prefix_key
-                        allowed_globals = hash_dict.get(hash_key, [])
-                    else:
-                        hash_key = get_hash(curr_tokens)
-                        allowed_globals = hash_dict.get(hash_key, [])
-                        
-                    mask_trie = torch.full_like(logits, float('-inf'))
-                    if allowed_globals:
-                         valid_allowed = [g for g in allowed_globals if g < logits.size(0)]
-                         if valid_allowed:
-                             mask_trie[torch.tensor(valid_allowed, device=device)] = 0
-                    
-                    logits = logits + mask_trie
-                    log_probs = F.log_softmax(logits, dim=-1)
-                    
-                    # Top-K expansion per candidate
-                    topk_vals, topk_indices = torch.topk(log_probs, args.top_k_items)
-                    
-                    for k in range(args.top_k_items):
-                        val = topk_vals[k].item()
-                        idx = topk_indices[k].item()
-                        if val == float('-inf'): continue
-                        
-                        new_batch_candidates[b].append({
-                            "tokens": curr_tokens + [idx],
-                            "score": curr_score + val
-                        })
-                
-                # Prune to Top-K per batch item
-                for b in range(batch_size):
-                    new_batch_candidates[b].sort(key=lambda x: x["score"], reverse=True)
-                    batch_candidates[b] = new_batch_candidates[b][:args.top_k_items]
+            generation_output = raw_teacher.generate(
+                input_ids.to(device),
+                attention_mask=attention_mask.to(device),
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=False,
+                logits_processor=logits_processor,
+            )
             
-            # Finalize Batch Predictions
+            # Clear mask
+            raw_teacher.config.custom_layer_mask = None
+            
+            # --- Step 3: Decode Outputs ---
+            batched_completions = generation_output.sequences[:, max_len:]
+            
+            if args.teacher_model.lower().find("llama") > -1:
+                output_strs = tokenizer.batch_decode(batched_completions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            else:
+                output_strs = tokenizer.batch_decode(batched_completions, skip_special_tokens=True)
+                
+            output_strs = [_.split("Response:\n")[-1].strip() for _ in output_strs]
+            
+            # Group by batch_size (each input has num_beams outputs)
             for b in range(batch_size):
-                sample_preds = []
-                for cand in batch_candidates[b]:
-                    pred_tokens = tokenizer.convert_ids_to_tokens(cand["tokens"])
-                    pred_str = "".join(pred_tokens).replace('Ġ', '')
-                    sample_preds.append(pred_str)
+                start_idx = b * args.top_k_items
+                end_idx = (b + 1) * args.top_k_items
+                sample_preds = output_strs[start_idx:end_idx]
                 
                 all_predictions.append({
                     "input": tokenizer.decode(input_ids[b], skip_special_tokens=True),
                     "sample_predictions": sample_preds,
-                    "layer_mask": mask[b].cpu().tolist()
+                    "layer_mask": list_mask[b]
                 })
 
     # Save Partial Results

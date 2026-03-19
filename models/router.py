@@ -27,15 +27,25 @@ class LayerRouter(nn.Module):
         
         # Top-K Selection
         # We want to select the top k layers to KEEP
-        topk_values, topk_indices = torch.topk(scores, self.top_k, dim=-1)
-        
+        # To avoid Mode Collapse (where unselected layers get 0 gradient),
+        # we inject Gumbel noise during training to encourage exploration.
+        if self.training:
+            # Gumbel(0, 1) noise
+            noise = -torch.empty_like(scores).exponential_(1e-5).log()
+            # Add noise to scores (temperature can be adjusted)
+            noisy_scores = scores + noise * 1.0 
+            topk_values, topk_indices = torch.topk(noisy_scores, self.top_k, dim=-1)
+        else:
+            # Deterministic for inference
+            topk_values, topk_indices = torch.topk(scores, self.top_k, dim=-1)
+            
         # Create Hard Mask
         mask_hard = torch.zeros_like(scores)
         mask_hard.scatter_(-1, topk_indices, 1.0)
         
         # Straight-Through Estimator (STE)
         # Forward pass: uses mask_hard (binary)
-        # Backward pass: gradients flow through scores
-        mask = (mask_hard - scores).detach() + scores
+        # Backward pass: gradients flow through scores (using sigmoid to bound the gradient scale)
+        mask = (mask_hard - torch.sigmoid(scores)).detach() + torch.sigmoid(scores)
         
         return mask, scores

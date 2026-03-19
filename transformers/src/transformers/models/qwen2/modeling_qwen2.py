@@ -315,9 +315,17 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
             # Handle 2D list for batched evaluation where some samples skip and some don't
             if custom_layer_mask is not None and isinstance(custom_layer_mask, list) and len(custom_layer_mask) > 0 and isinstance(custom_layer_mask[0], list):
                 # Only apply soft mixing if we DID NOT skip the entire layer for the whole batch
-                # Create a tensor mask for this layer [batch_size, 1, 1]
+                # Create a tensor mask for this layer
                 batch_mask = [row[layer_idx] for row in custom_layer_mask]
                 layer_mask_i = torch.tensor(batch_mask, device=hidden_states.device, dtype=hidden_states.dtype).view(-1, 1, 1)
+                
+                # [CRITICAL FIX for Beam Search]
+                # In Beam Search, hidden_states shape is [batch_size * num_beams, seq_len, hidden_size]
+                # But custom_layer_mask is only [batch_size, num_layers].
+                # We need to repeat/expand the mask to match the beam size.
+                if hidden_states.size(0) != layer_mask_i.size(0):
+                    num_beams = hidden_states.size(0) // layer_mask_i.size(0)
+                    layer_mask_i = layer_mask_i.repeat_interleave(num_beams, dim=0)
                 
                 # Soft mixing for inference: if mask is 0.0 for a sample, it restores original_hidden_states
                 hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states

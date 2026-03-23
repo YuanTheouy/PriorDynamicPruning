@@ -258,8 +258,13 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
                 # custom_layer_mask shape: [batch_size, num_layers]
                 if layer_idx < custom_layer_mask.size(1):
                     # 如果这一个 batch 里所有的 mask 都是 0.0，我们就可以安全跳过这层计算，使用 Ghost Cache
-                    if (custom_layer_mask[:, layer_idx] == 0.0).all():
-                        skip_layer = True
+                    # 这里有一个极其重要的坑：如果是 STE，mask 在前向传播时是 0/1 离散的。
+                    # 但是由于是训练，如果这一层被完全物理跳过（不经过 self_attn 和 mlp），
+                    # 那么这层对应的权重就不会产生任何计算图节点，在 DDP 下会引发 find_unused_parameters 甚至反向传播中断。
+                    # 更严重的是，如果 skip_layer = True，后续 Soft Mixing 也不会有梯度（因为没算 hidden_states）。
+                    # 因此，在训练时（Tensor mask），我们 **绝对不能** 进行物理跳过！
+                    # 我们必须算完 self_attn 和 mlp，然后让 Soft Mixing (STE) 去阻断信息并传递梯度。
+                    pass
 
             if skip_layer:
                 # We want to SKIP this layer to save time.

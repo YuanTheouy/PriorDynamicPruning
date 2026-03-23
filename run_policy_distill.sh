@@ -18,7 +18,7 @@ BATCH_SIZE=8 # This will be per-GPU batch size
 EPOCHS=3
 LEARNING_RATE=1e-4
 TEMPERATURE=1.0
-TOP_K_LAYERS=12
+TOP_K_LAYERS=21
 
 # Output Directory
 OUTPUT_DIR="./policy_ckpts/unfrozon/${CATEGORY}"

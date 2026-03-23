@@ -255,7 +255,31 @@ def main():
             # Log Probs for KL
             log_pruned_probs = F.log_softmax(active_pruned_sid_logits / args.temperature, dim=-1)
 
-            # --- 5. Loss ---
+            # --- 5. Debug Metrics (Approx NDCG/HR) ---
+            if accelerator.is_main_process and total_loss == 0: # Only print once per epoch start to avoid flooding
+                with torch.no_grad():
+                    # Get top predictions for both
+                    top_full = torch.argmax(active_full_sid_logits, dim=-1) # [num_active]
+                    top_pruned = torch.argmax(active_pruned_sid_logits, dim=-1) # [num_active]
+                    
+                    # Match rate between pruned and full teacher
+                    match_rate = (top_full == top_pruned).float().mean()
+                    
+                    # Target item match rate
+                    # active_labels are the token_ids we want to predict
+                    active_labels = shift_labels[shift_valid_mask]
+                    # We need to map active_labels to sid_token_ids indices
+                    # This is complex, let's just use token_ids directly for a quick check
+                    full_preds_ids = torch.tensor(sid_token_ids, device=device)[top_full]
+                    pruned_preds_ids = torch.tensor(sid_token_ids, device=device)[top_pruned]
+                    
+                    full_acc = (full_preds_ids == active_labels).float().mean()
+                    pruned_acc = (pruned_preds_ids == active_labels).float().mean()
+                    
+                    print(f"\nDEBUG: [Match with Full: {match_rate:.4f}] [Full Acc: {full_acc:.4f}] [Pruned Acc: {pruned_acc:.4f}]")
+                    print(f"DEBUG: Mask sample (first 5 layers): {mask[0, :5].tolist()}")
+
+            # --- 6. Loss ---
             loss = F.kl_div(log_pruned_probs, target_probs, reduction='batchmean') * (args.temperature ** 2)
 
             # Backward

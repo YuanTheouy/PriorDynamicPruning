@@ -229,34 +229,13 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        original_hidden_states = hidden_states
         # --- PHYSICAL ACCELERATION (GHOST CACHE) ---
         # Before doing any heavy computation, check if we need to skip this layer
         if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
             layer_idx = self.self_attn.layer_idx
             custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
             
-            # Support 2D list for batch inference: custom_layer_mask shape [batch_size, num_layers]
-            # We skip ONLY if all samples in the batch have mask == 0.0 for this layer
-            skip_layer = False
-            if custom_layer_mask is not None and isinstance(custom_layer_mask, list) and layer_idx < len(custom_layer_mask):
-                if isinstance(custom_layer_mask[layer_idx], list):
-                    # 2D case (eval_policy_joint.py)
-                    # We transpose conceptually: we need to check if all batch elements for THIS layer are 0
-                    # Wait, custom_layer_mask is [batch_size][num_layers]. 
-                    pass # Handled below
-                else:
-                    # 1D case (evaluate_pruned.py)
-                    # [CRITICAL FIX] Need to cast to float before checking to handle int/float mixed lists safely
-                    if float(custom_layer_mask[layer_idx]) == 0.0:
-                        skip_layer = True
-            
-            if custom_layer_mask is not None and isinstance(custom_layer_mask, list) and len(custom_layer_mask) > 0 and isinstance(custom_layer_mask[0], list):
-                # It's a 2D list [batch_size, num_layers]
-                if all(float(mask_row[layer_idx]) == 0.0 for mask_row in custom_layer_mask):
-                    skip_layer = True
-
-            if skip_layer:
+            if custom_layer_mask is not None and layer_idx < len(custom_layer_mask) and custom_layer_mask[layer_idx] == 0.0:
                 # We want to SKIP this layer to save time.
                 # BUT we must maintain the KV cache length for Beam Search.
                 # So we push "ghost" (all zero) keys and values into the cache.
@@ -307,46 +286,6 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
-        # --- SOFT MIXING (STE) FOR TRAINING OR BATCHED EVALUATION ---
-        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
-            layer_idx = self.self_attn.layer_idx
-            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
-            
-            # Handle 2D list for batched evaluation where some samples skip and some don't
-            if custom_layer_mask is not None and isinstance(custom_layer_mask, list) and len(custom_layer_mask) > 0 and isinstance(custom_layer_mask[0], list):
-                # [CRITICAL FIX] Avoid Soft Mixing if the whole batch skipped this layer
-                # If the whole batch skipped, skip_layer would be True and we wouldn't even reach here!
-                # Wait, if we reached here, it means AT LEAST ONE sample needs this layer.
-                # So we DO need to apply soft mixing.
-                
-                # Create a tensor mask for this layer
-                batch_mask = [float(row[layer_idx]) for row in custom_layer_mask]
-                layer_mask_i = torch.tensor(batch_mask, device=hidden_states.device, dtype=hidden_states.dtype).view(-1, 1, 1)
-                
-                # [CRITICAL FIX for Beam Search]
-                if hidden_states.size(0) != layer_mask_i.size(0):
-                    num_beams = hidden_states.size(0) // layer_mask_i.size(0)
-                    layer_mask_i = layer_mask_i.repeat_interleave(num_beams, dim=0)
-                
-                # Soft mixing for inference
-                hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
-                
-            # [CRITICAL FIX] Handle 1D list for static baselines (evaluate_pruned.py)
-            elif custom_layer_mask is not None and isinstance(custom_layer_mask, list) and len(custom_layer_mask) > 0 and not isinstance(custom_layer_mask[0], list):
-                # If we reached here with a 1D list, it means custom_layer_mask[layer_idx] != 0.0
-                # It should be 1.0. In that case, layer_mask_i is 1.0.
-                # 1.0 * hidden_states + 0.0 * original = hidden_states
-                # So we actually DON'T need to do anything! The hidden_states is already computed.
-                pass
-
-            # Handle Tensor mask for Training (STE)
-            elif custom_layer_mask is not None and isinstance(custom_layer_mask, torch.Tensor):
-                if layer_idx < custom_layer_mask.size(1):
-                    # extract mask for this layer: [batch_size]
-                    layer_mask_i = custom_layer_mask[:, layer_idx].view(-1, 1, 1).to(device=hidden_states.device, dtype=hidden_states.dtype)
-                    # apply soft mixing
-                    hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
 
         outputs = (hidden_states,)
         if output_attentions:

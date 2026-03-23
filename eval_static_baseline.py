@@ -274,6 +274,15 @@ def main():
             )
             logits_processor = LogitsProcessorList([clp])
 
+            # ---------------------------------------------------------
+            # [CRITICAL FIX] Use config mounting instead of kwargs!
+            # ---------------------------------------------------------
+            # In your original evaluate_pruned.py, you mounted the mask to the config:
+            # model.config.custom_layer_mask = mask.tolist()
+            # Do NOT pass layer_mask=mask in the generate() function kwargs!
+            
+            raw_teacher.config.custom_layer_mask = static_mask_cpu.tolist()
+
             generation_output = raw_teacher.generate(
                 input_ids,
                 attention_mask=attention_mask,
@@ -281,8 +290,11 @@ def main():
                 return_dict_in_generate=True,
                 output_scores=False,
                 logits_processor=logits_processor,
-                layer_mask=mask,
             )
+            
+            # Clean up the mask after generation
+            raw_teacher.config.custom_layer_mask = None
+            # ---------------------------------------------------------
             
             batched_completions = generation_output.sequences[:, max_len:]
             

@@ -229,6 +229,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        original_hidden_states = hidden_states
         # --- PHYSICAL ACCELERATION (GHOST CACHE) ---
         # Before doing any heavy computation, check if we need to skip this layer
         if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):

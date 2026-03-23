@@ -287,6 +287,34 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        # --- SOFT MIXING (STE) FOR TRAINING OR BATCHED EVALUATION ---
+        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
+            layer_idx = self.self_attn.layer_idx
+            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
+            
+            # Handle 2D list for batched evaluation where some samples skip and some don't
+            if custom_layer_mask is not None and isinstance(custom_layer_mask, list) and len(custom_layer_mask) > 0 and isinstance(custom_layer_mask[0], list):
+                # Create a tensor mask for this layer
+                batch_mask = [float(row[layer_idx]) for row in custom_layer_mask]
+                layer_mask_i = torch.tensor(batch_mask, device=hidden_states.device, dtype=hidden_states.dtype).view(-1, 1, 1)
+                
+                # [CRITICAL FIX for Beam Search]
+                if hidden_states.size(0) != layer_mask_i.size(0):
+                    num_beams = hidden_states.size(0) // layer_mask_i.size(0)
+                    layer_mask_i = layer_mask_i.repeat_interleave(num_beams, dim=0)
+                
+                # Soft mixing for inference: if mask is 0.0 for a sample, it restores original_hidden_states
+                hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
+
+            # Handle Tensor mask for Training (STE)
+            elif custom_layer_mask is not None and isinstance(custom_layer_mask, torch.Tensor):
+                if layer_idx < custom_layer_mask.size(1):
+                    # extract mask for this layer: [batch_size]
+                    layer_mask_i = custom_layer_mask[:, layer_idx].view(-1, 1, 1).to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    # apply soft mixing
+                    hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
+        # ------------------------------------------------------------
+
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)

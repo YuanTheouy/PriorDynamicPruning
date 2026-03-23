@@ -253,6 +253,14 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
                 if all(float(mask_row[layer_idx]) == 0.0 for mask_row in custom_layer_mask):
                     skip_layer = True
 
+            # [CRITICAL FIX] Support Tensor mask for Training (STE)
+            if custom_layer_mask is not None and isinstance(custom_layer_mask, torch.Tensor):
+                # custom_layer_mask shape: [batch_size, num_layers]
+                if layer_idx < custom_layer_mask.size(1):
+                    # 如果这一个 batch 里所有的 mask 都是 0.0，我们就可以安全跳过这层计算，使用 Ghost Cache
+                    if (custom_layer_mask[:, layer_idx] == 0.0).all():
+                        skip_layer = True
+
             if skip_layer:
                 # We want to SKIP this layer to save time.
                 # BUT we must maintain the KV cache length for Beam Search.
@@ -329,6 +337,9 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
                 if layer_idx < custom_layer_mask.size(1):
                     # extract mask for this layer: [batch_size]
                     layer_mask_i = custom_layer_mask[:, layer_idx].view(-1, 1, 1).to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    
+                    # Ensure seq_len dimension matches if necessary, though broadcasting usually handles [batch_size, 1, 1] * [batch_size, seq_len, hidden_dim]
+                    # original_hidden_states is the exact input.
                     # apply soft mixing
                     hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
         # ------------------------------------------------------------

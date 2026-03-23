@@ -1,8 +1,16 @@
 import os
+import sys
+
+# [CRITICAL FIX] Inject local transformers library dynamically based on script location
+# If we don't do this, it will load the system transformers and completely ignore your ghost cache logic!
+current_dir = os.path.dirname(os.path.abspath(__file__))
+transformers_src_path = os.path.join(current_dir, "transformers", "src")
+sys.path.insert(0, transformers_src_path)
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, GenerationConfig, LogitsProcessorList
+from transformers import AutoTokenizer, GenerationConfig, LogitsProcessorList, Qwen2ForCausalLM
 import argparse
 from tqdm import tqdm
 import json
@@ -142,14 +150,11 @@ def main():
     # 3. Load Teacher
     if accelerator.is_main_process:
         print("Loading Teacher model...")
-    # from transformers import Qwen2ForCausalLM
-    from models.modeling_qwen2 import Qwen2ForCausalLM
-    # FIX: Force SDPA or FlashAttention to fix the 10x performance regression!
-    # evaluate.py natively uses SDPA via AutoModel automatically.
+        
     raw_teacher = Qwen2ForCausalLM.from_pretrained(
         args.teacher_model, 
         torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa" # <--- THIS IS THE MAGIC FIX FOR SPEED
+        attn_implementation="sdpa"
     )
     raw_teacher.to(device)
     raw_teacher.eval()

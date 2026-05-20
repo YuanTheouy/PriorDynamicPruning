@@ -181,7 +181,8 @@ def assignment_entropy(template_ids: Sequence[str]) -> float:
         return 0.0
     counts = Counter(template_ids)
     total = float(sum(counts.values()))
-    return -sum((count / total) * math.log(count / total + 1e-12) for count in counts.values())
+    entropy = -sum((count / total) * math.log(count / total + 1e-12) for count in counts.values())
+    return max(0.0, entropy)
 
 
 def mask_entropy(masks: Sequence[Sequence[int]]) -> float:

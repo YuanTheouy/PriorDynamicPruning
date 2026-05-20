@@ -244,7 +244,7 @@ def dynamic_masks(
         state = last_hidden_state[torch.arange(input_ids.size(0), device=input_ids.device), last_indices]
         mask, scores = router(state)
 
-    if args.dynamic_selection == "template_library":
+    if args.method == "dynamic" and args.dynamic_selection == "template_library":
         budget_templates = filter_templates(templates, budget=args.top_k_layers)
         template_ids, masks = select_template_ids_from_scores(scores, budget_templates)
         return masks, template_ids, scores.detach().float().cpu().tolist()
@@ -252,6 +252,46 @@ def dynamic_masks(
     hard_masks = [[int(round(float(v))) for v in row] for row in mask.detach().float().cpu().tolist()]
     template_ids = [f"router_topk_k{sum(row)}" for row in hard_masks]
     return hard_masks, template_ids, scores.detach().float().cpu().tolist()
+
+
+def input_guided_masks(args, input_ids, attention_mask, templates: Sequence[LayerTemplate]):
+    """Select finite templates from prompt/input features, without executing an LLM prefix.
+
+    This is a lightweight PuDDing/IG-style baseline hook. It intentionally uses the
+    same template library as OPAL but only cheap prompt features, so any gain from
+    OPAL can be attributed to internal prefix evidence rather than to the library.
+    """
+    budget_templates = filter_templates(templates, budget=args.top_k_layers)
+    lengths = attention_mask.detach().long().sum(dim=1).cpu().tolist()
+    token_sums = (input_ids.detach().long() * attention_mask.detach().long()).sum(dim=1).cpu().tolist()
+    last_tokens = []
+    for row, mask in zip(input_ids.detach().long(), attention_mask.detach().long()):
+        active = row[mask.bool()]
+        last_tokens.append(int(active[-1].item()) if active.numel() else 0)
+
+    template_ids = []
+    masks = []
+    features = []
+    for length, token_sum, last_token in zip(lengths, token_sums, last_tokens):
+        if args.input_guided_selector == "length":
+            selector_value = int(length)
+        elif args.input_guided_selector == "hash":
+            selector_value = int(token_sum)
+        else:
+            selector_value = int(token_sum) + 131 * int(length) + 17 * int(last_token)
+        idx = (selector_value + int(args.seed)) % len(budget_templates)
+        template = budget_templates[idx]
+        template_ids.append(template.template_id)
+        masks.append(template.mask)
+        features.append(
+            {
+                "length": int(length),
+                "token_sum_mod": int(token_sum) % 1_000_003,
+                "last_token_id": int(last_token),
+                "selector_value_mod": int(selector_value) % 1_000_003,
+            }
+        )
+    return masks, template_ids, features
 
 
 def set_custom_mask(model, mask_payload):
@@ -438,7 +478,11 @@ def import_runtime_dependencies():
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Unified OPAL-LLM evaluation for MiniOneRec/Qwen.")
-    parser.add_argument("--method", choices=["full", "static", "dynamic", "oracle"], required=True)
+    parser.add_argument(
+        "--method",
+        choices=["full", "static", "dynamic", "input_guided", "layerwise_router", "oracle"],
+        required=True,
+    )
     parser.add_argument("--teacher_model", required=True)
     parser.add_argument("--test_file", required=True)
     parser.add_argument("--info_file", required=True)
@@ -451,6 +495,12 @@ def build_parser():
     parser.add_argument("--template_strategies", default=",".join(DEFAULT_TEMPLATE_STRATEGIES))
     parser.add_argument("--static_strategy", default="uniform")
     parser.add_argument("--dynamic_selection", choices=["topk_mask", "template_library"], default="template_library")
+    parser.add_argument(
+        "--input_guided_selector",
+        choices=["length", "hash", "length_hash"],
+        default="length_hash",
+        help="Prompt-feature selector for the PuDDing/IG-style baseline.",
+    )
     parser.add_argument("--budgets", default="")
     parser.add_argument("--top_k_layers", type=int, default=21)
     parser.add_argument("--top_k_items", type=int, default=50)
@@ -527,7 +577,7 @@ def main():
         static_template = static_template_from_args(args, num_layers, templates)
 
     student = router = None
-    if args.method == "dynamic":
+    if args.method in {"dynamic", "layerwise_router"}:
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
 
     timer = GenerationTimer(warmup_batches=args.warmup_batches, timed_batches=args.timed_batches)
@@ -600,6 +650,70 @@ def main():
                     timer,
                 )
         else:
+            if args.method == "input_guided":
+                masks, template_ids, input_guided_features = input_guided_masks(
+                    args, input_ids, attention_mask, templates
+                )
+                if args.group_by_template:
+                    outputs = generate_grouped_by_template(
+                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, timer
+                    )
+                else:
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        timer,
+                    )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    predictions.append(
+                        {
+                            "index": int(sample_index),
+                            "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                            "sample_predictions": outputs[local_pos],
+                            "layer_mask": masks[local_pos],
+                            "template_id": template_ids[local_pos],
+                            "input_guided_features": input_guided_features[local_pos],
+                        }
+                    )
+                continue
+
+            if args.method == "layerwise_router":
+                masks, template_ids, router_scores = dynamic_masks(
+                    args, student, router, input_ids, attention_mask, templates, num_layers
+                )
+                if args.group_by_template:
+                    outputs = generate_grouped_by_template(
+                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, timer
+                    )
+                else:
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        timer,
+                    )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    predictions.append(
+                        {
+                            "index": int(sample_index),
+                            "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                            "sample_predictions": outputs[local_pos],
+                            "layer_mask": masks[local_pos],
+                            "template_id": template_ids[local_pos],
+                            "router_scores": router_scores[local_pos],
+                        }
+                    )
+                continue
+
             oracle_rows = evaluate_oracle_batch(
                 model,
                 tokenizer,
@@ -670,6 +784,7 @@ def main():
             "template_id": args.template_id,
             "static_strategy": args.static_strategy,
             "dynamic_selection": args.dynamic_selection,
+            "input_guided_selector": args.input_guided_selector,
             "group_by_template": args.group_by_template,
             "seed": args.seed,
             "command": command_line(),

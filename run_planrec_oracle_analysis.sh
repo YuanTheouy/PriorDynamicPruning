@@ -7,6 +7,7 @@ TOP_K_LAYERS=${TOP_K_LAYERS:-21}
 SEED=${SEED:-42}
 PREDICTION_METHOD=${PREDICTION_METHOD:-dynamic_template}
 INPUT_GUIDED_SELECTOR=${INPUT_GUIDED_SELECTOR:-length_hash}
+INPUT_GUIDED_FEATURE_SET=${INPUT_GUIDED_FEATURE_SET:-length_hash}
 ORACLE_JSON=${ORACLE_JSON:-${OUTPUT_DIR}/raw_json/${CATEGORY}_oracle_k${TOP_K_LAYERS}_seed${SEED}.json}
 PREDICTION_JSON=${PREDICTION_JSON:-}
 
@@ -18,7 +19,7 @@ if [[ -z "$PREDICTION_JSON" ]]; then
       PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_dynamic_template_k${TOP_K_LAYERS}_seed${SEED}.json
       ;;
     input_guided)
-      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_input_guided_${INPUT_GUIDED_SELECTOR}_k${TOP_K_LAYERS}_seed${SEED}.json
+      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_input_guided_${INPUT_GUIDED_SELECTOR}_${INPUT_GUIDED_FEATURE_SET}_k${TOP_K_LAYERS}_seed${SEED}.json
       ;;
     layerwise_router)
       PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_layerwise_router_k${TOP_K_LAYERS}_seed${SEED}.json
@@ -40,6 +41,9 @@ if [[ ! -f "$PREDICTION_JSON" ]]; then
 fi
 
 name="${CATEGORY}_${PREDICTION_METHOD}_oracle_analysis_k${TOP_K_LAYERS}_seed${SEED}"
+if [[ "$PREDICTION_METHOD" == "input_guided" ]]; then
+  name="${CATEGORY}_${PREDICTION_METHOD}_${INPUT_GUIDED_SELECTOR}_${INPUT_GUIDED_FEATURE_SET}_oracle_analysis_k${TOP_K_LAYERS}_seed${SEED}"
+fi
 python3 ./analyze_planrec_oracle.py \
   --oracle_json "$ORACLE_JSON" \
   --prediction_json "$PREDICTION_JSON" \

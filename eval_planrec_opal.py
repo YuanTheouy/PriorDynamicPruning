@@ -4,7 +4,7 @@ import json
 import os
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -262,6 +262,41 @@ def input_guided_masks(args, input_ids, attention_mask, templates: Sequence[Laye
     OPAL can be attributed to internal prefix evidence rather than to the library.
     """
     budget_templates = filter_templates(templates, budget=args.top_k_layers)
+    features = input_guided_features(input_ids, attention_mask, args.input_guided_num_bins)
+
+    template_ids = []
+    masks = []
+    row_features = []
+    calibrated_map = getattr(args, "_input_guided_calibrated_map", {}) or {}
+    template_by_id = {template.template_id: template for template in budget_templates}
+    for feature in features:
+        if args.input_guided_selector == "length":
+            selector_value = int(feature["length"])
+        elif args.input_guided_selector == "hash":
+            selector_value = int(feature["token_sum"])
+        elif args.input_guided_selector == "calibrated":
+            key = input_guided_feature_key(feature, args.input_guided_feature_set)
+            template_id = calibrated_map.get(key)
+            template = template_by_id.get(template_id)
+            if template is None:
+                selector_value = int(feature["selector_value"])
+                template = budget_templates[(selector_value + int(args.seed)) % len(budget_templates)]
+            template_ids.append(template.template_id)
+            masks.append(template.mask)
+            row_features.append(summarize_input_guided_feature(feature, args.input_guided_feature_set))
+            continue
+        else:
+            selector_value = int(feature["selector_value"])
+        idx = (selector_value + int(args.seed)) % len(budget_templates)
+        template = budget_templates[idx]
+        template_ids.append(template.template_id)
+        masks.append(template.mask)
+        row_features.append(summarize_input_guided_feature(feature, args.input_guided_feature_set))
+    return masks, template_ids, row_features
+
+
+def input_guided_features(input_ids, attention_mask, num_bins: int) -> List[Dict[str, int]]:
+    num_bins = max(1, int(num_bins))
     lengths = attention_mask.detach().long().sum(dim=1).cpu().tolist()
     token_sums = (input_ids.detach().long() * attention_mask.detach().long()).sum(dim=1).cpu().tolist()
     last_tokens = []
@@ -269,29 +304,89 @@ def input_guided_masks(args, input_ids, attention_mask, templates: Sequence[Laye
         active = row[mask.bool()]
         last_tokens.append(int(active[-1].item()) if active.numel() else 0)
 
-    template_ids = []
-    masks = []
     features = []
     for length, token_sum, last_token in zip(lengths, token_sums, last_tokens):
-        if args.input_guided_selector == "length":
-            selector_value = int(length)
-        elif args.input_guided_selector == "hash":
-            selector_value = int(token_sum)
-        else:
-            selector_value = int(token_sum) + 131 * int(length) + 17 * int(last_token)
-        idx = (selector_value + int(args.seed)) % len(budget_templates)
-        template = budget_templates[idx]
-        template_ids.append(template.template_id)
-        masks.append(template.mask)
+        selector_value = int(token_sum) + 131 * int(length) + 17 * int(last_token)
         features.append(
             {
                 "length": int(length),
-                "token_sum_mod": int(token_sum) % 1_000_003,
+                "length_bin": int(length) % num_bins,
+                "token_sum": int(token_sum),
+                "token_hash_bin": int(token_sum) % num_bins,
                 "last_token_id": int(last_token),
-                "selector_value_mod": int(selector_value) % 1_000_003,
+                "last_token_bin": int(last_token) % num_bins,
+                "selector_value": int(selector_value),
+                "selector_value_bin": int(selector_value) % num_bins,
             }
         )
-    return masks, template_ids, features
+    return features
+
+
+def input_guided_feature_key(feature: Dict[str, int], feature_set: str) -> str:
+    if feature_set == "length":
+        parts = [feature["length_bin"]]
+    elif feature_set == "hash":
+        parts = [feature["token_hash_bin"]]
+    else:
+        parts = [feature["length_bin"], feature["token_hash_bin"], feature["last_token_bin"]]
+    return "|".join(str(int(part)) for part in parts)
+
+
+def summarize_input_guided_feature(feature: Dict[str, int], feature_set: str) -> Dict[str, int]:
+    return {
+        "length": int(feature["length"]),
+        "length_bin": int(feature["length_bin"]),
+        "token_sum_mod": int(feature["token_sum"]) % 1_000_003,
+        "token_hash_bin": int(feature["token_hash_bin"]),
+        "last_token_id": int(feature["last_token_id"]),
+        "last_token_bin": int(feature["last_token_bin"]),
+        "selector_value_mod": int(feature["selector_value"]) % 1_000_003,
+        "selector_value_bin": int(feature["selector_value_bin"]),
+        "feature_key": input_guided_feature_key(feature, feature_set),
+    }
+
+
+def load_input_guided_calibration(args) -> Dict[str, str]:
+    if not args.input_guided_calibration_json:
+        if args.input_guided_selector == "calibrated":
+            raise ValueError("--input_guided_calibration_json is required for calibrated input-guided selection")
+        return {}
+    payload = json.loads(open(args.input_guided_calibration_json, encoding="utf-8").read())
+    rows = payload.get("predictions", [])
+    votes: Dict[str, Counter] = defaultdict(Counter)
+    rank_sums: Dict[Tuple[str, str], float] = defaultdict(float)
+    rank_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    for row in rows:
+        feature = row.get("input_guided_features") or row.get("input_features") or {}
+        if not feature:
+            continue
+        key = str(feature.get("feature_key") or input_guided_feature_key(feature, args.input_guided_feature_set))
+        oracle_template = str(row.get("template_id", ""))
+        if oracle_template:
+            votes[key][oracle_template] += 1
+        for candidate in row.get("oracle_candidates", []) or []:
+            template_id = str(candidate.get("template_id", ""))
+            if not template_id:
+                continue
+            rank_sums[(key, template_id)] += float(candidate.get("rank", 1_000_000))
+            rank_counts[(key, template_id)] += 1
+
+    calibrated = {}
+    keys = set(votes)
+    keys.update(key for key, _ in rank_sums)
+    for key in keys:
+        scored = [
+            (rank_sums[(key, template_id)] / rank_counts[(key, template_id)], template_id)
+            for row_key, template_id in rank_counts
+            if row_key == key and rank_counts[(key, template_id)] > 0
+        ]
+        if scored:
+            calibrated[key] = min(scored)[1]
+        elif votes.get(key):
+            calibrated[key] = votes[key].most_common(1)[0][0]
+    if args.input_guided_selector == "calibrated" and not calibrated:
+        raise ValueError(f"No calibrated input-guided entries found in {args.input_guided_calibration_json}")
+    return calibrated
 
 
 def set_custom_mask(model, mask_payload):
@@ -497,10 +592,22 @@ def build_parser():
     parser.add_argument("--dynamic_selection", choices=["topk_mask", "template_library"], default="template_library")
     parser.add_argument(
         "--input_guided_selector",
-        choices=["length", "hash", "length_hash"],
+        choices=["length", "hash", "length_hash", "calibrated"],
         default="length_hash",
         help="Prompt-feature selector for the PuDDing/IG-style baseline.",
     )
+    parser.add_argument(
+        "--input_guided_calibration_json",
+        default="",
+        help="Oracle JSON with saved candidates and input_guided_features for calibrated prompt-feature selection.",
+    )
+    parser.add_argument(
+        "--input_guided_feature_set",
+        choices=["length", "hash", "length_hash"],
+        default="length_hash",
+        help="Prompt feature key used by the calibrated input-guided selector.",
+    )
+    parser.add_argument("--input_guided_num_bins", type=int, default=16)
     parser.add_argument("--budgets", default="")
     parser.add_argument("--top_k_layers", type=int, default=21)
     parser.add_argument("--top_k_items", type=int, default=50)
@@ -572,6 +679,7 @@ def main():
 
     sid_token_ids = get_sid_token_ids_from_info(tokenizer, args.info_file)
     templates = load_or_build_templates(args, num_layers)
+    args._input_guided_calibrated_map = load_input_guided_calibration(args)
     static_template = None
     if args.method == "static":
         static_template = static_template_from_args(args, num_layers, templates)
@@ -727,6 +835,11 @@ def main():
                 timer,
             )
             for local_pos, sample_index in enumerate(batch_indices):
+                feature = input_guided_features(
+                    input_ids[local_pos : local_pos + 1],
+                    attention_mask[local_pos : local_pos + 1],
+                    args.input_guided_num_bins,
+                )[0]
                 row = oracle_rows[int(sample_index)]
                 template = row["template"]
                 predictions.append(
@@ -738,6 +851,9 @@ def main():
                         "template_id": template.template_id if template else "none",
                         "oracle_rank": row["rank"],
                         "oracle_candidates": row["candidates"] if args.save_oracle_candidates else [],
+                        "input_guided_features": summarize_input_guided_feature(
+                            feature, args.input_guided_feature_set
+                        ),
                     }
                 )
             continue
@@ -785,6 +901,10 @@ def main():
             "static_strategy": args.static_strategy,
             "dynamic_selection": args.dynamic_selection,
             "input_guided_selector": args.input_guided_selector,
+            "input_guided_calibration_json": args.input_guided_calibration_json,
+            "input_guided_feature_set": args.input_guided_feature_set,
+            "input_guided_num_bins": args.input_guided_num_bins,
+            "input_guided_calibrated_keys": len(args._input_guided_calibrated_map),
             "group_by_template": args.group_by_template,
             "seed": args.seed,
             "command": command_line(),

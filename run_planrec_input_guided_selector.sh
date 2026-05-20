@@ -17,6 +17,9 @@ MAX_BATCHES=${MAX_BATCHES:-0}
 BUDGETS=${BUDGETS:-14,18,21,24,28}
 GROUP_BY_TEMPLATE=${GROUP_BY_TEMPLATE:-1}
 INPUT_GUIDED_SELECTOR=${INPUT_GUIDED_SELECTOR:-length_hash}
+INPUT_GUIDED_CALIBRATION_JSON=${INPUT_GUIDED_CALIBRATION_JSON:-}
+INPUT_GUIDED_FEATURE_SET=${INPUT_GUIDED_FEATURE_SET:-length_hash}
+INPUT_GUIDED_NUM_BINS=${INPUT_GUIDED_NUM_BINS:-16}
 TEMPLATE_LIBRARY=${TEMPLATE_LIBRARY:-${OUTPUT_DIR}/raw_json/${CATEGORY}_templates.json}
 
 test_file=$(ls ./data/Amazon/test/${CATEGORY}*11.csv 2>/dev/null | head -1)
@@ -36,6 +39,11 @@ if [[ "$GROUP_BY_TEMPLATE" == "1" ]]; then
   group_flag=(--group_by_template)
 fi
 
+calibration_flag=()
+if [[ -n "$INPUT_GUIDED_CALIBRATION_JSON" ]]; then
+  calibration_flag=(--input_guided_calibration_json "$INPUT_GUIDED_CALIBRATION_JSON")
+fi
+
 accelerate launch --num_processes "$NUM_GPUS" ./eval_planrec_opal.py \
   --method input_guided \
   --teacher_model "$MODEL_PATH" \
@@ -50,10 +58,13 @@ accelerate launch --num_processes "$NUM_GPUS" ./eval_planrec_opal.py \
   --budgets "$BUDGETS" \
   --save_template_library "$TEMPLATE_LIBRARY" \
   --input_guided_selector "$INPUT_GUIDED_SELECTOR" \
+  --input_guided_feature_set "$INPUT_GUIDED_FEATURE_SET" \
+  --input_guided_num_bins "$INPUT_GUIDED_NUM_BINS" \
+  "${calibration_flag[@]}" \
   "${group_flag[@]}" \
   --seed "$SEED" \
   --warmup_batches "$WARMUP_BATCHES" \
   --timed_batches "$TIMED_BATCHES" \
   --max_batches "$MAX_BATCHES" \
   --output_dir "$OUTPUT_DIR" \
-  --run_name "${CATEGORY}_input_guided_${INPUT_GUIDED_SELECTOR}_k${TOP_K_LAYERS}_seed${SEED}"
+  --run_name "${CATEGORY}_input_guided_${INPUT_GUIDED_SELECTOR}_${INPUT_GUIDED_FEATURE_SET}_k${TOP_K_LAYERS}_seed${SEED}"

@@ -5,24 +5,29 @@ CATEGORY=${CATEGORY:-Office_Products}
 OUTPUT_DIR=${OUTPUT_DIR:-./results/planrec_experiments}
 TOP_K_LAYERS=${TOP_K_LAYERS:-21}
 SEED=${SEED:-42}
-PREDICTION_METHOD=${PREDICTION_METHOD:-dynamic_template}
+PREDICTION_METHOD=${PREDICTION_METHOD:-opal}
 INPUT_GUIDED_SELECTOR=${INPUT_GUIDED_SELECTOR:-length_hash}
 INPUT_GUIDED_FEATURE_SET=${INPUT_GUIDED_FEATURE_SET:-length_hash}
-ORACLE_JSON=${ORACLE_JSON:-${OUTPUT_DIR}/raw_json/${CATEGORY}_oracle_k${TOP_K_LAYERS}_seed${SEED}.json}
+PREFIX_DEPTH=${PREFIX_DEPTH:-4}
+COMPENSATION=${COMPENSATION:-none}
+MAX_COMPENSATED_SKIPPED_LAYERS=${MAX_COMPENSATED_SKIPPED_LAYERS:-0}
+COMP_RANK=${COMP_RANK:-0}
+BATCH_SIZE=${BATCH_SIZE:-8}
+ORACLE_JSON=${ORACLE_JSON:-${OUTPUT_DIR}/raw_json/${CATEGORY}_oracle_masks_k${TOP_K_LAYERS}_seed${SEED}.json}
 PREDICTION_JSON=${PREDICTION_JSON:-}
 
 test_file=$(ls ./data/Amazon/test/${CATEGORY}*11.csv 2>/dev/null | head -1)
 
 if [[ -z "$PREDICTION_JSON" ]]; then
   case "$PREDICTION_METHOD" in
-    dynamic_template)
-      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_dynamic_template_k${TOP_K_LAYERS}_seed${SEED}.json
+    opal)
+      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_opal_prefix${PREFIX_DEPTH}_k${TOP_K_LAYERS}_${COMPENSATION}_R${MAX_COMPENSATED_SKIPPED_LAYERS}_r${COMP_RANK}_bs${BATCH_SIZE}_seed${SEED}.json
       ;;
     input_guided)
-      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_input_guided_${INPUT_GUIDED_SELECTOR}_${INPUT_GUIDED_FEATURE_SET}_k${TOP_K_LAYERS}_seed${SEED}.json
+      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_input_guided_${INPUT_GUIDED_SELECTOR}_${INPUT_GUIDED_FEATURE_SET}_k${TOP_K_LAYERS}_${COMPENSATION}_r${COMP_RANK}_seed${SEED}.json
       ;;
     layerwise_router)
-      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_layerwise_router_k${TOP_K_LAYERS}_seed${SEED}.json
+      PREDICTION_JSON=${OUTPUT_DIR}/raw_json/${CATEGORY}_layerwise_router_k${TOP_K_LAYERS}_${COMPENSATION}_r${COMP_RANK}_seed${SEED}.json
       ;;
     *)
       echo "Unknown PREDICTION_METHOD=$PREDICTION_METHOD; set PREDICTION_JSON explicitly"
@@ -40,7 +45,7 @@ if [[ ! -f "$PREDICTION_JSON" ]]; then
   exit 1
 fi
 
-name="${CATEGORY}_${PREDICTION_METHOD}_oracle_analysis_k${TOP_K_LAYERS}_seed${SEED}"
+name="${CATEGORY}_${PREDICTION_METHOD}_oracle_mask_analysis_k${TOP_K_LAYERS}_seed${SEED}"
 if [[ "$PREDICTION_METHOD" == "input_guided" ]]; then
   name="${CATEGORY}_${PREDICTION_METHOD}_${INPUT_GUIDED_SELECTOR}_${INPUT_GUIDED_FEATURE_SET}_oracle_analysis_k${TOP_K_LAYERS}_seed${SEED}"
 fi

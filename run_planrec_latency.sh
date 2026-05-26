@@ -7,8 +7,8 @@ export TIMED_BATCHES=${TIMED_BATCHES:-20}
 export MAX_BATCHES=${MAX_BATCHES:-0}
 
 bash ./run_planrec_full_teacher.sh
-bash ./run_planrec_static_templates.sh
-bash ./run_planrec_dynamic_planner.sh
+bash ./run_planrec_static_masks.sh
+bash ./run_planrec_opal_mask_router.sh
 bash ./run_planrec_input_guided_selector.sh
 bash ./run_planrec_layerwise_router.sh
 python3 ./summarize_planrec_results.py --output_dir "$OUTPUT_DIR"

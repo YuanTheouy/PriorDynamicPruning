@@ -2,7 +2,7 @@ import math
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 def cuda_synchronize_if_needed() -> None:
@@ -20,6 +20,15 @@ class TimedBatch:
     duration_sec: float
     samples: int
     warmup: bool
+    metadata: Dict[str, object]
+
+
+@dataclass
+class ComponentRecord:
+    name: str
+    duration_sec: float
+    samples: int
+    metadata: Dict[str, object]
 
 
 class GenerationTimer:
@@ -35,7 +44,10 @@ class GenerationTimer:
         timed = len([record for record in self.records if not record.warmup])
         return timed >= self.timed_batches
 
-    def measure(self, fn, samples: int):
+    def next_is_warmup(self) -> bool:
+        return self._seen_batches < self.warmup_batches
+
+    def measure(self, fn, samples: int, metadata: Optional[Dict[str, object]] = None):
         warmup = self._seen_batches < self.warmup_batches
         self._seen_batches += 1
         cuda_synchronize_if_needed()
@@ -43,8 +55,20 @@ class GenerationTimer:
         result = fn()
         cuda_synchronize_if_needed()
         duration = time.perf_counter() - start
-        self.records.append(TimedBatch(duration_sec=duration, samples=int(samples), warmup=warmup))
+        self.records.append(
+            TimedBatch(
+                duration_sec=duration,
+                samples=int(samples),
+                warmup=warmup,
+                metadata=dict(metadata or {}),
+            )
+        )
         return result
+
+    def add_last_metadata(self, metadata: Dict[str, object]) -> None:
+        if not self.records:
+            return
+        self.records[-1].metadata.update(metadata)
 
     def summary(self) -> Dict[str, float]:
         timed = [record for record in self.records if not record.warmup]
@@ -88,3 +112,37 @@ class GenerationTimer:
     def raw_records(self) -> List[Dict[str, object]]:
         return [record.__dict__.copy() for record in self.records]
 
+
+class ComponentTimer:
+    def __init__(self):
+        self.records: List[ComponentRecord] = []
+
+    def measure(self, name: str, fn, samples: int = 0, metadata: Optional[Dict[str, object]] = None):
+        cuda_synchronize_if_needed()
+        start = time.perf_counter()
+        result = fn()
+        cuda_synchronize_if_needed()
+        duration = time.perf_counter() - start
+        self.records.append(
+            ComponentRecord(
+                name=str(name),
+                duration_sec=duration,
+                samples=int(samples),
+                metadata=dict(metadata or {}),
+            )
+        )
+        return result, duration
+
+    def summary(self) -> Dict[str, float]:
+        grouped: Dict[str, List[float]] = {}
+        for record in self.records:
+            grouped.setdefault(record.name, []).append(float(record.duration_sec))
+        summary: Dict[str, float] = {}
+        for name, values in grouped.items():
+            total = sum(values)
+            summary[f"{name}_latency_total_sec"] = total
+            summary[f"{name}_latency_sec"] = total / len(values) if values else 0.0
+        return summary
+
+    def raw_records(self) -> List[Dict[str, object]]:
+        return [record.__dict__.copy() for record in self.records]

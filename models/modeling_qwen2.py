@@ -4,6 +4,7 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_qwen2.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+import time
 from typing import Callable, Optional, Union
 
 import torch
@@ -241,6 +242,47 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
+    def _ghost_compensate(self, hidden_states: torch.Tensor, compensation_config: Optional[dict], gate_i: Optional[torch.Tensor]) -> torch.Tensor:
+        compensation_config = compensation_config or {}
+        mode = str(compensation_config.get("mode", "none"))
+        rank = int(compensation_config.get("rank", 0))
+        if mode == "none" or rank <= 0:
+            return hidden_states
+        rank = max(0, min(rank, hidden_states.shape[-1]))
+        if rank <= 0:
+            return hidden_states
+        start = time.perf_counter()
+        normed = self.post_attention_layernorm(hidden_states)
+        basis = normed[..., :rank].mean(dim=-1, keepdim=True)
+        residual = torch.zeros_like(hidden_states)
+        residual[..., :rank] = basis.expand(*basis.shape[:-1], rank) / max(1, rank)
+        if gate_i is None:
+            gate_i = torch.ones(hidden_states.shape[0], device=hidden_states.device, dtype=hidden_states.dtype)
+        if gate_i.dim() == 1:
+            gate_i = gate_i.view(-1, 1, 1)
+        stats = compensation_config.get("runtime_stats")
+        if isinstance(stats, dict):
+            stats["calls"] = int(stats.get("calls", 0)) + 1
+            stats["total_sec"] = float(stats.get("total_sec", 0.0)) + (time.perf_counter() - start)
+        return hidden_states + gate_i.to(device=hidden_states.device, dtype=hidden_states.dtype) * residual
+
+    def _apply_layer_action(
+        self,
+        original_hidden_states: torch.Tensor,
+        computed_hidden_states: torch.Tensor,
+        layer_action_i: Optional[torch.Tensor],
+        compensation_gate_i: Optional[torch.Tensor],
+        compensation_config: Optional[dict],
+    ) -> torch.Tensor:
+        if layer_action_i is None:
+            return computed_hidden_states
+        if layer_action_i.dim() == 1:
+            action = layer_action_i.view(-1, 1, 1)
+        else:
+            action = layer_action_i
+        compensated = self._ghost_compensate(original_hidden_states, compensation_config, compensation_gate_i)
+        return torch.where(action == 1, computed_hidden_states, torch.where(action == 2, compensated, original_hidden_states))
+
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -252,10 +294,21 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         layer_mask_i: Optional[torch.Tensor] = None,
+        layer_action_i: Optional[torch.Tensor] = None,
+        compensation_gate_i: Optional[torch.Tensor] = None,
+        compensation_config: Optional[dict] = None,
         layer_idx: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         original_hidden_states = hidden_states
+        if layer_action_i is not None and torch.all(layer_action_i != 1):
+            return self._apply_layer_action(
+                original_hidden_states,
+                original_hidden_states,
+                layer_action_i,
+                compensation_gate_i,
+                compensation_config,
+            )
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -286,6 +339,14 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
             elif layer_mask_i.dim() == 2:
                 layer_mask_i = layer_mask_i.unsqueeze(2)
             hidden_states = layer_mask_i * hidden_states + (1 - layer_mask_i) * original_hidden_states
+        if layer_action_i is not None:
+            hidden_states = self._apply_layer_action(
+                original_hidden_states,
+                hidden_states,
+                layer_action_i,
+                compensation_gate_i,
+                compensation_config,
+            )
             
         return hidden_states
 
@@ -376,6 +437,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         layer_mask: Optional[torch.Tensor] = None,
+        layer_actions: Optional[torch.Tensor] = None,
+        compensation_gates: Optional[torch.Tensor] = None,
+        compensation_config: Optional[dict] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -537,15 +601,19 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         # Fast Path Optimization: If layer_mask is all 1s (No pruning), 
         # skip the layer_mask_i overhead completely to restore native speed and kernel fusion
-        is_full_layers = (layer_mask is None) or torch.all(layer_mask == 1)
+        is_full_layers = (layer_mask is None and layer_actions is None) or (
+            layer_actions is None and torch.all(layer_mask == 1)
+        )
 
         for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            layer_action_i = layer_actions[:, idx] if layer_actions is not None else None
+            compensation_gate_i = compensation_gates[:, idx] if compensation_gates is not None else None
             if is_full_layers:
                 layer_mask_i = None
             else:
                 layer_mask_i = layer_mask[:, idx] if layer_mask is not None else None
                 # Optimization: If layer_mask_i is all zeros, skip the layer entirely
-                if layer_mask_i is not None and torch.all(layer_mask_i == 0):
+                if layer_action_i is None and layer_mask_i is not None and torch.all(layer_mask_i == 0):
                     continue
 
             hidden_states = decoder_layer(
@@ -557,6 +625,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 layer_mask_i=layer_mask_i,
+                layer_action_i=layer_action_i,
+                compensation_gate_i=compensation_gate_i,
+                compensation_config=compensation_config,
                 layer_idx=idx,  # Use physical layer index `idx`
                 **kwargs,
             )
@@ -620,6 +691,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
         # Extract layer_mask if present in kwargs
         layer_mask = kwargs.get("layer_mask", None)
+        layer_actions = kwargs.get("layer_actions", None)
+        compensation_gates = kwargs.get("compensation_gates", None)
+        compensation_config = kwargs.get("compensation_config", None)
 
         model_inputs = {
             "input_ids": input_ids,
@@ -629,6 +703,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             "attention_mask": attention_mask,
             "inputs_embeds": inputs_embeds,
             "layer_mask": layer_mask,
+            "layer_actions": layer_actions,
+            "compensation_gates": compensation_gates,
+            "compensation_config": compensation_config,
         }
         return model_inputs
 
@@ -646,6 +723,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         layer_mask: Optional[torch.Tensor] = None,
+        layer_actions: Optional[torch.Tensor] = None,
+        compensation_gates: Optional[torch.Tensor] = None,
+        compensation_config: Optional[dict] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -674,6 +754,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             cache_position=cache_position,
             layer_mask=layer_mask,
+            layer_actions=layer_actions,
+            compensation_gates=compensation_gates,
+            compensation_config=compensation_config,
             **kwargs,
         )
 

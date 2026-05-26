@@ -4,6 +4,7 @@ import json
 import os
 import random
 import sys
+import time
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -22,17 +23,27 @@ from opal_llm.results import (
     summary_row,
     write_json,
 )
-from opal_llm.template_library import (
-    DEFAULT_TEMPLATE_STRATEGIES,
-    LayerTemplate,
-    filter_templates,
+from opal_llm.mask_library import (
+    ACTION_COMPENSATE,
+    ACTION_EXECUTE,
+    ALLOWED_COMPENSATED_LAYERS,
+    ALLOWED_COMPENSATION_RANKS,
+    DEFAULT_MASK_STRATEGIES,
+    LayerMaskSpec,
+    build_action_plan,
+    exact_topk_mask_from_scores,
+    filter_masks,
     generate_mask,
-    generate_template_library,
-    load_template_library,
-    save_template_library,
-    select_template_ids_from_scores,
+    generate_mask_library,
+    load_mask_library,
+    local_threshold_mask_from_scores,
+    mask_id_from_mask,
+    prompt_feature_scores,
+    save_mask_library,
+    summarize_batch_masks,
+    tensor_masks_to_lists,
 )
-from opal_llm.timing import GenerationTimer
+from opal_llm.timing import ComponentTimer, GenerationTimer
 
 torch = None
 Accelerator = None
@@ -157,37 +168,40 @@ def collate_left_pad(batch, pad_token_id: int):
     }
 
 
-def load_or_build_templates(args, num_layers: int) -> List[LayerTemplate]:
-    if args.template_library:
-        templates = load_template_library(args.template_library)
+def load_or_build_masks(args, num_layers: int) -> List[LayerMaskSpec]:
+    mask_library = args.mask_library or args.template_library
+    save_mask_path = args.save_mask_library or args.save_template_library
+    if mask_library:
+        masks = load_mask_library(mask_library)
     else:
         budgets = parse_int_csv(args.budgets) if args.budgets else [args.top_k_layers]
-        templates = generate_template_library(
+        masks = generate_mask_library(
             num_layers=num_layers,
             budgets=budgets,
-            strategies=parse_strategy_csv(args.template_strategies),
-            random_templates_per_budget=args.random_templates_per_budget,
+            strategies=parse_strategy_csv(args.mask_strategies),
+            random_masks_per_budget=args.random_masks_per_budget,
             seed=args.seed,
         )
-        if args.save_template_library:
-            save_template_library(args.save_template_library, templates)
-    return templates
+        if save_mask_path:
+            save_mask_library(save_mask_path, masks)
+    return masks
 
 
-def static_template_from_args(args, num_layers: int, templates: Sequence[LayerTemplate]) -> LayerTemplate:
-    if args.template_id:
-        return filter_templates(templates, template_id=args.template_id)[0]
+def static_mask_from_args(args, num_layers: int, mask_specs: Sequence[LayerMaskSpec]) -> LayerMaskSpec:
+    selected_mask_id = args.mask_id or args.template_id
+    if selected_mask_id:
+        return filter_masks(mask_specs, mask_id=selected_mask_id)[0]
     if args.static_strategy:
         mask = generate_mask(args.static_strategy, num_layers, args.top_k_layers, seed=args.seed)
-        return LayerTemplate(
-            template_id=f"{args.static_strategy}_k{sum(mask)}",
+        return LayerMaskSpec(
+            mask_id=f"{args.static_strategy}_k{sum(mask)}",
             strategy=args.static_strategy,
             budget=sum(mask),
             num_layers=num_layers,
             mask=mask,
             metadata={"source": "static_strategy"},
         )
-    return filter_templates(templates, budget=args.top_k_layers)[0]
+    return filter_masks(mask_specs, budget=args.top_k_layers)[0]
 
 
 def decode_generation(tokenizer, teacher_model: str, sequences, max_len: int) -> List[str]:
@@ -228,71 +242,207 @@ def load_student_router(args, sid_token_ids: Sequence[int], num_layers: int, dev
     return student, router
 
 
+def load_policy_router(args, hidden_size: int, num_layers: int, device):
+    if not args.policy_ckpt:
+        return None
+    router = LayerRouter(hidden_size=hidden_size, num_layers=num_layers, top_k=args.top_k_layers)
+    router_ckpt = torch.load(args.policy_ckpt, map_location="cpu")
+    router.load_state_dict(router_ckpt.get("model_state_dict", router_ckpt))
+    router.to(dtype_from_precision(args.precision)).to(device).eval()
+    return router
+
+
+def pool_request_state(last_hidden_state, attention_mask):
+    # MiniOneRec uses left padding for generation; the last active prompt token is
+    # therefore the final column for every non-empty row.
+    del attention_mask
+    return last_hidden_state[:, -1, :]
+
+
+def fallback_utility_scores(state, num_layers: int):
+    rows = []
+    state = state.detach().float()
+    for row in state:
+        summary = float(row.mean().item())
+        energy = float(row.pow(2).mean().sqrt().item())
+        scores = []
+        for layer in range(num_layers):
+            pos = (layer + 1) / max(1, num_layers)
+            score = energy * (0.5 + pos) + 0.1 * summary * ((layer % 3) - 1)
+            scores.append(score)
+        rows.append(scores)
+    return torch.tensor(rows, dtype=torch.float32, device=state.device)
+
+
 def dynamic_masks(
     args,
     student,
     router,
     input_ids,
     attention_mask,
-    templates: Sequence[LayerTemplate],
     num_layers: int,
 ):
     with torch.no_grad():
         student_out = student(input_ids=input_ids, attention_mask=attention_mask)
         last_hidden_state = student_out["last_hidden_state"]
-        last_indices = attention_mask.sum(dim=1) - 1
-        state = last_hidden_state[torch.arange(input_ids.size(0), device=input_ids.device), last_indices]
+        state = pool_request_state(last_hidden_state, attention_mask)
         mask, scores = router(state)
 
-    if args.method == "dynamic" and args.dynamic_selection == "template_library":
-        budget_templates = filter_templates(templates, budget=args.top_k_layers)
-        template_ids, masks = select_template_ids_from_scores(scores, budget_templates)
-        return masks, template_ids, scores.detach().float().cpu().tolist()
-
-    hard_masks = [[int(round(float(v))) for v in row] for row in mask.detach().float().cpu().tolist()]
-    template_ids = [f"router_topk_k{sum(row)}" for row in hard_masks]
-    return hard_masks, template_ids, scores.detach().float().cpu().tolist()
+    hard_masks = tensor_masks_to_lists(mask)
+    mask_ids = [mask_id_from_mask(row, prefix="student_router") for row in hard_masks]
+    return hard_masks, mask_ids, scores.detach().float().cpu().tolist()
 
 
-def input_guided_masks(args, input_ids, attention_mask, templates: Sequence[LayerTemplate]):
-    """Select finite templates from prompt/input features, without executing an LLM prefix.
+def layerwise_router_masks(args, student, router, input_ids, attention_mask, num_layers: int):
+    with torch.no_grad():
+        student_out = student(input_ids=input_ids, attention_mask=attention_mask)
+        state = pool_request_state(student_out["last_hidden_state"], attention_mask)
+        _, scores = router(state)
+    mask_tensor = local_threshold_mask_from_scores(
+        scores,
+        threshold=args.layerwise_threshold,
+        top_k=args.top_k_layers,
+        match_budget=args.layerwise_match_budget,
+    )
+    masks = tensor_masks_to_lists(mask_tensor)
+    mask_ids = [mask_id_from_mask(row, prefix="layerwise") for row in masks]
+    return masks, mask_ids, scores.detach().float().cpu().tolist()
 
-    This is a lightweight PuDDing/IG-style baseline hook. It intentionally uses the
-    same template library as OPAL but only cheap prompt features, so any gain from
-    OPAL can be attributed to internal prefix evidence rather than to the library.
+
+def opal_prefix_masks(
+    args,
+    model,
+    router,
+    input_ids,
+    attention_mask,
+    num_layers: int,
+    component_timer: ComponentTimer,
+):
+    prefix_depth = max(0, min(int(args.prefix_depth), num_layers))
+    prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(num_layers)]
+
+    def run_prefix():
+        set_custom_policy(
+            model,
+            mask_payload=prefix_mask,
+            action_payload=[ACTION_EXECUTE if keep else 0 for keep in prefix_mask],
+            compensation_config={"mode": "none", "rank": 0},
+        )
+        try:
+            with torch.no_grad():
+                return model.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                ).last_hidden_state
+        finally:
+            clear_custom_policy(model)
+
+    prefix_hidden, prefix_latency = component_timer.measure(
+        "prefix",
+        run_prefix,
+        samples=input_ids.size(0),
+        metadata={"prefix_depth": prefix_depth},
+    )
+    state = pool_request_state(prefix_hidden, attention_mask)
+
+    def run_router():
+        with torch.no_grad():
+            if router is not None:
+                _, scores = router(state)
+                return scores.detach().float()
+            return fallback_utility_scores(state, num_layers)
+
+    scores, router_latency = component_timer.measure(
+        "router",
+        run_router,
+        samples=input_ids.size(0),
+        metadata={"router_source": "policy_ckpt" if router is not None else "deterministic_prefix_fallback"},
+    )
+    mask_tensor = exact_topk_mask_from_scores(
+        scores,
+        top_k=args.top_k_layers,
+        prefix_depth=prefix_depth,
+        tail_keep=args.tail_keep,
+    )
+    masks = tensor_masks_to_lists(mask_tensor)
+    mask_ids = [mask_id_from_mask(row, prefix="opal") for row in masks]
+    return masks, mask_ids, scores.cpu().tolist(), prefix_latency, router_latency
+
+
+def build_actions_for_batch(args, masks: Sequence[Sequence[int]], scores: Optional[Sequence[Sequence[float]]] = None):
+    if scores is None:
+        scores = [[float(v) for v in mask] for mask in masks]
+    action_plans = [
+        build_action_plan(
+            execution_mask=mask,
+            scores=row_scores,
+            compensation=args.compensation,
+            max_compensated_skipped_layers=args.max_compensated_skipped_layers,
+            margin_delta=args.compensation_margin_delta,
+            margin_tau=args.compensation_margin_tau,
+            static_gate=args.static_compensation_gate,
+        )
+        for mask, row_scores in zip(masks, scores)
+    ]
+    return action_plans
+
+
+def compensation_config_from_args(args, action_plans: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    return {
+        "mode": args.compensation,
+        "rank": int(args.comp_rank),
+        "max_compensated_skipped_layers": int(args.max_compensated_skipped_layers),
+        "static_gate": float(args.static_compensation_gate),
+        "gates": [plan["compensation_gates"] for plan in action_plans],
+    }
+
+
+def timed_action_plans(
+    args,
+    masks: Sequence[Sequence[int]],
+    scores: Optional[Sequence[Sequence[float]]],
+    component_timer: ComponentTimer,
+):
+    return component_timer.measure(
+        "compensation",
+        lambda: build_actions_for_batch(args, masks, scores),
+        samples=len(masks),
+        metadata={"compensation": args.compensation, "comp_rank": args.comp_rank},
+    )[0]
+
+
+def input_guided_masks(args, input_ids, attention_mask, num_layers: int):
+    """Select masks from prompt/input features, without executing an LLM prefix.
+
+    This is a lightweight PuDDing/IG-style baseline hook. It intentionally uses
+    only cheap prompt features, so OPAL gains can be attributed to internal prefix
+    evidence rather than to a finite mask library.
     """
-    budget_templates = filter_templates(templates, budget=args.top_k_layers)
     features = input_guided_features(input_ids, attention_mask, args.input_guided_num_bins)
-
-    template_ids = []
-    masks = []
-    row_features = []
     calibrated_map = getattr(args, "_input_guided_calibrated_map", {}) or {}
-    template_by_id = {template.template_id: template for template in budget_templates}
-    for feature in features:
-        if args.input_guided_selector == "length":
-            selector_value = int(feature["length"])
-        elif args.input_guided_selector == "hash":
-            selector_value = int(feature["token_sum"])
-        elif args.input_guided_selector == "calibrated":
+    scores = prompt_feature_scores(features, num_layers, args.seed, args.input_guided_feature_set)
+    if args.input_guided_selector == "length":
+        scores = prompt_feature_scores(features, num_layers, args.seed, "length")
+    elif args.input_guided_selector == "hash":
+        scores = prompt_feature_scores(features, num_layers, args.seed, "hash")
+    elif args.input_guided_selector == "calibrated" and calibrated_map:
+        calibrated_masks = []
+        for feature in features:
             key = input_guided_feature_key(feature, args.input_guided_feature_set)
-            template_id = calibrated_map.get(key)
-            template = template_by_id.get(template_id)
-            if template is None:
-                selector_value = int(feature["selector_value"])
-                template = budget_templates[(selector_value + int(args.seed)) % len(budget_templates)]
-            template_ids.append(template.template_id)
-            masks.append(template.mask)
-            row_features.append(summarize_input_guided_feature(feature, args.input_guided_feature_set))
-            continue
-        else:
-            selector_value = int(feature["selector_value"])
-        idx = (selector_value + int(args.seed)) % len(budget_templates)
-        template = budget_templates[idx]
-        template_ids.append(template.template_id)
-        masks.append(template.mask)
-        row_features.append(summarize_input_guided_feature(feature, args.input_guided_feature_set))
-    return masks, template_ids, row_features
+            mask = calibrated_map.get(key)
+            calibrated_masks.append(mask)
+        if all(mask is not None for mask in calibrated_masks):
+            masks = [[int(v) for v in mask] for mask in calibrated_masks]
+            mask_ids = [mask_id_from_mask(mask, prefix="input_calibrated") for mask in masks]
+            row_features = [summarize_input_guided_feature(feature, args.input_guided_feature_set) for feature in features]
+            return masks, mask_ids, row_features, scores.tolist()
+
+    mask_tensor = exact_topk_mask_from_scores(scores.to(input_ids.device), top_k=args.top_k_layers)
+    masks = tensor_masks_to_lists(mask_tensor)
+    mask_ids = [mask_id_from_mask(mask, prefix="input_guided") for mask in masks]
+    row_features = [summarize_input_guided_feature(feature, args.input_guided_feature_set) for feature in features]
+    return masks, mask_ids, row_features, scores.tolist()
 
 
 def input_guided_features(input_ids, attention_mask, num_bins: int) -> List[Dict[str, int]]:
@@ -346,7 +496,7 @@ def summarize_input_guided_feature(feature: Dict[str, int], feature_set: str) ->
     }
 
 
-def load_input_guided_calibration(args) -> Dict[str, str]:
+def load_input_guided_calibration(args) -> Dict[str, List[int]]:
     if not args.input_guided_calibration_json:
         if args.input_guided_selector == "calibrated":
             raise ValueError("--input_guided_calibration_json is required for calibrated input-guided selection")
@@ -356,49 +506,81 @@ def load_input_guided_calibration(args) -> Dict[str, str]:
     votes: Dict[str, Counter] = defaultdict(Counter)
     rank_sums: Dict[Tuple[str, str], float] = defaultdict(float)
     rank_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    mask_by_id: Dict[str, List[int]] = {}
     for row in rows:
         feature = row.get("input_guided_features") or row.get("input_features") or {}
         if not feature:
             continue
         key = str(feature.get("feature_key") or input_guided_feature_key(feature, args.input_guided_feature_set))
-        oracle_template = str(row.get("template_id", ""))
-        if oracle_template:
-            votes[key][oracle_template] += 1
+        oracle_mask_id = str(row.get("mask_id") or row.get("template_id") or "")
+        oracle_mask = row.get("execution_mask") or row.get("layer_mask") or []
+        if oracle_mask_id and oracle_mask:
+            mask_by_id[oracle_mask_id] = [int(v) for v in oracle_mask]
+            votes[key][oracle_mask_id] += 1
         for candidate in row.get("oracle_candidates", []) or []:
-            template_id = str(candidate.get("template_id", ""))
-            if not template_id:
+            mask_id = str(candidate.get("mask_id") or candidate.get("template_id") or "")
+            candidate_mask = candidate.get("execution_mask") or candidate.get("layer_mask") or []
+            if not mask_id:
                 continue
-            rank_sums[(key, template_id)] += float(candidate.get("rank", 1_000_000))
-            rank_counts[(key, template_id)] += 1
+            if candidate_mask:
+                mask_by_id[mask_id] = [int(v) for v in candidate_mask]
+            rank_sums[(key, mask_id)] += float(candidate.get("rank", 1_000_000))
+            rank_counts[(key, mask_id)] += 1
 
     calibrated = {}
     keys = set(votes)
     keys.update(key for key, _ in rank_sums)
     for key in keys:
         scored = [
-            (rank_sums[(key, template_id)] / rank_counts[(key, template_id)], template_id)
-            for row_key, template_id in rank_counts
-            if row_key == key and rank_counts[(key, template_id)] > 0
+            (rank_sums[(key, mask_id)] / rank_counts[(key, mask_id)], mask_id)
+            for row_key, mask_id in rank_counts
+            if row_key == key and rank_counts[(key, mask_id)] > 0
         ]
         if scored:
-            calibrated[key] = min(scored)[1]
+            calibrated[key] = mask_by_id.get(min(scored)[1])
         elif votes.get(key):
-            calibrated[key] = votes[key].most_common(1)[0][0]
+            calibrated[key] = mask_by_id.get(votes[key].most_common(1)[0][0])
+    calibrated = {key: value for key, value in calibrated.items() if value}
     if args.input_guided_selector == "calibrated" and not calibrated:
         raise ValueError(f"No calibrated input-guided entries found in {args.input_guided_calibration_json}")
     return calibrated
 
 
-def set_custom_mask(model, mask_payload):
+def set_custom_policy(model, mask_payload, action_payload=None, compensation_config=None):
     model.config.custom_layer_mask = mask_payload
+    model.config.custom_layer_actions = action_payload
+    model.config.custom_compensation_config = compensation_config or {"mode": "none", "rank": 0}
+    model.config.custom_compensation_runtime_stats = {"calls": 0, "total_sec": 0.0}
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         for layer in model.model.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
                 layer.self_attn.config.custom_layer_mask = mask_payload
+                layer.self_attn.config.custom_layer_actions = action_payload
+                layer.self_attn.config.custom_compensation_config = compensation_config or {"mode": "none", "rank": 0}
+                layer.self_attn.config.custom_compensation_runtime_stats = model.config.custom_compensation_runtime_stats
 
 
-def clear_custom_mask(model):
-    set_custom_mask(model, None)
+def clear_custom_policy(model):
+    stats = getattr(model.config, "custom_compensation_runtime_stats", {"calls": 0, "total_sec": 0.0})
+    model.config.custom_layer_mask = None
+    model.config.custom_layer_actions = None
+    model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    model.config.custom_compensation_runtime_stats = stats
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                layer.self_attn.config.custom_layer_mask = None
+                layer.self_attn.config.custom_layer_actions = None
+                layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+                layer.self_attn.config.custom_compensation_runtime_stats = stats
+
+
+def compensation_runtime_stats(model):
+    stats = getattr(model.config, "custom_compensation_runtime_stats", {}) or {}
+    return {
+        "compensation_runtime_calls": int(stats.get("calls", 0)),
+        "compensation_runtime_total_sec": float(stats.get("total_sec", 0.0)),
+    }
 
 
 def generate_once(
@@ -409,7 +591,10 @@ def generate_once(
     attention_mask,
     prefix_allowed_tokens_fn,
     mask_payload,
+    action_payload,
+    compensation_config,
     timer: GenerationTimer,
+    timer_metadata: Optional[Dict[str, object]] = None,
 ):
     generation_config = GenerationConfig(
         num_beams=args.top_k_items,
@@ -423,10 +608,16 @@ def generate_once(
     )
 
     def call_generate():
+        model.config.custom_compensation_runtime_stats = {"calls": 0, "total_sec": 0.0}
         if mask_payload is None:
-            clear_custom_mask(model)
+            clear_custom_policy(model)
         else:
-            set_custom_mask(model, mask_payload)
+            set_custom_policy(
+                model,
+                mask_payload=mask_payload,
+                action_payload=action_payload,
+                compensation_config=compensation_config,
+            )
         logits_processor = LogitsProcessorList(
             [
                 ConstrainedLogitsProcessor(
@@ -447,14 +638,15 @@ def generate_once(
                 logits_processor=logits_processor,
             )
         finally:
-            clear_custom_mask(model)
+            clear_custom_policy(model)
 
-    output = timer.measure(call_generate, samples=input_ids.size(0))
+    output = timer.measure(call_generate, samples=input_ids.size(0), metadata=timer_metadata)
+    timer.add_last_metadata(compensation_runtime_stats(model))
     decoded = decode_generation(tokenizer, args.teacher_model, output.sequences, input_ids.size(1))
     return group_beam_outputs(decoded, input_ids.size(0), args.top_k_items)
 
 
-def generate_grouped_by_template(
+def generate_grouped_by_mask(
     model,
     tokenizer,
     args,
@@ -462,15 +654,33 @@ def generate_grouped_by_template(
     attention_mask,
     prefix_allowed_tokens_fn,
     masks: Sequence[Sequence[int]],
+    actions: Sequence[Sequence[int]],
+    compensation_config: Dict[str, object],
     timer: GenerationTimer,
+    batch_metadata: Optional[Dict[str, object]] = None,
 ):
     groups = defaultdict(list)
     for idx, mask in enumerate(masks):
-        groups[tuple(int(v) for v in mask)].append(idx)
+        action = actions[idx] if actions else [ACTION_EXECUTE if int(v) else 0 for v in mask]
+        groups[(tuple(int(v) for v in mask), tuple(int(v) for v in action))].append(idx)
 
     grouped_outputs = [None] * len(masks)
-    for mask_tuple, row_indices in groups.items():
+    group_count = len(groups)
+    for (mask_tuple, action_tuple), row_indices in groups.items():
         idx_tensor = torch.tensor(row_indices, dtype=torch.long, device=input_ids.device)
+        timer_metadata = dict(batch_metadata or {})
+        timer_metadata.update(
+            summarize_batch_masks(
+                [masks[idx] for idx in row_indices],
+                grouping_strategy="identical_mask_grouping",
+                num_groups=group_count,
+            )
+        )
+        sub_compensation_config = dict(compensation_config or {})
+        if isinstance(sub_compensation_config.get("gates"), list):
+            sub_compensation_config["gates"] = [
+                sub_compensation_config["gates"][idx] for idx in row_indices
+            ]
         sub_outputs = generate_once(
             model=model,
             tokenizer=tokenizer,
@@ -479,7 +689,10 @@ def generate_grouped_by_template(
             attention_mask=attention_mask.index_select(0, idx_tensor),
             prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
             mask_payload=list(mask_tuple),
+            action_payload=list(action_tuple),
+            compensation_config=sub_compensation_config,
             timer=timer,
+            timer_metadata=timer_metadata,
         )
         for local_idx, output in zip(row_indices, sub_outputs):
             grouped_outputs[local_idx] = output
@@ -493,16 +706,23 @@ def evaluate_oracle_batch(
     input_ids,
     attention_mask,
     prefix_allowed_tokens_fn,
-    templates: Sequence[LayerTemplate],
+    mask_specs: Sequence[LayerMaskSpec],
     batch_indices: Sequence[int],
     ground_truths: Sequence[str],
     timer: GenerationTimer,
 ):
     best = {
-        int(index): {"rank": 1_000_000, "predictions": [], "template": None, "candidates": []}
+        int(index): {"rank": 1_000_000, "predictions": [], "mask_spec": None, "candidates": []}
         for index in batch_indices
     }
-    for template in filter_templates(templates, budget=args.top_k_layers):
+    for mask_spec in filter_masks(mask_specs, budget=args.top_k_layers):
+        actions = [ACTION_EXECUTE if int(v) else 0 for v in mask_spec.mask]
+        timer_metadata = summarize_batch_masks(
+            [mask_spec.mask for _ in batch_indices],
+            grouping_strategy="none",
+            num_groups=1,
+        )
+        timer_metadata.update({"oracle_candidate_mask_id": mask_spec.mask_id})
         outputs = generate_once(
             model=model,
             tokenizer=tokenizer,
@@ -510,13 +730,16 @@ def evaluate_oracle_batch(
             input_ids=input_ids,
             attention_mask=attention_mask,
             prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-            mask_payload=template.mask,
+            mask_payload=mask_spec.mask,
+            action_payload=actions,
+            compensation_config={"mode": "none", "rank": 0},
             timer=timer,
+            timer_metadata=timer_metadata,
         )
         for row_pos, sample_index in enumerate(batch_indices):
             target = ground_truths[int(sample_index)] if int(sample_index) < len(ground_truths) else ""
             rank = rank_of(outputs[row_pos], target)
-            candidate = {"template_id": template.template_id, "rank": rank}
+            candidate = {"mask_id": mask_spec.mask_id, "execution_mask": mask_spec.mask, "rank": rank}
             if args.save_oracle_candidates:
                 best[int(sample_index)]["candidates"].append(candidate)
             if rank < best[int(sample_index)]["rank"]:
@@ -524,7 +747,7 @@ def evaluate_oracle_batch(
                     {
                         "rank": rank,
                         "predictions": outputs[row_pos],
-                        "template": template,
+                        "mask_spec": mask_spec,
                     }
                 )
     return best
@@ -575,7 +798,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Unified OPAL-LLM evaluation for MiniOneRec/Qwen.")
     parser.add_argument(
         "--method",
-        choices=["full", "static", "dynamic", "input_guided", "layerwise_router", "oracle"],
+        choices=["full", "static", "opal", "dynamic", "input_guided", "layerwise_router", "oracle"],
         required=True,
     )
     parser.add_argument("--teacher_model", required=True)
@@ -584,12 +807,31 @@ def build_parser():
     parser.add_argument("--category", default="Office_Products")
     parser.add_argument("--student_ckpt", default="")
     parser.add_argument("--policy_ckpt", default="")
-    parser.add_argument("--template_library", default="")
-    parser.add_argument("--save_template_library", default="")
-    parser.add_argument("--template_id", default="")
-    parser.add_argument("--template_strategies", default=",".join(DEFAULT_TEMPLATE_STRATEGIES))
+    parser.add_argument("--mask_library", default="")
+    parser.add_argument("--save_mask_library", default="")
+    parser.add_argument("--mask_id", default="")
+    parser.add_argument("--mask_strategies", default=",".join(DEFAULT_MASK_STRATEGIES))
+    parser.add_argument("--template_library", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--save_template_library", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--template_id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--template_strategies", default="", help=argparse.SUPPRESS)
     parser.add_argument("--static_strategy", default="uniform")
-    parser.add_argument("--dynamic_selection", choices=["topk_mask", "template_library"], default="template_library")
+    parser.add_argument("--dynamic_selection", choices=["topk_mask", "template_library"], default="topk_mask", help=argparse.SUPPRESS)
+    parser.add_argument("--budget_mode", choices=["exact_topk"], default="exact_topk")
+    parser.add_argument("--prefix_depth", type=int, default=4)
+    parser.add_argument("--tail_keep", type=int, default=0)
+    parser.add_argument(
+        "--compensation",
+        choices=["none", "ungated_lowrank", "static_gate", "margin_gated"],
+        default="none",
+    )
+    parser.add_argument("--max_compensated_skipped_layers", type=int, default=0)
+    parser.add_argument("--comp_rank", type=int, default=0)
+    parser.add_argument("--static_compensation_gate", type=float, default=0.5)
+    parser.add_argument("--compensation_margin_delta", type=float, default=0.0)
+    parser.add_argument("--compensation_margin_tau", type=float, default=1.0)
+    parser.add_argument("--layerwise_threshold", type=float, default=0.0)
+    parser.add_argument("--layerwise_match_budget", action="store_true")
     parser.add_argument(
         "--input_guided_selector",
         choices=["length", "hash", "length_hash", "calibrated"],
@@ -620,8 +862,10 @@ def build_parser():
     parser.add_argument("--warmup_batches", type=int, default=1)
     parser.add_argument("--timed_batches", type=int, default=0, help="0 means time every non-warmup batch")
     parser.add_argument("--max_batches", type=int, default=0, help="0 means no evaluator-side limit")
-    parser.add_argument("--random_templates_per_budget", type=int, default=0)
-    parser.add_argument("--group_by_template", action="store_true")
+    parser.add_argument("--random_masks_per_budget", type=int, default=0)
+    parser.add_argument("--random_templates_per_budget", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--group_by_mask", action="store_true")
+    parser.add_argument("--group_by_template", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--save_oracle_candidates", action="store_true")
     parser.add_argument("--drop_dedup", action="store_true")
     parser.add_argument("--run_name", default="")
@@ -632,6 +876,18 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.template_strategies and not args.mask_strategies:
+        args.mask_strategies = args.template_strategies
+    if args.random_templates_per_budget and not args.random_masks_per_budget:
+        args.random_masks_per_budget = args.random_templates_per_budget
+    if args.group_by_template:
+        args.group_by_mask = True
+    if args.comp_rank not in ALLOWED_COMPENSATION_RANKS:
+        raise ValueError(f"--comp_rank must be one of {sorted(ALLOWED_COMPENSATION_RANKS)}")
+    if args.max_compensated_skipped_layers not in ALLOWED_COMPENSATED_LAYERS:
+        raise ValueError(
+            f"--max_compensated_skipped_layers must be one of {sorted(ALLOWED_COMPENSATED_LAYERS)}"
+        )
     import_runtime_dependencies()
 
     set_seed(args.seed)
@@ -678,17 +934,20 @@ def main():
     from utils_distill import get_sid_token_ids_from_info
 
     sid_token_ids = get_sid_token_ids_from_info(tokenizer, args.info_file)
-    templates = load_or_build_templates(args, num_layers)
+    mask_specs = load_or_build_masks(args, num_layers)
     args._input_guided_calibrated_map = load_input_guided_calibration(args)
-    static_template = None
+    static_mask_spec = None
     if args.method == "static":
-        static_template = static_template_from_args(args, num_layers, templates)
+        static_mask_spec = static_mask_from_args(args, num_layers, mask_specs)
 
-    student = router = None
+    student = router = opal_router = None
     if args.method in {"dynamic", "layerwise_router"}:
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
+    if args.method == "opal":
+        opal_router = load_policy_router(args, model.config.hidden_size, num_layers, device)
 
     timer = GenerationTimer(warmup_batches=args.warmup_batches, timed_batches=args.timed_batches)
+    component_timer = ComponentTimer()
     ground_truths = load_ground_truths(args.test_file, drop_dedup=args.drop_dedup)
     valid_sids = load_valid_sids(args.info_file)
     predictions = []
@@ -701,7 +960,7 @@ def main():
                     "method": args.method,
                     "num_layers": num_layers,
                     "top_k_layers": effective_top_k_layers,
-                    "num_templates": len(templates),
+                    "num_masks": len(mask_specs),
                     "device": str(device),
                 },
                 indent=2,
@@ -721,13 +980,10 @@ def main():
 
         if args.method == "full":
             masks = [[1] * num_layers for _ in range(batch_size)]
-            template_ids = ["full_teacher"] * batch_size
-            outputs = generate_once(
-                model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, None, timer
-            )
-        elif args.method == "static":
-            masks = [static_template.mask for _ in range(batch_size)]
-            template_ids = [static_template.template_id for _ in range(batch_size)]
+            mask_ids = ["full_teacher"] * batch_size
+            action_plans = build_actions_for_batch(args, masks, [[1.0] * num_layers for _ in masks])
+            actions = [plan["action_mask"] for plan in action_plans]
+            batch_metadata = summarize_batch_masks(masks, grouping_strategy="none", num_groups=1)
             outputs = generate_once(
                 model,
                 tokenizer,
@@ -735,18 +991,48 @@ def main():
                 input_ids,
                 attention_mask,
                 prefix_allowed_tokens_fn,
-                static_template.mask,
+                None,
+                None,
+                {"mode": "none", "rank": 0},
                 timer,
+                timer_metadata=batch_metadata,
+            )
+        elif args.method == "static":
+            masks = [static_mask_spec.mask for _ in range(batch_size)]
+            mask_ids = [static_mask_spec.mask_id for _ in range(batch_size)]
+            action_plans = timed_action_plans(args, masks, None, component_timer)
+            actions = [plan["action_mask"] for plan in action_plans]
+            comp_config = compensation_config_from_args(args, action_plans)
+            batch_metadata = summarize_batch_masks(masks, grouping_strategy="none", num_groups=1)
+            outputs = generate_once(
+                model,
+                tokenizer,
+                args,
+                input_ids,
+                attention_mask,
+                prefix_allowed_tokens_fn,
+                static_mask_spec.mask,
+                actions[0],
+                comp_config,
+                timer,
+                timer_metadata=batch_metadata,
             )
         elif args.method == "dynamic":
-            masks, template_ids, router_scores = dynamic_masks(
-                args, student, router, input_ids, attention_mask, templates, num_layers
+            (masks, mask_ids, router_scores), _ = component_timer.measure(
+                "router",
+                lambda: dynamic_masks(args, student, router, input_ids, attention_mask, num_layers),
+                samples=batch_size,
+                metadata={"router_source": "one_layer_student_policy"},
             )
-            if args.group_by_template:
-                outputs = generate_grouped_by_template(
-                    model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, timer
+            action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+            actions = [plan["action_mask"] for plan in action_plans]
+            comp_config = compensation_config_from_args(args, action_plans)
+            if args.group_by_mask:
+                outputs = generate_grouped_by_mask(
+                    model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, actions, comp_config, timer
                 )
             else:
+                batch_metadata = summarize_batch_masks(masks, grouping_strategy="layerwise_subset", num_groups=1)
                 outputs = generate_once(
                     model,
                     tokenizer,
@@ -755,18 +1041,34 @@ def main():
                     attention_mask,
                     prefix_allowed_tokens_fn,
                     masks,
+                    actions,
+                    comp_config,
                     timer,
+                    timer_metadata=batch_metadata,
                 )
         else:
-            if args.method == "input_guided":
-                masks, template_ids, input_guided_features = input_guided_masks(
-                    args, input_ids, attention_mask, templates
+            if args.method == "opal":
+                masks, mask_ids, router_scores, _, _ = opal_prefix_masks(
+                    args, model, opal_router, input_ids, attention_mask, num_layers, component_timer
                 )
-                if args.group_by_template:
-                    outputs = generate_grouped_by_template(
-                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, timer
+                action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
                     )
                 else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="layerwise_subset", num_groups=1)
                     outputs = generate_once(
                         model,
                         tokenizer,
@@ -775,7 +1077,10 @@ def main():
                         attention_mask,
                         prefix_allowed_tokens_fn,
                         masks,
+                        actions,
+                        comp_config,
                         timer,
+                        timer_metadata=batch_metadata,
                     )
                 for local_pos, sample_index in enumerate(batch_indices):
                     predictions.append(
@@ -784,21 +1089,87 @@ def main():
                             "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
                             "sample_predictions": outputs[local_pos],
                             "layer_mask": masks[local_pos],
-                            "template_id": template_ids[local_pos],
+                            "execution_mask": masks[local_pos],
+                            "action_mask": actions[local_pos],
+                            "mask_id": mask_ids[local_pos],
+                            "action_id": action_plans[local_pos]["action_id"],
+                            "kept_layer_count": sum(masks[local_pos]),
+                            "prefix_depth": args.prefix_depth,
+                            "layer_scores": router_scores[local_pos],
+                            "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                            "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                            "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                        }
+                    )
+                continue
+
+            if args.method == "input_guided":
+                (mask_result, _router_time) = component_timer.measure(
+                    "router",
+                    lambda: input_guided_masks(args, input_ids, attention_mask, num_layers),
+                    samples=batch_size,
+                    metadata={"router_source": "prompt_features"},
+                )
+                masks, mask_ids, input_guided_features, router_scores = mask_result
+                action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, actions, comp_config, timer
+                    )
+                else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="layerwise_subset", num_groups=1)
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
+                        timer_metadata=batch_metadata,
+                    )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    predictions.append(
+                        {
+                            "index": int(sample_index),
+                            "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                            "sample_predictions": outputs[local_pos],
+                            "layer_mask": masks[local_pos],
+                            "execution_mask": masks[local_pos],
+                            "action_mask": actions[local_pos],
+                            "mask_id": mask_ids[local_pos],
+                            "action_id": action_plans[local_pos]["action_id"],
+                            "layer_scores": router_scores[local_pos],
+                            "kept_layer_count": sum(masks[local_pos]),
                             "input_guided_features": input_guided_features[local_pos],
+                            "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                            "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                            "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
                         }
                     )
                 continue
 
             if args.method == "layerwise_router":
-                masks, template_ids, router_scores = dynamic_masks(
-                    args, student, router, input_ids, attention_mask, templates, num_layers
+                (masks, mask_ids, router_scores), _ = component_timer.measure(
+                    "router",
+                    lambda: layerwise_router_masks(args, student, router, input_ids, attention_mask, num_layers),
+                    samples=batch_size,
+                    metadata={"router_source": "one_layer_student_local_threshold"},
                 )
-                if args.group_by_template:
-                    outputs = generate_grouped_by_template(
-                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, timer
+                action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, actions, comp_config, timer
                     )
                 else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="layerwise_subset", num_groups=1)
                     outputs = generate_once(
                         model,
                         tokenizer,
@@ -807,7 +1178,10 @@ def main():
                         attention_mask,
                         prefix_allowed_tokens_fn,
                         masks,
+                        actions,
+                        comp_config,
                         timer,
+                        timer_metadata=batch_metadata,
                     )
                 for local_pos, sample_index in enumerate(batch_indices):
                     predictions.append(
@@ -816,8 +1190,16 @@ def main():
                             "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
                             "sample_predictions": outputs[local_pos],
                             "layer_mask": masks[local_pos],
-                            "template_id": template_ids[local_pos],
+                            "execution_mask": masks[local_pos],
+                            "action_mask": actions[local_pos],
+                            "mask_id": mask_ids[local_pos],
+                            "action_id": action_plans[local_pos]["action_id"],
                             "router_scores": router_scores[local_pos],
+                            "layer_scores": router_scores[local_pos],
+                            "kept_layer_count": sum(masks[local_pos]),
+                            "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                            "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                            "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
                         }
                     )
                 continue
@@ -829,7 +1211,7 @@ def main():
                 input_ids,
                 attention_mask,
                 prefix_allowed_tokens_fn,
-                templates,
+                mask_specs,
                 batch_indices,
                 ground_truths,
                 timer,
@@ -841,14 +1223,17 @@ def main():
                     args.input_guided_num_bins,
                 )[0]
                 row = oracle_rows[int(sample_index)]
-                template = row["template"]
+                mask_spec = row["mask_spec"]
+                selected_mask = mask_spec.mask if mask_spec else []
                 predictions.append(
                     {
                         "index": int(sample_index),
                         "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
                         "sample_predictions": row["predictions"],
-                        "layer_mask": template.mask if template else [],
-                        "template_id": template.template_id if template else "none",
+                        "layer_mask": selected_mask,
+                        "execution_mask": selected_mask,
+                        "action_mask": [ACTION_EXECUTE if int(v) else 0 for v in selected_mask],
+                        "mask_id": mask_spec.mask_id if mask_spec else "none",
                         "oracle_rank": row["rank"],
                         "oracle_candidates": row["candidates"] if args.save_oracle_candidates else [],
                         "input_guided_features": summarize_input_guided_feature(
@@ -864,10 +1249,18 @@ def main():
                 "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
                 "sample_predictions": outputs[local_pos],
                 "layer_mask": masks[local_pos],
-                "template_id": template_ids[local_pos],
+                "execution_mask": masks[local_pos],
+                "action_mask": actions[local_pos],
+                "mask_id": mask_ids[local_pos],
+                "action_id": action_plans[local_pos]["action_id"],
+                "kept_layer_count": sum(masks[local_pos]),
+                "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
             }
             if args.method == "dynamic":
                 record["router_scores"] = router_scores[local_pos]
+                record["layer_scores"] = router_scores[local_pos]
             predictions.append(record)
 
     rank_path = dirs["raw_json"] / f"{run_name}_rank{accelerator.process_index}.json"
@@ -876,6 +1269,7 @@ def main():
         {
             "predictions": predictions,
             "timing_records": timer.raw_records(),
+            "component_timing_records": component_timer.raw_records(),
         },
     )
     accelerator.wait_for_everyone()
@@ -883,10 +1277,12 @@ def main():
     if accelerator.is_main_process:
         all_predictions = []
         timing_records = []
+        component_timing_records = []
         for path in sorted(dirs["raw_json"].glob(f"{run_name}_rank*.json")):
             payload = json.loads(path.read_text(encoding="utf-8"))
             all_predictions.extend(payload.get("predictions", []))
             timing_records.extend(payload.get("timing_records", []))
+            component_timing_records.extend(payload.get("component_timing_records", []))
         all_predictions = sorted(all_predictions, key=lambda row: int(row.get("index", 0)))
 
         metadata = {
@@ -896,16 +1292,24 @@ def main():
             "checkpoint": args.teacher_model,
             "student_ckpt": args.student_ckpt,
             "policy_ckpt": args.policy_ckpt,
-            "template_library": args.template_library or args.save_template_library,
-            "template_id": args.template_id,
+            "mask_library": args.mask_library or args.save_mask_library or args.template_library or args.save_template_library,
+            "mask_id": args.mask_id or args.template_id,
             "static_strategy": args.static_strategy,
+            "budget_mode": args.budget_mode,
+            "prefix_depth": args.prefix_depth,
+            "tail_keep": args.tail_keep,
+            "compensation": args.compensation,
+            "max_compensated_skipped_layers": args.max_compensated_skipped_layers,
+            "comp_rank": args.comp_rank,
+            "layerwise_threshold": args.layerwise_threshold,
+            "layerwise_match_budget": args.layerwise_match_budget,
             "dynamic_selection": args.dynamic_selection,
             "input_guided_selector": args.input_guided_selector,
             "input_guided_calibration_json": args.input_guided_calibration_json,
             "input_guided_feature_set": args.input_guided_feature_set,
             "input_guided_num_bins": args.input_guided_num_bins,
             "input_guided_calibrated_keys": len(args._input_guided_calibrated_map),
-            "group_by_template": args.group_by_template,
+            "group_by_mask": args.group_by_mask,
             "seed": args.seed,
             "command": command_line(),
             "git_commit": git_commit(current_dir),
@@ -945,9 +1349,35 @@ def main():
                 "latency_p50_sec": percentile(0.50),
                 "latency_p95_sec": percentile(0.95),
                 "throughput_samples_per_sec": total_samples / total_time if total_time > 0 else 0.0,
+                "physical_generate_latency_sec": mean,
             }
         else:
             latency_summary = timer.summary()
+            latency_summary["physical_generate_latency_sec"] = latency_summary.get("latency_mean_sec", 0.0)
+
+        component_groups: Dict[str, List[float]] = defaultdict(list)
+        for record in component_timing_records:
+            component_groups[str(record.get("name", ""))].append(float(record.get("duration_sec", 0.0)))
+        for component_name, values in component_groups.items():
+            if not component_name:
+                continue
+            latency_summary[f"{component_name}_latency_sec"] = sum(values) / len(values) if values else 0.0
+            latency_summary[f"{component_name}_latency_total_sec"] = sum(values)
+        latency_summary.setdefault("router_latency_sec", 0.0)
+        latency_summary.setdefault("prefix_latency_sec", 0.0)
+        latency_summary.setdefault("compensation_latency_sec", 0.0)
+        latency_summary.setdefault("grouping_overhead_sec", 0.0)
+        runtime_comp = [
+            float((row.get("metadata") or {}).get("compensation_runtime_total_sec", 0.0))
+            for row in timing_records
+        ]
+        latency_summary["compensation_runtime_total_sec"] = sum(runtime_comp)
+        if latency_summary.get("latency_mean_sec", 0.0) > 0:
+            latency_summary["compensation_overhead_ratio"] = latency_summary["compensation_runtime_total_sec"] / max(
+                1e-12, sum(float(row.get("duration_sec", 0.0)) for row in timing_records)
+            )
+        else:
+            latency_summary["compensation_overhead_ratio"] = 0.0
 
         final_payload = build_payload(
             metadata=metadata,
@@ -957,6 +1387,7 @@ def main():
             latency=latency_summary,
             timing_records=timing_records,
         )
+        final_payload["component_timing_records"] = component_timing_records
         final_path = dirs["raw_json"] / f"{run_name}.json"
         write_json(final_path, final_payload)
         append_summary_csv(dirs["tables"] / "summary.csv", summary_row(final_payload, str(final_path)))

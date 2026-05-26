@@ -14,15 +14,16 @@ PRECISION=${PRECISION:-bf16}
 WARMUP_BATCHES=${WARMUP_BATCHES:-1}
 TIMED_BATCHES=${TIMED_BATCHES:-0}
 MAX_BATCHES=${MAX_BATCHES:-0}
-BUDGETS=${BUDGETS:-14,18,21,24,28}
+PREFIX_DEPTH=${PREFIX_DEPTH:-4}
+TAIL_KEEP=${TAIL_KEEP:-0}
 GROUP_BY_MASK=${GROUP_BY_MASK:-1}
-LAYERWISE_THRESHOLD=${LAYERWISE_THRESHOLD:-0.0}
-LAYERWISE_MATCH_BUDGET=${LAYERWISE_MATCH_BUDGET:-1}
+POLICY_CKPT=${POLICY_CKPT:-}
 COMPENSATION=${COMPENSATION:-none}
 MAX_COMPENSATED_SKIPPED_LAYERS=${MAX_COMPENSATED_SKIPPED_LAYERS:-0}
 COMP_RANK=${COMP_RANK:-0}
-STUDENT_CKPT=${STUDENT_CKPT:-}
-POLICY_CKPT=${POLICY_CKPT:-}
+STATIC_COMPENSATION_GATE=${STATIC_COMPENSATION_GATE:-0.5}
+COMPENSATION_MARGIN_DELTA=${COMPENSATION_MARGIN_DELTA:-0.0}
+COMPENSATION_MARGIN_TAU=${COMPENSATION_MARGIN_TAU:-1.0}
 
 test_file=$(ls ./data/Amazon/test/${CATEGORY}*11.csv 2>/dev/null | head -1)
 info_file=$(ls ./data/Amazon/info/${CATEGORY}*.txt 2>/dev/null | head -1)
@@ -36,16 +37,9 @@ if [[ ! -f "$test_file" || ! -f "$info_file" ]]; then
   exit 1
 fi
 
-if [[ -z "$STUDENT_CKPT" ]]; then
-  STUDENT_CKPT=$(ls -v ./student_ckpts/${CATEGORY}/student_epoch_*.pt 2>/dev/null | tail -1)
-fi
-if [[ -z "$POLICY_CKPT" ]]; then
-  POLICY_CKPT=$(ls -v ./policy_ckpts/unfrozon/${CATEGORY}/policy_epoch_*.pt 2>/dev/null | tail -1)
-fi
-
-if [[ ! -f "$STUDENT_CKPT" || ! -f "$POLICY_CKPT" ]]; then
-  echo "Missing STUDENT_CKPT or POLICY_CKPT"
-  exit 1
+policy_flag=()
+if [[ -n "$POLICY_CKPT" ]]; then
+  policy_flag=(--policy_ckpt "$POLICY_CKPT")
 fi
 
 group_flag=()
@@ -53,16 +47,10 @@ if [[ "$GROUP_BY_MASK" == "1" ]]; then
   group_flag=(--group_by_mask)
 fi
 
-budget_flag=()
-if [[ "$LAYERWISE_MATCH_BUDGET" == "1" ]]; then
-  budget_flag=(--layerwise_match_budget)
-fi
-
 accelerate launch --num_processes "$NUM_GPUS" ./eval_planrec_opal.py \
-  --method layerwise_router \
+  --method opal \
   --teacher_model "$MODEL_PATH" \
-  --student_ckpt "$STUDENT_CKPT" \
-  --policy_ckpt "$POLICY_CKPT" \
+  "${policy_flag[@]}" \
   --test_file "$test_file" \
   --info_file "$info_file" \
   --category "$CATEGORY" \
@@ -71,16 +59,19 @@ accelerate launch --num_processes "$NUM_GPUS" ./eval_planrec_opal.py \
   --top_k_items "$TOP_K_ITEMS" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
   --precision "$PRECISION" \
-  --budgets "$BUDGETS" \
-  --layerwise_threshold "$LAYERWISE_THRESHOLD" \
-  "${budget_flag[@]}" \
+  --budget_mode exact_topk \
+  --prefix_depth "$PREFIX_DEPTH" \
+  --tail_keep "$TAIL_KEEP" \
   --compensation "$COMPENSATION" \
   --max_compensated_skipped_layers "$MAX_COMPENSATED_SKIPPED_LAYERS" \
   --comp_rank "$COMP_RANK" \
+  --static_compensation_gate "$STATIC_COMPENSATION_GATE" \
+  --compensation_margin_delta "$COMPENSATION_MARGIN_DELTA" \
+  --compensation_margin_tau "$COMPENSATION_MARGIN_TAU" \
   "${group_flag[@]}" \
   --seed "$SEED" \
   --warmup_batches "$WARMUP_BATCHES" \
   --timed_batches "$TIMED_BATCHES" \
   --max_batches "$MAX_BATCHES" \
   --output_dir "$OUTPUT_DIR" \
-  --run_name "${CATEGORY}_layerwise_router_k${TOP_K_LAYERS}_${COMPENSATION}_r${COMP_RANK}_seed${SEED}"
+  --run_name "${CATEGORY}_opal_prefix${PREFIX_DEPTH}_k${TOP_K_LAYERS}_${COMPENSATION}_R${MAX_COMPENSATED_SKIPPED_LAYERS}_r${COMP_RANK}_bs${BATCH_SIZE}_seed${SEED}"

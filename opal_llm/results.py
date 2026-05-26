@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from .template_library import summarize_masks
+from .mask_library import summarize_masks
 
 
 DEFAULT_TOPK = (1, 3, 5, 10, 20, 50)
@@ -148,15 +148,45 @@ def build_payload(
     timing_records: Sequence[Dict[str, object]],
 ) -> Dict[str, object]:
     masks = [row.get("layer_mask", []) for row in predictions if row.get("layer_mask") is not None]
-    template_ids = [str(row.get("template_id")) for row in predictions if row.get("template_id") is not None]
+    mask_ids = [
+        str(row.get("mask_id") or row.get("template_id"))
+        for row in predictions
+        if row.get("mask_id") is not None or row.get("template_id") is not None
+    ]
     metrics = compute_metrics(predictions, ground_truths, valid_sids)
+    serving_records = [
+        row.get("metadata", {})
+        for row in timing_records
+        if isinstance(row.get("metadata"), dict) and row.get("metadata")
+    ]
+    batch_records = [row for row in serving_records if row.get("batch_size") is not None]
     return {
         "metadata": metadata,
         "metrics": metrics,
         "latency": latency,
-        "mask_stats": summarize_masks(masks, template_ids if template_ids else None),
+        "mask_stats": summarize_masks(masks, mask_ids if mask_ids else None),
+        "serving_stats": summarize_serving_records(batch_records),
         "timing_records": list(timing_records),
         "predictions": list(predictions),
+    }
+
+
+def summarize_serving_records(records: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    if not records:
+        return {
+            "mean_unique_masks_in_batch": 0.0,
+            "mean_mask_entropy_in_batch": 0.0,
+            "grouping_strategy_usage": {},
+            "mean_num_groups": 0.0,
+        }
+    strategies = [str(row.get("grouping_strategy", "none")) for row in records]
+    return {
+        "mean_unique_masks_in_batch": sum(float(row.get("unique_masks_in_batch", 0.0)) for row in records)
+        / len(records),
+        "mean_mask_entropy_in_batch": sum(float(row.get("mask_entropy_in_batch", 0.0)) for row in records)
+        / len(records),
+        "grouping_strategy_usage": {key: strategies.count(key) for key in sorted(set(strategies))},
+        "mean_num_groups": sum(float(row.get("num_groups", 0.0)) for row in records) / len(records),
     }
 
 
@@ -165,6 +195,7 @@ def summary_row(payload: Dict[str, object], raw_output_path: str) -> Dict[str, o
     metrics = payload.get("metrics", {})
     latency = payload.get("latency", {})
     mask_stats = payload.get("mask_stats", {})
+    serving_stats = payload.get("serving_stats", {})
     return {
         "dataset": metadata.get("dataset"),
         "method": metadata.get("method"),
@@ -186,5 +217,9 @@ def summary_row(payload: Dict[str, object], raw_output_path: str) -> Dict[str, o
         "average_kept_layers": mask_stats.get("average_kept_layers"),
         "unique_masks": mask_stats.get("unique_masks"),
         "mask_entropy": mask_stats.get("mask_entropy"),
+        "per_batch_unique_masks": serving_stats.get("mean_unique_masks_in_batch"),
+        "per_batch_mask_entropy": serving_stats.get("mean_mask_entropy_in_batch"),
+        "router_latency_sec": latency.get("router_latency_sec"),
+        "compensation_latency_sec": latency.get("compensation_latency_sec"),
         "raw_output_path": raw_output_path,
     }

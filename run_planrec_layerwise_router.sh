@@ -43,9 +43,11 @@ if [[ -z "$POLICY_CKPT" ]]; then
   POLICY_CKPT=$(ls -v ./policy_ckpts/unfrozon/${CATEGORY}/policy_epoch_*.pt 2>/dev/null | tail -1)
 fi
 
-if [[ ! -f "$STUDENT_CKPT" || ! -f "$POLICY_CKPT" ]]; then
-  echo "Missing STUDENT_CKPT or POLICY_CKPT"
-  exit 1
+router_flags=()
+if [[ -f "$STUDENT_CKPT" && -f "$POLICY_CKPT" ]]; then
+  router_flags=(--student_ckpt "$STUDENT_CKPT" --policy_ckpt "$POLICY_CKPT")
+else
+  echo "Warning: missing STUDENT_CKPT/POLICY_CKPT; using prompt-feature local-threshold fallback for smoke."
 fi
 
 group_flag=()
@@ -61,8 +63,7 @@ fi
 accelerate launch --num_processes "$NUM_GPUS" ./eval_planrec_opal.py \
   --method layerwise_router \
   --teacher_model "$MODEL_PATH" \
-  --student_ckpt "$STUDENT_CKPT" \
-  --policy_ckpt "$POLICY_CKPT" \
+  "${router_flags[@]}" \
   --test_file "$test_file" \
   --info_file "$info_file" \
   --category "$CATEGORY" \

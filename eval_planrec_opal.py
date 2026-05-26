@@ -294,10 +294,14 @@ def dynamic_masks(
 
 
 def layerwise_router_masks(args, student, router, input_ids, attention_mask, num_layers: int):
-    with torch.no_grad():
-        student_out = student(input_ids=input_ids, attention_mask=attention_mask)
-        state = pool_request_state(student_out["last_hidden_state"], attention_mask)
-        _, scores = router(state)
+    if student is not None and router is not None:
+        with torch.no_grad():
+            student_out = student(input_ids=input_ids, attention_mask=attention_mask)
+            state = pool_request_state(student_out["last_hidden_state"], attention_mask)
+            _, scores = router(state)
+    else:
+        features = input_guided_features(input_ids, attention_mask, args.input_guided_num_bins)
+        scores = prompt_feature_scores(features, num_layers, args.seed, args.input_guided_feature_set).to(input_ids.device)
     mask_tensor = local_threshold_mask_from_scores(
         scores,
         threshold=args.layerwise_threshold,
@@ -941,7 +945,9 @@ def main():
         static_mask_spec = static_mask_from_args(args, num_layers, mask_specs)
 
     student = router = opal_router = None
-    if args.method in {"dynamic", "layerwise_router"}:
+    if args.method == "dynamic":
+        student, router = load_student_router(args, sid_token_ids, num_layers, device)
+    elif args.method == "layerwise_router" and args.student_ckpt and args.policy_ckpt:
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
     if args.method == "opal":
         opal_router = load_policy_router(args, model.config.hidden_size, num_layers, device)
@@ -1159,7 +1165,11 @@ def main():
                     "router",
                     lambda: layerwise_router_masks(args, student, router, input_ids, attention_mask, num_layers),
                     samples=batch_size,
-                    metadata={"router_source": "one_layer_student_local_threshold"},
+                    metadata={
+                        "router_source": "one_layer_student_local_threshold"
+                        if student is not None and router is not None
+                        else "prompt_feature_local_threshold_fallback"
+                    },
                 )
                 action_plans = timed_action_plans(args, masks, router_scores, component_timer)
                 actions = [plan["action_mask"] for plan in action_plans]

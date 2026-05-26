@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export PYTHONPATH="${REPO_ROOT}/transformers/src:${PYTHONPATH:-}"
+
 MODEL_PATH=${MODEL_PATH:-/workspace/ckpts/MiniOneRec/Office_ckpt}
 CATEGORY=${CATEGORY:-Office_Products}
 OUTPUT_DIR=${OUTPUT_DIR:-./results/planrec_experiments}

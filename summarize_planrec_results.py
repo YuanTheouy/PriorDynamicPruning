@@ -18,6 +18,11 @@ def main():
     parser = argparse.ArgumentParser(description="Summarize OPAL-LLM MiniOneRec result JSON files.")
     parser.add_argument("--output_dir", default="./results/planrec_experiments")
     parser.add_argument("--table_name", default="summary_recomputed.csv")
+    parser.add_argument(
+        "--run_name_contains",
+        default="",
+        help="Only include final JSON files whose metadata.run_name contains this substring.",
+    )
     args = parser.parse_args()
 
     root = Path(args.output_dir)
@@ -32,6 +37,9 @@ def main():
             continue
         payload = load_result(path)
         if payload is None:
+            continue
+        run_name = str(payload.get("metadata", {}).get("run_name") or "")
+        if args.run_name_contains and args.run_name_contains not in run_name:
             continue
         payloads.append((path, payload))
 
@@ -51,12 +59,13 @@ def main():
 
     md_path = table_dir / "quality_retention.md"
     with md_path.open("w", encoding="utf-8") as f:
-        f.write("| dataset | method | mask_id | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n")
-        f.write("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        f.write("| dataset | run_name | method | mask_id | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n")
+        f.write("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for row in rows:
             f.write(
-                "| {dataset} | {method} | {mask_id} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(
+                "| {dataset} | {run_name} | {method} | {mask_id} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(
                     dataset=row.get("dataset"),
+                    run_name=row.get("run_name") or "",
                     method=row.get("method"),
                     mask_id=row.get("mask_id") or "",
                     stage=row.get("opal_stage") or "",

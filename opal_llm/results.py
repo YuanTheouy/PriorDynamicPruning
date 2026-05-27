@@ -240,6 +240,7 @@ def summary_row(payload: Dict[str, object], raw_output_path: str) -> Dict[str, o
         mask_id = unique_mask_ids[0] if len(unique_mask_ids) == 1 else f"mixed:{len(unique_mask_ids)}"
     return {
         "dataset": metadata.get("dataset"),
+        "run_name": metadata.get("run_name"),
         "method": metadata.get("method"),
         "opal_stage": metadata.get("opal_stage"),
         "skip_rate": metadata.get("skip_rate"),

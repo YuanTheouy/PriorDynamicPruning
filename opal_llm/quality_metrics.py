@@ -27,6 +27,17 @@ def summarize_quality_metrics(rows: Sequence[Dict[str, float]]) -> Dict[str, flo
     return summary
 
 
+def encode_target_ids(tokenizer, text: str) -> List[int]:
+    try:
+        return tokenizer.encode(text, bos=False, eos=True)
+    except TypeError:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            token_ids = list(token_ids) + [int(eos_token_id)]
+        return token_ids
+
+
 def build_target_scoring_batch(tokenizer, input_ids, attention_mask, targets: Sequence[str], max_len: int):
     import torch
 
@@ -34,7 +45,7 @@ def build_target_scoring_batch(tokenizer, input_ids, attention_mask, targets: Se
     label_rows = []
     for ids, mask, target in zip(input_ids.detach().cpu(), attention_mask.detach().cpu(), targets):
         prompt_ids = ids[mask.bool()].tolist()
-        target_ids = tokenizer.encode(f"{str(target).strip()}\n", bos=False, eos=True)
+        target_ids = encode_target_ids(tokenizer, f"{str(target).strip()}\n")
         combined = prompt_ids + target_ids
         labels = [-100] * len(prompt_ids) + target_ids
         if max_len > 0 and len(combined) > max_len:
@@ -116,4 +127,3 @@ def quality_rows_from_logits(full_logits, skip_logits, labels) -> List[Dict[str,
             }
         )
     return rows
-

@@ -1542,7 +1542,7 @@ def main():
                     samples=batch_size,
                     metadata={"router_source": "prompt_features", "warmup": batch_is_warmup},
                 )
-                masks, mask_ids, input_guided_features, router_scores = mask_result
+                masks, mask_ids, input_guided_row_features, router_scores = mask_result
                 action_plans = timed_action_plans(args, masks, router_scores, component_timer, metadata={"warmup": batch_is_warmup})
                 actions = [plan["action_mask"] for plan in action_plans]
                 comp_config = compensation_config_from_args(args, action_plans)
@@ -1578,7 +1578,7 @@ def main():
                             "action_id": action_plans[local_pos]["action_id"],
                             "layer_scores": router_scores[local_pos],
                             "kept_layer_count": sum(masks[local_pos]),
-                            "input_guided_features": input_guided_features[local_pos],
+                            "input_guided_features": input_guided_row_features[local_pos],
                             "compensation_mask": action_plans[local_pos]["compensation_mask"],
                             "compensation_gates": action_plans[local_pos]["compensation_gates"],
                             "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],

@@ -3,10 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class LayerRouter(nn.Module):
-    def __init__(self, hidden_size, num_layers, top_k):
+    def __init__(self, hidden_size, num_layers, top_k, gumbel_noise_scale=1.0):
         super().__init__()
         self.num_layers = num_layers
         self.top_k = top_k
+        self.gumbel_noise_scale = float(gumbel_noise_scale)
         
         # 2-layer MLP
         self.mlp = nn.Sequential(
@@ -29,11 +30,11 @@ class LayerRouter(nn.Module):
         # We want to select the top k layers to KEEP
         # To avoid Mode Collapse (where unselected layers get 0 gradient),
         # we inject Gumbel noise during training to encourage exploration.
-        if self.training:
-            # Gumbel(0, 1) noise
-            noise = -torch.empty_like(scores).exponential_(1e-5).log()
-            # Add noise to scores (temperature can be adjusted)
-            noisy_scores = scores + noise * 1.0 
+        if self.training and self.gumbel_noise_scale > 0:
+            # Standard Gumbel(0, 1) noise for top-k exploration.
+            uniform = torch.rand_like(scores).clamp_(1e-6, 1.0 - 1e-6)
+            noise = -torch.log(-torch.log(uniform))
+            noisy_scores = scores + noise * self.gumbel_noise_scale
             topk_values, topk_indices = torch.topk(noisy_scores, self.top_k, dim=-1)
         else:
             # Deterministic for inference

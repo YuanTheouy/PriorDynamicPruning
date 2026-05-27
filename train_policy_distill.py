@@ -151,6 +151,13 @@ def main():
     parser.add_argument("--mask_distill_weight", type=float, default=0.0)
     parser.add_argument("--risk_ranking_weight", type=float, default=0.0)
     parser.add_argument("--kl_distill_weight", type=float, default=1.0)
+    parser.add_argument("--gumbel_noise_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--restrict_to_oracle_cache",
+        action="store_true",
+        help="Train only examples covered by --oracle_cache. Use this for OPAL-2 oracle distillation.",
+    )
+    parser.add_argument("--loss_log_interval", type=int, default=200)
     args = parser.parse_args()
     if args.router_input_source == "student" and not args.student_ckpt:
         raise ValueError("--student_ckpt is required when --router_input_source student")
@@ -210,7 +217,22 @@ def main():
         return result
 
     if oracle_cache:
-        dataset = IndexedDataset(dataset)
+        indexed_dataset = IndexedDataset(dataset)
+        if args.restrict_to_oracle_cache:
+            oracle_indices = sorted(int(index) for index in oracle_cache.keys() if 0 <= int(index) < len(dataset))
+            if not oracle_indices:
+                raise ValueError(
+                    "--restrict_to_oracle_cache was set, but no oracle rows match the training dataset indices."
+                )
+            dataset = torch.utils.data.Subset(indexed_dataset, oracle_indices)
+            if accelerator.is_main_process:
+                print(
+                    "Restricting training to oracle-covered rows: "
+                    f"{len(oracle_indices)}/{len(indexed_dataset)} "
+                    f"({len(oracle_indices) / max(1, len(indexed_dataset)):.2%})"
+                )
+        else:
+            dataset = indexed_dataset
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=custom_collate)
 
@@ -269,7 +291,12 @@ def main():
 
     # 5. Initialize Router (Policy Network)
     hidden_size = student.backbone.config.hidden_size if student is not None else raw_teacher.config.hidden_size
-    router = LayerRouter(hidden_size=hidden_size, num_layers=num_layers, top_k=args.top_k_layers)
+    router = LayerRouter(
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        top_k=args.top_k_layers,
+        gumbel_noise_scale=args.gumbel_noise_scale,
+    )
     router.to(torch.bfloat16) # Match precision
     router.to(device)
     router.train()
@@ -295,6 +322,11 @@ def main():
     
     for epoch in range(args.epochs):
         total_loss = 0
+        total_kl_loss = 0.0
+        total_mask_loss = 0.0
+        total_rank_loss = 0.0
+        used_steps = 0
+        skipped_no_supervision = 0
         
         if accelerator.is_main_process:
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
@@ -333,69 +365,71 @@ def main():
             # --- 2. Router Forward ---
             # mask: [batch, num_layers]
             mask, scores = router(state)
-
-            # --- 3. Full Teacher Forward (Target) ---
-            with torch.no_grad():
-                # We can call raw_teacher directly
-                full_outputs = raw_teacher(input_ids=input_ids, attention_mask=attention_mask)
-                full_logits = full_outputs.logits
-                
-                # Shift and filter for SID
-                shift_full_logits = full_logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                shift_valid_mask = (shift_labels != -100)
-                
-                active_full_logits = shift_full_logits[shift_valid_mask]
-                active_full_sid_logits = active_full_logits[:, sid_token_ids]
-                
-                # Target Probs
-                target_probs = F.softmax(active_full_sid_logits / args.temperature, dim=-1)
-
-            # --- 4. Pruned Teacher Forward (Prediction) ---
-            # We use the wrapper. It requires layer_mask.
-            pruned_logits = pruned_teacher(input_ids, attention_mask, mask)
-            
-            # Shift and filter
-            shift_pruned_logits = pruned_logits[..., :-1, :].contiguous()
-            # Re-use mask and indices
-            active_pruned_logits = shift_pruned_logits[shift_valid_mask]
-            active_pruned_sid_logits = active_pruned_logits[:, sid_token_ids]
-            
-            # Log Probs for KL
-            log_pruned_probs = F.log_softmax(active_pruned_sid_logits / args.temperature, dim=-1)
-
-            # --- 5. Debug Metrics (Approx NDCG/HR) ---
-            if accelerator.is_main_process and total_loss == 0: # Only print once per epoch start to avoid flooding
-                with torch.no_grad():
-                    # Get top predictions for both
-                    top_full = torch.argmax(active_full_sid_logits, dim=-1) # [num_active]
-                    top_pruned = torch.argmax(active_pruned_sid_logits, dim=-1) # [num_active]
-                    
-                    # Match rate between pruned and full teacher
-                    match_rate = (top_full == top_pruned).float().mean()
-                    
-                    # Target item match rate
-                    # active_labels are the token_ids we want to predict
-                    active_labels = shift_labels[shift_valid_mask]
-                    # We need to map active_labels to sid_token_ids indices
-                    # This is complex, let's just use token_ids directly for a quick check
-                    full_preds_ids = torch.tensor(sid_token_ids, device=device)[top_full]
-                    pruned_preds_ids = torch.tensor(sid_token_ids, device=device)[top_pruned]
-                    
-                    full_acc = (full_preds_ids == active_labels).float().mean()
-                    pruned_acc = (pruned_preds_ids == active_labels).float().mean()
-                    
-                    print(f"\nDEBUG: [Match with Full: {match_rate:.4f}] [Full Acc: {full_acc:.4f}] [Pruned Acc: {pruned_acc:.4f}]")
-                    print(f"DEBUG: Mask sample (first 5 layers): {mask[0, :5].tolist()}")
+            oracle_mask = oracle_mask_tensor(batch_indices, oracle_cache, num_layers, device)
 
             # --- 6. Loss ---
-            kl_loss = F.kl_div(log_pruned_probs, target_probs, reduction='batchmean') * (args.temperature ** 2)
-            loss = args.kl_distill_weight * kl_loss
-            oracle_mask = oracle_mask_tensor(batch_indices, oracle_cache, num_layers, device)
+            loss = scores.float().new_tensor(0.0)
+            kl_loss = scores.float().new_tensor(0.0)
+            mask_loss = scores.float().new_tensor(0.0)
+            rank_loss = scores.float().new_tensor(0.0)
+            has_loss_term = False
+
+            if args.kl_distill_weight > 0:
+                # --- 3. Full Teacher Forward (Target) ---
+                with torch.no_grad():
+                    full_outputs = raw_teacher(input_ids=input_ids, attention_mask=attention_mask)
+                    full_logits = full_outputs.logits
+
+                    shift_full_logits = full_logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    shift_valid_mask = shift_labels != -100
+
+                    active_full_logits = shift_full_logits[shift_valid_mask]
+                    active_full_sid_logits = active_full_logits[:, sid_token_ids]
+                    target_probs = F.softmax(active_full_sid_logits / args.temperature, dim=-1)
+
+                # --- 4. Pruned Teacher Forward (Prediction) ---
+                pruned_logits = pruned_teacher(input_ids, attention_mask, mask)
+
+                shift_pruned_logits = pruned_logits[..., :-1, :].contiguous()
+                active_pruned_logits = shift_pruned_logits[shift_valid_mask]
+                active_pruned_sid_logits = active_pruned_logits[:, sid_token_ids]
+                log_pruned_probs = F.log_softmax(active_pruned_sid_logits / args.temperature, dim=-1)
+
+                if accelerator.is_main_process and total_loss == 0:
+                    with torch.no_grad():
+                        top_full = torch.argmax(active_full_sid_logits, dim=-1)
+                        top_pruned = torch.argmax(active_pruned_sid_logits, dim=-1)
+                        match_rate = (top_full == top_pruned).float().mean()
+
+                        active_labels = shift_labels[shift_valid_mask]
+                        full_preds_ids = torch.tensor(sid_token_ids, device=device)[top_full]
+                        pruned_preds_ids = torch.tensor(sid_token_ids, device=device)[top_pruned]
+
+                        full_acc = (full_preds_ids == active_labels).float().mean()
+                        pruned_acc = (pruned_preds_ids == active_labels).float().mean()
+
+                        print(
+                            f"\nDEBUG: [Match with Full: {match_rate:.4f}] "
+                            f"[Full Acc: {full_acc:.4f}] [Pruned Acc: {pruned_acc:.4f}]"
+                        )
+
+                kl_loss = F.kl_div(log_pruned_probs, target_probs, reduction='batchmean') * (args.temperature ** 2)
+                loss = loss + args.kl_distill_weight * kl_loss
+                has_loss_term = True
+
             if oracle_mask is not None and args.mask_distill_weight > 0:
-                loss = loss + args.mask_distill_weight * mask_distillation_loss(scores, oracle_mask)
+                mask_loss = mask_distillation_loss(scores, oracle_mask)
+                loss = loss + args.mask_distill_weight * mask_loss
+                has_loss_term = True
             if oracle_mask is not None and args.risk_ranking_weight > 0:
-                loss = loss + args.risk_ranking_weight * risk_ranking_loss(scores, oracle_mask)
+                rank_loss = risk_ranking_loss(scores, oracle_mask)
+                loss = loss + args.risk_ranking_weight * rank_loss
+                has_loss_term = True
+
+            if not has_loss_term:
+                skipped_no_supervision += 1
+                continue
 
             # Backward
             optimizer.zero_grad()
@@ -403,11 +437,33 @@ def main():
             optimizer.step()
             
             total_loss += loss.item()
+            total_kl_loss += float(kl_loss.detach().float().item())
+            total_mask_loss += float(mask_loss.detach().float().item())
+            total_rank_loss += float(rank_loss.detach().float().item())
+            used_steps += 1
             if accelerator.is_main_process:
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                if args.loss_log_interval > 0 and used_steps % args.loss_log_interval == 0:
+                    print(
+                        f"\nLOSS DEBUG step={used_steps} "
+                        f"total={total_loss / used_steps:.4f} "
+                        f"kl={total_kl_loss / used_steps:.4f} "
+                        f"mask={total_mask_loss / used_steps:.4f} "
+                        f"rank={total_rank_loss / used_steps:.4f} "
+                        f"skipped_no_supervision={skipped_no_supervision}"
+                    )
         
         if accelerator.is_main_process:
-            print(f"Epoch {epoch+1} finished. Avg Loss: {total_loss / len(dataloader):.4f}")
+            denom = max(1, used_steps)
+            print(
+                f"Epoch {epoch+1} finished. "
+                f"Avg Loss: {total_loss / denom:.4f} "
+                f"(kl={total_kl_loss / denom:.4f}, "
+                f"mask={total_mask_loss / denom:.4f}, "
+                f"rank={total_rank_loss / denom:.4f}, "
+                f"used_steps={used_steps}, "
+                f"skipped_no_supervision={skipped_no_supervision})"
+            )
             
             # Save Checkpoint
             save_path = os.path.join(args.output_dir, f"policy_epoch_{epoch+1}.pt")
@@ -427,6 +483,8 @@ def main():
                 "mask_distill_weight": float(args.mask_distill_weight),
                 "risk_ranking_weight": float(args.risk_ranking_weight),
                 "kl_distill_weight": float(args.kl_distill_weight),
+                "gumbel_noise_scale": float(args.gumbel_noise_scale),
+                "restrict_to_oracle_cache": bool(args.restrict_to_oracle_cache),
             }
             torch.save(
                 {

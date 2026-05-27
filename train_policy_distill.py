@@ -88,6 +88,39 @@ def gather_last_token_state(last_hidden_state, attention_mask):
     return last_hidden_state[torch.arange(last_hidden_state.size(0), device=last_hidden_state.device), last_indices]
 
 
+def prompt_only_inputs(input_ids, attention_mask, labels, pad_token_id):
+    prompt_rows = []
+    mask_rows = []
+    lengths = []
+    for ids, mask, row_labels in zip(input_ids, attention_mask, labels):
+        valid_labels = row_labels.ne(-100).nonzero(as_tuple=False)
+        if valid_labels.numel() > 0:
+            prompt_len = int(valid_labels[0].item())
+        else:
+            prompt_len = int(mask.long().sum().item())
+        prompt_len = max(1, min(prompt_len, ids.size(0)))
+        prompt_rows.append(ids[:prompt_len])
+        mask_rows.append(mask[:prompt_len])
+        lengths.append(prompt_len)
+
+    width = max(lengths)
+    padded_ids = []
+    padded_masks = []
+    for ids, mask, length in zip(prompt_rows, mask_rows, lengths):
+        pad = width - length
+        if pad > 0:
+            padded_ids.append(
+                torch.cat([ids, ids.new_full((pad,), int(pad_token_id))], dim=0)
+            )
+            padded_masks.append(
+                torch.cat([mask, mask.new_zeros((pad,))], dim=0)
+            )
+        else:
+            padded_ids.append(ids)
+            padded_masks.append(mask)
+    return torch.stack(padded_ids, dim=0), torch.stack(padded_masks, dim=0)
+
+
 def teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers, prefix_depth):
     prefix_depth = max(0, min(int(prefix_depth), int(num_layers)))
     prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(num_layers)]
@@ -152,6 +185,12 @@ def main():
     parser.add_argument("--risk_ranking_weight", type=float, default=0.0)
     parser.add_argument("--kl_distill_weight", type=float, default=1.0)
     parser.add_argument("--gumbel_noise_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--router_context",
+        choices=["prompt", "full"],
+        default="prompt",
+        help="Use prompt-only context for the router by default; full includes target tokens and is for legacy ablations.",
+    )
     parser.add_argument(
         "--restrict_to_oracle_cache",
         action="store_true",
@@ -338,6 +377,15 @@ def main():
             attention_mask = batch["attention_mask"]
             labels = batch["labels"]
             batch_indices = batch.get("index")
+            if args.router_context == "prompt":
+                router_input_ids, router_attention_mask = prompt_only_inputs(
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    tokenizer.pad_token_id,
+                )
+            else:
+                router_input_ids, router_attention_mask = input_ids, attention_mask
 
             # Filter valid positions
             valid_positions_mask = (labels != -100)
@@ -347,20 +395,20 @@ def main():
             # --- 1. Get Router State ---
             if args.router_input_source == "student":
                 if args.train_student:
-                    student_outputs = student(input_ids=input_ids, attention_mask=attention_mask)
+                    student_outputs = student(input_ids=router_input_ids, attention_mask=router_attention_mask)
                 else:
                     with torch.no_grad():
-                        student_outputs = student(input_ids=input_ids, attention_mask=attention_mask)
-                state = gather_last_token_state(student_outputs["last_hidden_state"], attention_mask)
+                        student_outputs = student(input_ids=router_input_ids, attention_mask=router_attention_mask)
+                state = gather_last_token_state(student_outputs["last_hidden_state"], router_attention_mask)
             else:
                 prefix_hidden = teacher_prefix_hidden_state(
                     raw_teacher,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
+                    input_ids=router_input_ids,
+                    attention_mask=router_attention_mask,
                     num_layers=num_layers,
                     prefix_depth=args.prefix_depth,
                 )
-                state = gather_last_token_state(prefix_hidden, attention_mask)
+                state = gather_last_token_state(prefix_hidden, router_attention_mask)
 
             # --- 2. Router Forward ---
             # mask: [batch, num_layers]
@@ -484,6 +532,7 @@ def main():
                 "risk_ranking_weight": float(args.risk_ranking_weight),
                 "kl_distill_weight": float(args.kl_distill_weight),
                 "gumbel_noise_scale": float(args.gumbel_noise_scale),
+                "router_context": args.router_context,
                 "restrict_to_oracle_cache": bool(args.restrict_to_oracle_cache),
             }
             torch.save(

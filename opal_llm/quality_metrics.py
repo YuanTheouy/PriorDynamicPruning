@@ -9,20 +9,40 @@ def _finite_exp(value: float) -> float:
 
 
 def summarize_quality_metrics(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
-    keys = [
-        "NLL_full",
-        "NLL_skip",
-        "Delta_NLL",
-        "PPL_full",
-        "PPL_skip",
-        "Delta_PPL",
-        "KL_full_to_skip",
-        "oracle_regret",
-    ]
     summary = {}
-    for key in keys:
-        values = [float(row[key]) for row in rows if row.get(key) is not None and math.isfinite(float(row[key]))]
-        summary[key] = sum(values) / len(values) if values else 0.0
+    weights = [
+        float(row.get("quality_token_count") or 0.0)
+        for row in rows
+        if row.get("quality_token_count") is not None
+    ]
+    total_weight = sum(weight for weight in weights if math.isfinite(weight) and weight > 0)
+
+    def weighted_mean(key: str) -> float:
+        if total_weight <= 0:
+            values = [float(row[key]) for row in rows if row.get(key) is not None and math.isfinite(float(row[key]))]
+            return sum(values) / len(values) if values else 0.0
+        total = 0.0
+        for row in rows:
+            value = row.get(key)
+            weight = float(row.get("quality_token_count") or 0.0)
+            if value is None or not math.isfinite(float(value)) or weight <= 0 or not math.isfinite(weight):
+                continue
+            total += float(value) * weight
+        return total / total_weight
+
+    summary["NLL_full"] = weighted_mean("NLL_full")
+    summary["NLL_skip"] = weighted_mean("NLL_skip")
+    summary["Delta_NLL"] = summary["NLL_skip"] - summary["NLL_full"]
+    summary["PPL_full"] = _finite_exp(summary["NLL_full"])
+    summary["PPL_skip"] = _finite_exp(summary["NLL_skip"])
+    summary["Delta_PPL"] = summary["PPL_skip"] - summary["PPL_full"]
+    summary["KL_full_to_skip"] = weighted_mean("KL_full_to_skip")
+    oracle_regrets = [
+        float(row["oracle_regret"])
+        for row in rows
+        if row.get("oracle_regret") is not None and math.isfinite(float(row["oracle_regret"]))
+    ]
+    summary["oracle_regret"] = sum(oracle_regrets) / len(oracle_regrets) if oracle_regrets else 0.0
     summary["num_quality_samples"] = len(rows)
     return summary
 

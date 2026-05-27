@@ -4,6 +4,7 @@ import csv
 import json
 from pathlib import Path
 
+from opal_llm.quality_metrics import summarize_quality_metrics
 from opal_llm.results import summary_row
 
 
@@ -44,6 +45,13 @@ def main():
         payloads.append((path, payload))
 
     for path, payload in payloads:
+        predictions = payload.get("predictions", [])
+        quality_rows = [row for row in predictions if row.get("NLL_full") is not None]
+        if quality_rows:
+            payload = dict(payload)
+            metrics = dict(payload.get("metrics") or {})
+            metrics.update(summarize_quality_metrics(quality_rows))
+            payload["metrics"] = metrics
         rows.append(summary_row(payload, str(path)))
 
     if not rows:

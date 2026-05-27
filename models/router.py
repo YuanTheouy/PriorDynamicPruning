@@ -49,3 +49,21 @@ class LayerRouter(nn.Module):
         mask = (mask_hard - torch.sigmoid(scores)).detach() + torch.sigmoid(scores)
         
         return mask, scores
+
+
+def mask_distillation_loss(scores, oracle_mask):
+    return F.binary_cross_entropy_with_logits(scores.float(), oracle_mask.float())
+
+
+def risk_ranking_loss(scores, oracle_mask, margin: float = 1.0):
+    losses = []
+    for row_scores, row_mask in zip(scores.float(), oracle_mask.float()):
+        keep_scores = row_scores[row_mask > 0.5]
+        skip_scores = row_scores[row_mask <= 0.5]
+        if keep_scores.numel() == 0 or skip_scores.numel() == 0:
+            continue
+        pairwise = margin + skip_scores.view(-1, 1) - keep_scores.view(1, -1)
+        losses.append(F.relu(pairwise).mean())
+    if not losses:
+        return scores.float().new_tensor(0.0)
+    return torch.stack(losses).mean()

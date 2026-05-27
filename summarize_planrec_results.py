@@ -35,35 +35,7 @@ def main():
             continue
         payloads.append((path, payload))
 
-    full_latency = {}
     for path, payload in payloads:
-        metadata = payload.get("metadata", {})
-        if metadata.get("method") != "full":
-            continue
-        key = (
-            metadata.get("dataset"),
-            metadata.get("beam_size"),
-            metadata.get("max_new_tokens"),
-            metadata.get("batch_size"),
-            metadata.get("precision"),
-        )
-        latency = payload.get("latency", {}).get("latency_mean_sec")
-        if latency:
-            full_latency[key] = float(latency)
-
-    for path, payload in payloads:
-        metadata = payload.get("metadata", {})
-        key = (
-            metadata.get("dataset"),
-            metadata.get("beam_size"),
-            metadata.get("max_new_tokens"),
-            metadata.get("batch_size"),
-            metadata.get("precision"),
-        )
-        current = payload.get("latency", {}).get("latency_mean_sec")
-        baseline = full_latency.get(key)
-        if current and baseline:
-            payload.setdefault("metadata", {})["speedup_vs_full"] = baseline / float(current)
         rows.append(summary_row(payload, str(path)))
 
     if not rows:
@@ -77,20 +49,25 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    md_path = table_dir / "quality_latency.md"
+    md_path = table_dir / "quality_retention.md"
     with md_path.open("w", encoding="utf-8") as f:
-        f.write("| dataset | method | budget | NDCG@10 | HR@10 | latency_mean_sec | speedup_vs_full | avg_layers | unique_masks |\n")
-        f.write("|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
+        f.write("| dataset | method | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n")
+        f.write("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for row in rows:
             f.write(
-                "| {dataset} | {method} | {budget} | {ndcg10:.4f} | {hr10:.4f} | {lat:.4f} | {speedup} | {layers:.2f} | {unique} |\n".format(
+                "| {dataset} | {method} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(
                     dataset=row.get("dataset"),
                     method=row.get("method"),
-                    budget=row.get("budget"),
+                    stage=row.get("opal_stage") or "",
+                    skip_rate=float(row.get("skip_rate") or 0.0),
                     ndcg10=float(row.get("NDCG@10") or 0.0),
-                    hr10=float(row.get("HR@10") or 0.0),
-                    lat=float(row.get("latency_mean_sec") or 0.0),
-                    speedup=("" if row.get("speedup_vs_full") in (None, "") else f"{float(row.get('speedup_vs_full')):.3f}"),
+                    retention=float(row.get("retention_NDCG@10") or 0.0),
+                    delta_nll=float(row.get("Delta_NLL") or 0.0),
+                    delta_ppl=float(row.get("Delta_PPL") or 0.0),
+                    kl=float(row.get("KL_full_to_skip") or 0.0),
+                    regret=float(row.get("oracle_regret") or 0.0),
+                    agreement=float(row.get("prefix_to_oracle_agreement") or 0.0),
+                    hamming=float(row.get("hamming_distance") or 0.0),
                     layers=float(row.get("average_kept_layers") or 0.0),
                     unique=row.get("unique_masks"),
                 )

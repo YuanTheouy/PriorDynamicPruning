@@ -280,6 +280,11 @@ def exact_topk_mask_from_scores(
     forced = set(range(min(prefix_depth, num_layers)))
     if tail_keep > 0:
         forced.update(range(max(0, num_layers - int(tail_keep)), num_layers))
+    if len(forced) > top_k:
+        raise ValueError(
+            f"Forced prefix/tail layers ({len(forced)}) exceed exact top-k budget ({top_k}). "
+            "Lower --prefix_depth/--tail_keep or increase --top_k_layers."
+        )
 
     masks = torch.zeros_like(score_tensor)
     if forced:
@@ -293,13 +298,6 @@ def exact_topk_mask_from_scores(
             candidate_scores[:, forced_idx] = -float("inf")
         _, top_indices = torch.topk(candidate_scores, remaining_budget, dim=-1)
         masks.scatter_(1, top_indices, 1.0)
-
-    if len(forced) > top_k:
-        # Prefix/tail constraints are stronger than the exact-K budget. Keep them
-        # explicit in the mask rather than silently dropping observed prefix layers.
-        masks = torch.zeros_like(score_tensor)
-        forced_idx = torch.tensor(sorted(forced), device=score_tensor.device, dtype=torch.long)
-        masks[:, forced_idx] = 1.0
     return masks
 
 

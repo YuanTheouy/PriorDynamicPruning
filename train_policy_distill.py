@@ -20,10 +20,24 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from models.one_layer_student import OneLayerStudentModel
-from models.router import LayerRouter
+from models.router import LayerRouter, mask_distillation_loss, risk_ranking_loss
 from models.pruned_teacher import PrunedTeacherWrapper
 from utils_distill import get_sid_token_ids_from_info
 from data import SidSFTDataset
+from opal_llm.oracle_masks import load_oracle_cache
+
+
+class IndexedDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        row = dict(self.dataset[index])
+        row["index"] = index
+        return row
 
 def collate_fn(batch):
     # Filter out None values that might come from dataset
@@ -44,10 +58,78 @@ def collate_fn(batch):
         "labels": labels
     }
 
+
+def set_custom_policy(model, mask_payload, action_payload=None):
+    model.config.custom_layer_mask = mask_payload
+    model.config.custom_layer_actions = action_payload
+    model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                layer.self_attn.config.custom_layer_mask = mask_payload
+                layer.self_attn.config.custom_layer_actions = action_payload
+                layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+
+
+def clear_custom_policy(model):
+    model.config.custom_layer_mask = None
+    model.config.custom_layer_actions = None
+    model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                layer.self_attn.config.custom_layer_mask = None
+                layer.self_attn.config.custom_layer_actions = None
+                layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+
+
+def gather_last_token_state(last_hidden_state, attention_mask):
+    last_indices = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+    return last_hidden_state[torch.arange(last_hidden_state.size(0), device=last_hidden_state.device), last_indices]
+
+
+def teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers, prefix_depth):
+    prefix_depth = max(0, min(int(prefix_depth), int(num_layers)))
+    prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(num_layers)]
+    set_custom_policy(
+        model,
+        mask_payload=prefix_mask,
+        action_payload=[1 if keep else 0 for keep in prefix_mask],
+    )
+    try:
+        with torch.no_grad():
+            return model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).last_hidden_state
+    finally:
+        clear_custom_policy(model)
+
+
+def oracle_mask_tensor(batch_indices, oracle_cache, num_layers, device):
+    if not oracle_cache or batch_indices is None:
+        return None
+    rows = []
+    for index in batch_indices.detach().cpu().tolist():
+        entry = oracle_cache.get(int(index))
+        if not entry:
+            rows.append(None)
+            continue
+        mask = entry.get("oracle_mask") or entry.get("execution_mask") or entry.get("layer_mask") or []
+        if len(mask) != num_layers:
+            rows.append(None)
+        else:
+            rows.append([float(v) for v in mask])
+    if any(row is None for row in rows):
+        return None
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_model", type=str, required=True, help="Path to the teacher model checkpoint")
-    parser.add_argument("--student_ckpt", type=str, required=True, help="Path to the pretrained student checkpoint")
+    parser.add_argument("--student_ckpt", type=str, default="", help="Path to the pretrained student checkpoint")
     parser.add_argument("--train_file", type=str, required=True, help="Path to training CSV file")
     parser.add_argument("--info_file", type=str, required=True, help="Path to item info txt file")
     parser.add_argument("--category", type=str, default="Office_Products")
@@ -58,7 +140,22 @@ def main():
     parser.add_argument("--top_k_layers", type=int, default=12, help="Number of layers to keep in Teacher")
     parser.add_argument("--output_dir", type=str, default="./policy_ckpts")
     parser.add_argument("--train_student", action="store_true", help="Whether to unfreeze and train the student model")
+    parser.add_argument(
+        "--router_input_source",
+        choices=["student", "teacher_prefix"],
+        default="student",
+        help="State used by the policy router. Use teacher_prefix for OPAL prefix-hidden training.",
+    )
+    parser.add_argument("--prefix_depth", type=int, default=4, help="Teacher prefix depth for --router_input_source teacher_prefix")
+    parser.add_argument("--oracle_cache", default="", help="Oracle mask cache for OPAL-2 mask/risk distillation.")
+    parser.add_argument("--mask_distill_weight", type=float, default=0.0)
+    parser.add_argument("--risk_ranking_weight", type=float, default=0.0)
+    parser.add_argument("--kl_distill_weight", type=float, default=1.0)
     args = parser.parse_args()
+    if args.router_input_source == "student" and not args.student_ckpt:
+        raise ValueError("--student_ckpt is required when --router_input_source student")
+    if args.router_input_source != "student" and args.train_student:
+        raise ValueError("--train_student is only valid with --router_input_source student")
 
     # Initialize Accelerator
     # Fix unused parameters error in DDP
@@ -68,7 +165,9 @@ def main():
     
     if accelerator.is_main_process:
         print(f"Using device: {device}, Total processes: {accelerator.num_processes}")
-        if args.train_student:
+        if args.router_input_source == "teacher_prefix":
+            print(f"Training Strategy: Teacher Prefix Hidden State + Policy Router (prefix_depth={args.prefix_depth})")
+        elif args.train_student:
             print("🚀 Training Strategy: Jointly training Student Encoder + Policy Router")
         else:
             print("🧊 Training Strategy: Frozen Student Encoder, Training Policy Router Only")
@@ -82,6 +181,9 @@ def main():
     sid_token_ids = get_sid_token_ids_from_info(tokenizer, args.info_file)
     if accelerator.is_main_process:
         print(f"Extracted {len(sid_token_ids)} active SID tokens.")
+    oracle_cache = load_oracle_cache(args.oracle_cache) if args.oracle_cache else {}
+    if args.oracle_cache and not oracle_cache:
+        raise ValueError(f"--oracle_cache has no usable oracle rows: {args.oracle_cache}")
     
     # 2. Dataset & DataLoader
     dataset = SidSFTDataset(
@@ -96,12 +198,19 @@ def main():
         input_ids = [torch.tensor(b["input_ids"]) for b in batch]
         attention_mask = [torch.tensor(b["attention_mask"]) for b in batch]
         labels = [torch.tensor(b["labels"]) for b in batch]
+        indices = [int(b.get("index", -1)) for b in batch]
         
         input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
         attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
         
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        result = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        if any(index >= 0 for index in indices):
+            result["index"] = torch.tensor(indices, dtype=torch.long)
+        return result
+
+    if oracle_cache:
+        dataset = IndexedDataset(dataset)
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=custom_collate)
 
@@ -131,40 +240,35 @@ def main():
     if accelerator.is_main_process:
         print(f"Teacher has {num_layers} layers. Target Top-K: {args.top_k_layers}")
 
-    # 4. Load Student
-    if accelerator.is_main_process:
-        print("Loading Student model...")
-    student = OneLayerStudentModel(args.teacher_model, sid_token_ids)
-    
-    # Load checkpoint
-    checkpoint = torch.load(args.student_ckpt, map_location='cpu')
-    if 'model_state_dict' in checkpoint:
-        student.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        student.load_state_dict(checkpoint)
+    # 4. Load the router state source.
+    student = None
+    if args.router_input_source == "student":
+        if accelerator.is_main_process:
+            print("Loading Student model...")
+        student = OneLayerStudentModel(args.teacher_model, sid_token_ids)
         
-    student.to(torch.bfloat16)
-    student.to(device)
-    
-    if args.train_student:
-        student.train()
-        # Unfreeze student parameters (backbone)
-        # Assuming backbone is the main part we want to fine-tune
-        for param in student.backbone.parameters():
-            param.requires_grad = True
-        # Keep embeddings frozen? Usually yes to align with teacher, but here we can unfreeze if needed.
-        # Let's unfreeze backbone layers. Embeddings might be shared/frozen.
-        # For simplicity, unfreeze everything except maybe embeddings if they were tied.
-        # User request: "transformer and mlp together unfreeze".
-        # So we allow gradients on student.
-    else:
-        student.eval()
-        for param in student.parameters():
-            param.requires_grad = False
+        checkpoint = torch.load(args.student_ckpt, map_location='cpu')
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            student.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            student.load_state_dict(checkpoint)
+
+        student.to(torch.bfloat16)
+        student.to(device)
+
+        if args.train_student:
+            student.train()
+            for param in student.backbone.parameters():
+                param.requires_grad = True
+        else:
+            student.eval()
+            for param in student.parameters():
+                param.requires_grad = False
+    elif accelerator.is_main_process:
+        print(f"Training OPAL router from teacher prefix hidden states at depth {args.prefix_depth}.")
 
     # 5. Initialize Router (Policy Network)
-    # Input size is hidden size of student
-    hidden_size = student.backbone.config.hidden_size
+    hidden_size = student.backbone.config.hidden_size if student is not None else raw_teacher.config.hidden_size
     router = LayerRouter(hidden_size=hidden_size, num_layers=num_layers, top_k=args.top_k_layers)
     router.to(torch.bfloat16) # Match precision
     router.to(device)
@@ -180,7 +284,7 @@ def main():
     optimizer = torch.optim.AdamW(params_to_optimize, lr=args.lr)
 
     # Prepare with Accelerate
-    if args.train_student:
+    if args.router_input_source == "student" and args.train_student:
         router, student, optimizer, dataloader = accelerator.prepare(router, student, optimizer, dataloader)
     else:
         router, optimizer, dataloader = accelerator.prepare(router, optimizer, dataloader)
@@ -201,25 +305,30 @@ def main():
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
             labels = batch["labels"]
+            batch_indices = batch.get("index")
 
             # Filter valid positions
             valid_positions_mask = (labels != -100)
             if not valid_positions_mask.any():
                 continue
 
-            # --- 1. Get Student State ---
-            # If training student, we need gradients
-            if args.train_student:
-                student_outputs = student(input_ids=input_ids, attention_mask=attention_mask)
-            else:
-                with torch.no_grad():
+            # --- 1. Get Router State ---
+            if args.router_input_source == "student":
+                if args.train_student:
                     student_outputs = student(input_ids=input_ids, attention_mask=attention_mask)
-            
-            last_hidden_state = student_outputs["last_hidden_state"]
-            
-            # Use the state of the LAST token in the sequence
-            last_indices = attention_mask.sum(dim=1) - 1
-            state = last_hidden_state[torch.arange(input_ids.size(0), device=device), last_indices]
+                else:
+                    with torch.no_grad():
+                        student_outputs = student(input_ids=input_ids, attention_mask=attention_mask)
+                state = gather_last_token_state(student_outputs["last_hidden_state"], attention_mask)
+            else:
+                prefix_hidden = teacher_prefix_hidden_state(
+                    raw_teacher,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    num_layers=num_layers,
+                    prefix_depth=args.prefix_depth,
+                )
+                state = gather_last_token_state(prefix_hidden, attention_mask)
 
             # --- 2. Router Forward ---
             # mask: [batch, num_layers]
@@ -280,7 +389,13 @@ def main():
                     print(f"DEBUG: Mask sample (first 5 layers): {mask[0, :5].tolist()}")
 
             # --- 6. Loss ---
-            loss = F.kl_div(log_pruned_probs, target_probs, reduction='batchmean') * (args.temperature ** 2)
+            kl_loss = F.kl_div(log_pruned_probs, target_probs, reduction='batchmean') * (args.temperature ** 2)
+            loss = args.kl_distill_weight * kl_loss
+            oracle_mask = oracle_mask_tensor(batch_indices, oracle_cache, num_layers, device)
+            if oracle_mask is not None and args.mask_distill_weight > 0:
+                loss = loss + args.mask_distill_weight * mask_distillation_loss(scores, oracle_mask)
+            if oracle_mask is not None and args.risk_ranking_weight > 0:
+                loss = loss + args.risk_ranking_weight * risk_ranking_loss(scores, oracle_mask)
 
             # Backward
             optimizer.zero_grad()
@@ -299,14 +414,34 @@ def main():
             unwrapped_router = accelerator.unwrap_model(router)
             
             # Save Policy
-            torch.save(unwrapped_router.state_dict(), save_path)
+            router_metadata = {
+                "router_input_source": args.router_input_source,
+                "prefix_depth": int(args.prefix_depth) if args.router_input_source == "teacher_prefix" else 0,
+                "top_k_layers": int(args.top_k_layers),
+                "num_layers": int(num_layers),
+                "teacher_model": args.teacher_model,
+                "train_student": bool(args.train_student),
+                "mask_training_mode": "differentiable_soft_mask",
+                "oracle_cache": args.oracle_cache,
+                "oracle_cache_size": len(oracle_cache),
+                "mask_distill_weight": float(args.mask_distill_weight),
+                "risk_ranking_weight": float(args.risk_ranking_weight),
+                "kl_distill_weight": float(args.kl_distill_weight),
+            }
+            torch.save(
+                {
+                    "model_state_dict": unwrapped_router.state_dict(),
+                    "metadata": router_metadata,
+                },
+                save_path,
+            )
             print(f"Saved policy checkpoint to {save_path}")
             
             # If we trained student, we should save it too!
             if args.train_student:
                 student_save_path = os.path.join(args.output_dir, f"finetuned_student_epoch_{epoch+1}.pt")
                 unwrapped_student = accelerator.unwrap_model(student)
-                torch.save(unwrapped_student.state_dict(), student_save_path)
+                torch.save({"model_state_dict": unwrapped_student.state_dict()}, student_save_path)
                 print(f"Saved fine-tuned student to {student_save_path}")
 
 if __name__ == "__main__":

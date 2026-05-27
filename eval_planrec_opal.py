@@ -43,6 +43,14 @@ from opal_llm.mask_library import (
     summarize_batch_masks,
     tensor_masks_to_lists,
 )
+from opal_llm.mask_utils import (
+    actual_skip_rate,
+    keep_count_from_skip_rate,
+    mask_from_skip_risk,
+    repair_structure_constraints,
+)
+from opal_llm.oracle_masks import load_oracle_cache, oracle_eval_fields
+from opal_llm.quality_metrics import build_target_scoring_batch, quality_rows_from_logits
 from opal_llm.timing import ComponentTimer, GenerationTimer
 
 torch = None
@@ -103,6 +111,16 @@ def dtype_from_precision(precision: str):
     if precision == "fp32":
         return torch.float32
     raise ValueError(f"Unsupported precision: {precision}")
+
+
+def unpack_checkpoint(payload):
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        metadata = dict(payload.get("metadata") or {})
+        for key in ("router_input_source", "prefix_depth", "top_k_layers", "num_layers"):
+            if key in payload and key not in metadata:
+                metadata[key] = payload[key]
+        return payload["model_state_dict"], metadata
+    return payload, {}
 
 
 def detect_num_layers(model) -> int:
@@ -231,25 +249,38 @@ def load_student_router(args, sid_token_ids: Sequence[int], num_layers: int, dev
 
     student = OneLayerStudentModel(args.teacher_model, sid_token_ids)
     student_ckpt = torch.load(args.student_ckpt, map_location="cpu")
-    student.load_state_dict(student_ckpt.get("model_state_dict", student_ckpt))
+    student_state, _ = unpack_checkpoint(student_ckpt)
+    student.load_state_dict(student_state)
     student.to(dtype_from_precision(args.precision)).to(device).eval()
 
     hidden_size = student.backbone.config.hidden_size
     router = LayerRouter(hidden_size=hidden_size, num_layers=num_layers, top_k=args.top_k_layers)
     router_ckpt = torch.load(args.policy_ckpt, map_location="cpu")
-    router.load_state_dict(router_ckpt.get("model_state_dict", router_ckpt))
+    router_state, _ = unpack_checkpoint(router_ckpt)
+    router.load_state_dict(router_state)
     router.to(dtype_from_precision(args.precision)).to(device).eval()
     return student, router
 
 
 def load_policy_router(args, hidden_size: int, num_layers: int, device):
     if not args.policy_ckpt:
-        return None
+        if args.allow_fallback_router:
+            return None, {"router_input_source": "deterministic_prefix_fallback"}
+        raise ValueError("--policy_ckpt is required for --method opal. Use --allow_fallback_router only for debugging.")
     router = LayerRouter(hidden_size=hidden_size, num_layers=num_layers, top_k=args.top_k_layers)
     router_ckpt = torch.load(args.policy_ckpt, map_location="cpu")
-    router.load_state_dict(router_ckpt.get("model_state_dict", router_ckpt))
+    router_state, metadata = unpack_checkpoint(router_ckpt)
+    router_input_source = str(metadata.get("router_input_source", "legacy_unknown"))
+    valid_prefix_sources = {"teacher_prefix", "prefix_hidden", "opal_prefix_hidden"}
+    if router_input_source not in valid_prefix_sources and not args.allow_legacy_policy_ckpt:
+        raise ValueError(
+            "OPAL requires a policy checkpoint trained on teacher prefix hidden states. "
+            f"Checkpoint source is {router_input_source!r}. "
+            "Use --allow_legacy_policy_ckpt only for ablations/debugging."
+        )
+    router.load_state_dict(router_state)
     router.to(dtype_from_precision(args.precision)).to(device).eval()
-    return router
+    return router, metadata
 
 
 def pool_request_state(last_hidden_state, attention_mask):
@@ -321,6 +352,7 @@ def opal_prefix_masks(
     attention_mask,
     num_layers: int,
     component_timer: ComponentTimer,
+    is_warmup: bool = False,
 ):
     prefix_depth = max(0, min(int(args.prefix_depth), num_layers))
     prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(num_layers)]
@@ -346,7 +378,7 @@ def opal_prefix_masks(
         "prefix",
         run_prefix,
         samples=input_ids.size(0),
-        metadata={"prefix_depth": prefix_depth},
+        metadata={"prefix_depth": prefix_depth, "warmup": bool(is_warmup)},
     )
     state = pool_request_state(prefix_hidden, attention_mask)
 
@@ -361,7 +393,10 @@ def opal_prefix_masks(
         "router",
         run_router,
         samples=input_ids.size(0),
-        metadata={"router_source": "policy_ckpt" if router is not None else "deterministic_prefix_fallback"},
+        metadata={
+            "router_source": "policy_ckpt" if router is not None else "deterministic_prefix_fallback",
+            "warmup": bool(is_warmup),
+        },
     )
     mask_tensor = exact_topk_mask_from_scores(
         scores,
@@ -372,6 +407,131 @@ def opal_prefix_masks(
     masks = tensor_masks_to_lists(mask_tensor)
     mask_ids = [mask_id_from_mask(row, prefix="opal") for row in masks]
     return masks, mask_ids, scores.cpu().tolist(), prefix_latency, router_latency
+
+
+def prefix_hidden_state(
+    args,
+    model,
+    input_ids,
+    attention_mask,
+    num_layers: int,
+    component_timer: ComponentTimer,
+    is_warmup: bool = False,
+):
+    prefix_depth = max(0, min(int(args.prefix_depth), num_layers))
+    prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(num_layers)]
+
+    def run_prefix():
+        set_custom_policy(
+            model,
+            mask_payload=prefix_mask,
+            action_payload=[ACTION_EXECUTE if keep else 0 for keep in prefix_mask],
+            compensation_config={"mode": "none", "rank": 0},
+        )
+        try:
+            with torch.no_grad():
+                return model.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                ).last_hidden_state
+        finally:
+            clear_custom_policy(model)
+
+    return component_timer.measure(
+        "prefix",
+        run_prefix,
+        samples=input_ids.size(0),
+        metadata={"prefix_depth": prefix_depth, "warmup": bool(is_warmup), "method": "opal_q"},
+    )[0]
+
+
+def opal_q_masks(
+    args,
+    model,
+    router,
+    oracle_cache: Dict[int, Dict[str, object]],
+    input_ids,
+    attention_mask,
+    batch_indices: Sequence[int],
+    num_layers: int,
+    component_timer: ComponentTimer,
+    is_warmup: bool = False,
+):
+    keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
+    prefix_hidden = prefix_hidden_state(
+        args,
+        model,
+        input_ids,
+        attention_mask,
+        num_layers,
+        component_timer,
+        is_warmup=is_warmup,
+    )
+    state = pool_request_state(prefix_hidden, attention_mask)
+
+    def run_router():
+        with torch.no_grad():
+            if router is not None:
+                _, scores = router(state)
+                return scores.detach().float()
+            return fallback_utility_scores(state, num_layers)
+
+    keep_scores, _ = component_timer.measure(
+        "router",
+        run_router,
+        samples=input_ids.size(0),
+        metadata={
+            "router_source": "policy_ckpt" if router is not None else "deterministic_prefix_fallback",
+            "warmup": bool(is_warmup),
+            "method": "opal_q",
+            "opal_stage": int(args.opal_stage),
+        },
+    )
+    skip_risks = keep_scores.detach().float().cpu().tolist()
+    keep_scores_list = keep_scores.detach().float().cpu().tolist()
+
+    masks = []
+    mask_ids = []
+    row_metadata = []
+    for row_pos, (sample_index, row_risk) in enumerate(zip(batch_indices, skip_risks)):
+        base_mask = mask_from_skip_risk(row_risk, keep_count=keep_count)
+        structure_stats = {
+            "max_consecutive_skips_actual": None,
+            "stage_keep_counts": [],
+            "structure_penalty_value": 0.0,
+        }
+        selected_mask = base_mask
+        if int(args.opal_stage) >= 3 and float(args.structure_penalty) > 0:
+            selected_mask, structure_stats = repair_structure_constraints(
+                base_mask,
+                row_risk,
+                max_consecutive=args.max_consecutive_skips,
+                num_stages=args.num_stages,
+                min_keep_per_stage=args.min_keep_per_stage,
+            )
+
+        oracle_fields = {}
+        if int(args.opal_stage) >= 2:
+            oracle_fields = oracle_eval_fields(oracle_cache.get(int(sample_index)), selected_mask)
+
+        masks.append(selected_mask)
+        mask_ids.append(mask_id_from_mask(selected_mask, prefix=f"opal_q_s{int(args.opal_stage)}"))
+        row_metadata.append(
+            {
+                "method": "opal_q",
+                "opal_stage": int(args.opal_stage),
+                "prefix_depth": int(args.prefix_depth),
+                "skip_rate": actual_skip_rate(selected_mask),
+                "requested_skip_rate": float(args.skip_rate) if float(args.skip_rate) >= 0 else None,
+                "keep_score": keep_scores_list[row_pos],
+                "skip_risk": row_risk,
+                "kept_layer_count": sum(int(v) for v in selected_mask),
+                **structure_stats,
+                **oracle_fields,
+            }
+        )
+    return masks, mask_ids, keep_scores_list, skip_risks, row_metadata
 
 
 def build_actions_for_batch(args, masks: Sequence[Sequence[int]], scores: Optional[Sequence[Sequence[float]]] = None):
@@ -407,12 +567,15 @@ def timed_action_plans(
     masks: Sequence[Sequence[int]],
     scores: Optional[Sequence[Sequence[float]]],
     component_timer: ComponentTimer,
+    metadata: Optional[Dict[str, object]] = None,
 ):
+    timer_metadata = {"compensation": args.compensation, "comp_rank": args.comp_rank}
+    timer_metadata.update(metadata or {})
     return component_timer.measure(
         "compensation",
         lambda: build_actions_for_batch(args, masks, scores),
         samples=len(masks),
-        metadata={"compensation": args.compensation, "comp_rank": args.comp_rank},
+        metadata=timer_metadata,
     )[0]
 
 
@@ -435,12 +598,21 @@ def input_guided_masks(args, input_ids, attention_mask, num_layers: int):
         for feature in features:
             key = input_guided_feature_key(feature, args.input_guided_feature_set)
             mask = calibrated_map.get(key)
-            calibrated_masks.append(mask)
-        if all(mask is not None for mask in calibrated_masks):
-            masks = [[int(v) for v in mask] for mask in calibrated_masks]
-            mask_ids = [mask_id_from_mask(mask, prefix="input_calibrated") for mask in masks]
-            row_features = [summarize_input_guided_feature(feature, args.input_guided_feature_set) for feature in features]
-            return masks, mask_ids, row_features, scores.tolist()
+            calibrated_masks.append(mask if mask is not None and len(mask) == num_layers else None)
+        fallback_tensor = exact_topk_mask_from_scores(scores.to(input_ids.device), top_k=args.top_k_layers)
+        fallback_masks = tensor_masks_to_lists(fallback_tensor)
+        masks = []
+        mask_ids = []
+        for calibrated_mask, fallback_mask in zip(calibrated_masks, fallback_masks):
+            if calibrated_mask is not None:
+                row_mask = [int(v) for v in calibrated_mask]
+                masks.append(row_mask)
+                mask_ids.append(mask_id_from_mask(row_mask, prefix="input_calibrated"))
+            else:
+                masks.append(fallback_mask)
+                mask_ids.append(mask_id_from_mask(fallback_mask, prefix="input_guided_fallback"))
+        row_features = [summarize_input_guided_feature(feature, args.input_guided_feature_set) for feature in features]
+        return masks, mask_ids, row_features, scores.tolist()
 
     mask_tensor = exact_topk_mask_from_scores(scores.to(input_ids.device), top_k=args.top_k_layers)
     masks = tensor_masks_to_lists(mask_tensor)
@@ -650,6 +822,85 @@ def generate_once(
     return group_beam_outputs(decoded, input_ids.size(0), args.top_k_items)
 
 
+def generate_once_untimed(
+    model,
+    tokenizer,
+    args,
+    input_ids,
+    attention_mask,
+    prefix_allowed_tokens_fn,
+):
+    generation_config = GenerationConfig(
+        num_beams=args.top_k_items,
+        length_penalty=args.length_penalty,
+        num_return_sequences=args.top_k_items,
+        pad_token_id=model.config.pad_token_id,
+        eos_token_id=model.config.eos_token_id,
+        max_new_tokens=args.max_new_tokens,
+        top_k=None,
+        top_p=None,
+    )
+    clear_custom_policy(model)
+    logits_processor = LogitsProcessorList(
+        [
+            ConstrainedLogitsProcessor(
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+                num_beams=args.top_k_items,
+                base_model=args.teacher_model,
+                eos_token_id=model.config.eos_token_id,
+            )
+        ]
+    )
+    try:
+        with torch.no_grad():
+            output = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=False,
+                logits_processor=logits_processor,
+            )
+    finally:
+        clear_custom_policy(model)
+    decoded = decode_generation(tokenizer, args.teacher_model, output.sequences, input_ids.size(1))
+    return group_beam_outputs(decoded, input_ids.size(0), args.top_k_items)
+
+
+def compute_quality_for_batch(
+    model,
+    tokenizer,
+    args,
+    input_ids,
+    attention_mask,
+    targets: Sequence[str],
+    masks: Sequence[Sequence[int]],
+    actions: Sequence[Sequence[int]],
+    compensation_config: Dict[str, object],
+):
+    scoring_ids, scoring_attention, labels = build_target_scoring_batch(
+        tokenizer,
+        input_ids,
+        attention_mask,
+        targets,
+        max_len=2560,
+    )
+    with torch.no_grad():
+        clear_custom_policy(model)
+        full_logits = model(input_ids=scoring_ids, attention_mask=scoring_attention, use_cache=False).logits
+        set_custom_policy(
+            model,
+            mask_payload=[list(map(int, mask)) for mask in masks],
+            action_payload=[list(map(int, action)) for action in actions],
+            compensation_config=compensation_config,
+        )
+        try:
+            skip_logits = model(input_ids=scoring_ids, attention_mask=scoring_attention, use_cache=False).logits
+        finally:
+            clear_custom_policy(model)
+    return quality_rows_from_logits(full_logits, skip_logits, labels)
+
+
 def generate_grouped_by_mask(
     model,
     tokenizer,
@@ -716,9 +967,17 @@ def evaluate_oracle_batch(
     timer: GenerationTimer,
 ):
     best = {
-        int(index): {"rank": 1_000_000, "predictions": [], "mask_spec": None, "candidates": []}
+        int(index): {
+            "score": float("inf"),
+            "rank": 1_000_000,
+            "predictions": [],
+            "mask_spec": None,
+            "candidates": [],
+            "quality": {},
+        }
         for index in batch_indices
     }
+    targets = [ground_truths[int(index)] if int(index) < len(ground_truths) else "" for index in batch_indices]
     for mask_spec in filter_masks(mask_specs, budget=args.top_k_layers):
         actions = [ACTION_EXECUTE if int(v) else 0 for v in mask_spec.mask]
         timer_metadata = summarize_batch_masks(
@@ -740,18 +999,43 @@ def evaluate_oracle_batch(
             timer=timer,
             timer_metadata=timer_metadata,
         )
+        quality_rows = []
+        if not args.disable_quality_metrics:
+            quality_rows = compute_quality_for_batch(
+                model,
+                tokenizer,
+                args,
+                input_ids,
+                attention_mask,
+                targets,
+                [mask_spec.mask for _ in batch_indices],
+                [actions for _ in batch_indices],
+                {"mode": "none", "rank": 0},
+            )
         for row_pos, sample_index in enumerate(batch_indices):
             target = ground_truths[int(sample_index)] if int(sample_index) < len(ground_truths) else ""
             rank = rank_of(outputs[row_pos], target)
             candidate = {"mask_id": mask_spec.mask_id, "execution_mask": mask_spec.mask, "rank": rank}
+            if quality_rows:
+                candidate.update(quality_rows[row_pos])
+            if args.oracle_objective == "kl" and quality_rows:
+                candidate_score = float(quality_rows[row_pos]["KL_full_to_skip"])
+            elif args.oracle_objective == "nll" and quality_rows:
+                candidate_score = float(quality_rows[row_pos]["NLL_skip"])
+            else:
+                candidate_score = float(rank)
+            candidate["oracle_loss"] = candidate_score
+            candidate["full_loss"] = candidate.get("NLL_full")
             if args.save_oracle_candidates:
                 best[int(sample_index)]["candidates"].append(candidate)
-            if rank < best[int(sample_index)]["rank"]:
+            if candidate_score < float(best[int(sample_index)]["score"]):
                 best[int(sample_index)].update(
                     {
+                        "score": candidate_score,
                         "rank": rank,
                         "predictions": outputs[row_pos],
                         "mask_spec": mask_spec,
+                        "quality": quality_rows[row_pos] if quality_rows else {},
                     }
                 )
     return best
@@ -802,7 +1086,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Unified OPAL-LLM evaluation for MiniOneRec/Qwen.")
     parser.add_argument(
         "--method",
-        choices=["full", "static", "opal", "dynamic", "input_guided", "layerwise_router", "oracle"],
+        choices=["full", "static", "opal", "opal_q", "dynamic", "input_guided", "layerwise_router", "oracle"],
         required=True,
     )
     parser.add_argument("--teacher_model", required=True)
@@ -811,6 +1095,16 @@ def build_parser():
     parser.add_argument("--category", default="Office_Products")
     parser.add_argument("--student_ckpt", default="")
     parser.add_argument("--policy_ckpt", default="")
+    parser.add_argument(
+        "--allow_fallback_router",
+        action="store_true",
+        help="Allow OPAL to use deterministic prefix fallback scores when --policy_ckpt is absent. Debug only.",
+    )
+    parser.add_argument(
+        "--allow_legacy_policy_ckpt",
+        action="store_true",
+        help="Allow OPAL to load router checkpoints without prefix-hidden metadata. Debug/ablation only.",
+    )
     parser.add_argument("--mask_library", default="")
     parser.add_argument("--save_mask_library", default="")
     parser.add_argument("--mask_id", default="")
@@ -823,6 +1117,16 @@ def build_parser():
     parser.add_argument("--dynamic_selection", choices=["topk_mask", "template_library"], default="topk_mask", help=argparse.SUPPRESS)
     parser.add_argument("--budget_mode", choices=["exact_topk"], default="exact_topk")
     parser.add_argument("--prefix_depth", type=int, default=4)
+    parser.add_argument("--opal_stage", type=int, choices=[1, 2, 3], default=1)
+    parser.add_argument("--skip_rate", type=float, default=-1.0)
+    parser.add_argument("--oracle_cache", default="")
+    parser.add_argument("--oracle_objective", choices=["nll", "kl", "rank"], default="nll")
+    parser.add_argument("--max_consecutive_skips", type=int, default=0)
+    parser.add_argument("--num_stages", type=int, default=1)
+    parser.add_argument("--min_keep_per_stage", type=int, default=0)
+    parser.add_argument("--structure_penalty", type=float, default=1.0)
+    parser.add_argument("--disable_quality_metrics", action="store_true")
+    parser.add_argument("--compute_full_downstream_reference", action="store_true")
     parser.add_argument("--tail_keep", type=int, default=0)
     parser.add_argument(
         "--compensation",
@@ -834,6 +1138,11 @@ def build_parser():
     parser.add_argument("--static_compensation_gate", type=float, default=0.5)
     parser.add_argument("--compensation_margin_delta", type=float, default=0.0)
     parser.add_argument("--compensation_margin_tau", type=float, default=1.0)
+    parser.add_argument(
+        "--allow_heuristic_compensation",
+        action="store_true",
+        help="Allow the current non-trainable ghost residual compensation implementation. Debug/ablation only.",
+    )
     parser.add_argument("--layerwise_threshold", type=float, default=0.0)
     parser.add_argument("--layerwise_match_budget", action="store_true")
     parser.add_argument(
@@ -892,6 +1201,11 @@ def main():
         raise ValueError(
             f"--max_compensated_skipped_layers must be one of {sorted(ALLOWED_COMPENSATED_LAYERS)}"
         )
+    if args.compensation != "none" and not args.allow_heuristic_compensation:
+        raise ValueError(
+            "Current compensation modes use a non-trainable heuristic residual, not the learnable OPAL ghost residual. "
+            "Use --allow_heuristic_compensation only for ablations/debugging."
+        )
     import_runtime_dependencies()
 
     set_seed(args.seed)
@@ -933,6 +1247,8 @@ def main():
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     num_layers = detect_num_layers(model)
+    if args.method == "opal_q":
+        args.top_k_layers = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
     effective_top_k_layers = num_layers if args.method == "full" else args.top_k_layers
 
     from utils_distill import get_sid_token_ids_from_info
@@ -945,12 +1261,25 @@ def main():
         static_mask_spec = static_mask_from_args(args, num_layers, mask_specs)
 
     student = router = opal_router = None
+    opal_router_metadata: Dict[str, object] = {}
     if args.method == "dynamic":
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
     elif args.method == "layerwise_router" and args.student_ckpt and args.policy_ckpt:
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
+    oracle_cache = load_oracle_cache(args.oracle_cache) if args.oracle_cache else {}
     if args.method == "opal":
-        opal_router = load_policy_router(args, model.config.hidden_size, num_layers, device)
+        opal_router, opal_router_metadata = load_policy_router(args, model.config.hidden_size, num_layers, device)
+    elif args.method == "opal_q":
+        if args.opal_stage >= 2 and not args.oracle_cache:
+            raise ValueError("--oracle_cache is required for --method opal_q --opal_stage >= 2")
+        if args.opal_stage >= 2 and not oracle_cache:
+            raise ValueError(f"--oracle_cache has no usable oracle rows: {args.oracle_cache}")
+        if args.policy_ckpt:
+            opal_router, opal_router_metadata = load_policy_router(args, model.config.hidden_size, num_layers, device)
+        elif not args.allow_fallback_router:
+            raise ValueError("--policy_ckpt is required for --method opal_q unless --allow_fallback_router is set")
+        else:
+            opal_router_metadata = {"router_input_source": "deterministic_prefix_fallback"}
 
     timer = GenerationTimer(warmup_batches=args.warmup_batches, timed_batches=args.timed_batches)
     component_timer = ComponentTimer()
@@ -983,6 +1312,13 @@ def main():
         attention_mask = batch["attention_mask"].to(device)
         batch_indices = [int(x) for x in batch["index"].detach().cpu().tolist()]
         batch_size = input_ids.size(0)
+        batch_is_warmup = timer.next_is_warmup()
+        batch_targets = [
+            ground_truths[int(index)] if int(index) < len(ground_truths) else ""
+            for index in batch_indices
+        ]
+        quality_rows = None
+        full_reference_outputs = None
 
         if args.method == "full":
             masks = [[1] * num_layers for _ in range(batch_size)]
@@ -1006,7 +1342,7 @@ def main():
         elif args.method == "static":
             masks = [static_mask_spec.mask for _ in range(batch_size)]
             mask_ids = [static_mask_spec.mask_id for _ in range(batch_size)]
-            action_plans = timed_action_plans(args, masks, None, component_timer)
+            action_plans = timed_action_plans(args, masks, None, component_timer, metadata={"warmup": batch_is_warmup})
             actions = [plan["action_mask"] for plan in action_plans]
             comp_config = compensation_config_from_args(args, action_plans)
             batch_metadata = summarize_batch_masks(masks, grouping_strategy="none", num_groups=1)
@@ -1028,9 +1364,9 @@ def main():
                 "router",
                 lambda: dynamic_masks(args, student, router, input_ids, attention_mask, num_layers),
                 samples=batch_size,
-                metadata={"router_source": "one_layer_student_policy"},
+                metadata={"router_source": "one_layer_student_policy", "warmup": batch_is_warmup},
             )
-            action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+            action_plans = timed_action_plans(args, masks, router_scores, component_timer, metadata={"warmup": batch_is_warmup})
             actions = [plan["action_mask"] for plan in action_plans]
             comp_config = compensation_config_from_args(args, action_plans)
             if args.group_by_mask:
@@ -1055,9 +1391,9 @@ def main():
         else:
             if args.method == "opal":
                 masks, mask_ids, router_scores, _, _ = opal_prefix_masks(
-                    args, model, opal_router, input_ids, attention_mask, num_layers, component_timer
+                    args, model, opal_router, input_ids, attention_mask, num_layers, component_timer, is_warmup=batch_is_warmup
                 )
-                action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+                action_plans = timed_action_plans(args, masks, router_scores, component_timer, metadata={"warmup": batch_is_warmup})
                 actions = [plan["action_mask"] for plan in action_plans]
                 comp_config = compensation_config_from_args(args, action_plans)
                 if args.group_by_mask:
@@ -1106,7 +1442,97 @@ def main():
                             "compensation_gates": action_plans[local_pos]["compensation_gates"],
                             "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
                         }
+                )
+                continue
+
+            if args.method == "opal_q":
+                masks, mask_ids, keep_scores, skip_risks, opal_q_rows = opal_q_masks(
+                    args,
+                    model,
+                    opal_router,
+                    oracle_cache,
+                    input_ids,
+                    attention_mask,
+                    batch_indices,
+                    num_layers,
+                    component_timer,
+                    is_warmup=batch_is_warmup,
+                )
+                action_plans = timed_action_plans(args, masks, skip_risks, component_timer, metadata={"warmup": batch_is_warmup})
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
                     )
+                else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="layerwise_subset", num_groups=1)
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
+                        timer_metadata=batch_metadata,
+                    )
+                if not args.disable_quality_metrics:
+                    quality_rows = compute_quality_for_batch(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        batch_targets,
+                        masks,
+                        actions,
+                        comp_config,
+                    )
+                if args.compute_full_downstream_reference or args.method == "opal_q":
+                    full_reference_outputs = generate_once_untimed(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                    )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    record = {
+                        "index": int(sample_index),
+                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                        "sample_predictions": outputs[local_pos],
+                        "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
+                        "layer_mask": masks[local_pos],
+                        "execution_mask": masks[local_pos],
+                        "action_mask": actions[local_pos],
+                        "mask_id": mask_ids[local_pos],
+                        "action_id": action_plans[local_pos]["action_id"],
+                        "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                        "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                        "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                    }
+                    record.update(opal_q_rows[local_pos])
+                    if quality_rows:
+                        record.update(quality_rows[local_pos])
+                        if record.get("mask_regret") is None and record.get("oracle_loss") is not None:
+                            record["mask_regret"] = record["NLL_skip"] - float(record["oracle_loss"])
+                    if record.get("mask_regret") is not None:
+                        record["oracle_regret"] = record["mask_regret"]
+                    predictions.append(record)
                 continue
 
             if args.method == "input_guided":
@@ -1114,10 +1540,10 @@ def main():
                     "router",
                     lambda: input_guided_masks(args, input_ids, attention_mask, num_layers),
                     samples=batch_size,
-                    metadata={"router_source": "prompt_features"},
+                    metadata={"router_source": "prompt_features", "warmup": batch_is_warmup},
                 )
                 masks, mask_ids, input_guided_features, router_scores = mask_result
-                action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+                action_plans = timed_action_plans(args, masks, router_scores, component_timer, metadata={"warmup": batch_is_warmup})
                 actions = [plan["action_mask"] for plan in action_plans]
                 comp_config = compensation_config_from_args(args, action_plans)
                 if args.group_by_mask:
@@ -1168,10 +1594,11 @@ def main():
                     metadata={
                         "router_source": "one_layer_student_local_threshold"
                         if student is not None and router is not None
-                        else "prompt_feature_local_threshold_fallback"
+                        else "prompt_feature_local_threshold_fallback",
+                        "warmup": batch_is_warmup,
                     },
                 )
-                action_plans = timed_action_plans(args, masks, router_scores, component_timer)
+                action_plans = timed_action_plans(args, masks, router_scores, component_timer, metadata={"warmup": batch_is_warmup})
                 actions = [plan["action_mask"] for plan in action_plans]
                 comp_config = compensation_config_from_args(args, action_plans)
                 if args.group_by_mask:
@@ -1235,22 +1662,28 @@ def main():
                 row = oracle_rows[int(sample_index)]
                 mask_spec = row["mask_spec"]
                 selected_mask = mask_spec.mask if mask_spec else []
-                predictions.append(
-                    {
-                        "index": int(sample_index),
-                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
-                        "sample_predictions": row["predictions"],
-                        "layer_mask": selected_mask,
-                        "execution_mask": selected_mask,
-                        "action_mask": [ACTION_EXECUTE if int(v) else 0 for v in selected_mask],
-                        "mask_id": mask_spec.mask_id if mask_spec else "none",
-                        "oracle_rank": row["rank"],
-                        "oracle_candidates": row["candidates"] if args.save_oracle_candidates else [],
-                        "input_guided_features": summarize_input_guided_feature(
-                            feature, args.input_guided_feature_set
-                        ),
-                    }
-                )
+                quality = dict(row.get("quality") or {})
+                record = {
+                    "index": int(sample_index),
+                    "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                    "sample_predictions": row["predictions"],
+                    "layer_mask": selected_mask,
+                    "execution_mask": selected_mask,
+                    "oracle_mask": selected_mask,
+                    "action_mask": [ACTION_EXECUTE if int(v) else 0 for v in selected_mask],
+                    "mask_id": mask_spec.mask_id if mask_spec else "none",
+                    "oracle_rank": row["rank"],
+                    "oracle_loss": row["score"],
+                    "full_loss": quality.get("NLL_full"),
+                    "mask_regret": 0.0,
+                    "oracle_regret": 0.0,
+                    "oracle_candidates": row["candidates"] if args.save_oracle_candidates else [],
+                    "input_guided_features": summarize_input_guided_feature(
+                        feature, args.input_guided_feature_set
+                    ),
+                }
+                record.update(quality)
+                predictions.append(record)
             continue
 
         for local_pos, sample_index in enumerate(batch_indices):
@@ -1302,13 +1735,32 @@ def main():
             "checkpoint": args.teacher_model,
             "student_ckpt": args.student_ckpt,
             "policy_ckpt": args.policy_ckpt,
+            "policy_ckpt_metadata": opal_router_metadata if args.method in {"opal", "opal_q"} else {},
+            "allow_fallback_router": args.allow_fallback_router,
+            "allow_legacy_policy_ckpt": args.allow_legacy_policy_ckpt,
             "mask_library": args.mask_library or args.save_mask_library or args.template_library or args.save_template_library,
             "mask_id": args.mask_id or args.template_id,
             "static_strategy": args.static_strategy,
             "budget_mode": args.budget_mode,
+            "skip_rate": actual_skip_rate([1] * effective_top_k_layers + [0] * max(0, num_layers - effective_top_k_layers))
+            if args.method != "full"
+            else 0.0,
+            "requested_skip_rate": args.skip_rate if args.skip_rate >= 0 else None,
+            "opal_stage": args.opal_stage if args.method == "opal_q" else None,
             "prefix_depth": args.prefix_depth,
+            "oracle_cache": args.oracle_cache,
+            "oracle_objective": args.oracle_objective,
+            "oracle_cache_size": len(oracle_cache),
+            "max_consecutive_skips": args.max_consecutive_skips,
+            "num_stages": args.num_stages,
+            "min_keep_per_stage": args.min_keep_per_stage,
+            "structure_penalty": args.structure_penalty,
+            "quality_metrics_enabled": not args.disable_quality_metrics,
+            "full_downstream_reference": args.compute_full_downstream_reference or args.method == "opal_q",
             "tail_keep": args.tail_keep,
             "compensation": args.compensation,
+            "compensation_impl": "heuristic_non_trainable" if args.compensation != "none" else "none",
+            "allow_heuristic_compensation": args.allow_heuristic_compensation,
             "max_compensated_skipped_layers": args.max_compensated_skipped_layers,
             "comp_rank": args.comp_rank,
             "layerwise_threshold": args.layerwise_threshold,
@@ -1367,6 +1819,8 @@ def main():
 
         component_groups: Dict[str, List[float]] = defaultdict(list)
         for record in component_timing_records:
+            if bool((record.get("metadata") or {}).get("warmup", False)):
+                continue
             component_groups[str(record.get("name", ""))].append(float(record.get("duration_sec", 0.0)))
         for component_name, values in component_groups.items():
             if not component_name:
@@ -1377,9 +1831,21 @@ def main():
         latency_summary.setdefault("prefix_latency_sec", 0.0)
         latency_summary.setdefault("compensation_latency_sec", 0.0)
         latency_summary.setdefault("grouping_overhead_sec", 0.0)
+        timed_component_records = [
+            record
+            for record in component_timing_records
+            if not bool((record.get("metadata") or {}).get("warmup", False))
+        ]
+        component_overhead_total = sum(float(record.get("duration_sec", 0.0)) for record in timed_component_records)
+        timed_generate_records = [row for row in timing_records if not row.get("warmup")]
+        latency_summary["component_overhead_total_sec"] = component_overhead_total
+        latency_summary["component_overhead_records"] = len(timed_component_records)
+        if timed_generate_records:
+            latency_summary["physical_generate_latency_mean_sec"] = latency_summary.get("physical_generate_latency_sec", 0.0)
+            latency_summary["component_overhead_mean_sec"] = component_overhead_total / max(1, len(timed_generate_records))
         runtime_comp = [
             float((row.get("metadata") or {}).get("compensation_runtime_total_sec", 0.0))
-            for row in timing_records
+            for row in timed_generate_records
         ]
         latency_summary["compensation_runtime_total_sec"] = sum(runtime_comp)
         if latency_summary.get("latency_mean_sec", 0.0) > 0:

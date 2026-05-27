@@ -258,15 +258,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         )
         if actions is not None:
             return actions.long()
-        mask_values = self._layer_values_from_payload(
-            getattr(self.self_attn.config, "custom_layer_mask", None),
-            layer_idx,
-            hidden_states,
-            hidden_states.dtype,
-        )
-        if mask_values is None:
-            return None
-        return torch.where(mask_values > 0.5, torch.ones_like(mask_values, dtype=torch.long), torch.zeros_like(mask_values, dtype=torch.long))
+        return None
 
     def _compensation_gates(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
         config = getattr(self.self_attn.config, "custom_compensation_config", {}) or {}

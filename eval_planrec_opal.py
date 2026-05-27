@@ -1803,6 +1803,7 @@ def main():
         all_predictions = sorted(all_predictions, key=lambda row: int(row.get("index", 0)))
 
         metadata = {
+            "run_name": run_name,
             "dataset": args.category,
             "method": args.method,
             "top_k_layers": effective_top_k_layers,

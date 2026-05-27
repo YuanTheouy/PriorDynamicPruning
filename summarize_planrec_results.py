@@ -30,18 +30,29 @@ def main():
     raw_dir = root / "raw_json"
     table_dir = root / "tables"
     table_dir.mkdir(parents=True, exist_ok=True)
+    table_path = table_dir / args.table_name
+    md_path = table_dir / "quality_retention.md"
+    md_header = "| dataset | run_name | method | mask_id | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n"
+    md_separator = "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
 
     rows = []
     payloads = []
+    final_json_count = 0
     for path in sorted(raw_dir.glob("*.json")):
         if "_rank" in path.stem:
             continue
+        final_json_count += 1
         payload = load_result(path)
         if payload is None:
             continue
-        run_name = str(payload.get("metadata", {}).get("run_name") or "")
+        metadata = dict(payload.get("metadata") or {})
+        run_name = str(metadata.get("run_name") or path.stem)
         if args.run_name_contains and args.run_name_contains not in run_name:
             continue
+        if metadata.get("run_name") != run_name:
+            payload = dict(payload)
+            metadata["run_name"] = run_name
+            payload["metadata"] = metadata
         payloads.append((path, payload))
 
     for path, payload in payloads:
@@ -55,20 +66,34 @@ def main():
         rows.append(summary_row(payload, str(path)))
 
     if not rows:
-        print(f"No final result JSON files found in {raw_dir}")
+        with table_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["message", "raw_dir", "run_name_contains", "final_json_count"])
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "message": "no matching final result JSON files",
+                    "raw_dir": str(raw_dir),
+                    "run_name_contains": args.run_name_contains,
+                    "final_json_count": final_json_count,
+                }
+            )
+        with md_path.open("w", encoding="utf-8") as f:
+            f.write(md_header)
+            f.write(md_separator)
+        filter_msg = f" matching run_name_contains={args.run_name_contains!r}" if args.run_name_contains else ""
+        print(f"No final result JSON files{filter_msg} found in {raw_dir}; scanned {final_json_count} final JSON files.")
+        print(f"Wrote empty markdown table to {md_path}")
         return
 
-    table_path = table_dir / args.table_name
     fields = list(rows[0].keys())
     with table_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
 
-    md_path = table_dir / "quality_retention.md"
     with md_path.open("w", encoding="utf-8") as f:
-        f.write("| dataset | run_name | method | mask_id | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n")
-        f.write("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        f.write(md_header)
+        f.write(md_separator)
         for row in rows:
             f.write(
                 "| {dataset} | {run_name} | {method} | {mask_id} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(

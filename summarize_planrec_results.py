@@ -51,13 +51,14 @@ def main():
 
     md_path = table_dir / "quality_retention.md"
     with md_path.open("w", encoding="utf-8") as f:
-        f.write("| dataset | method | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n")
-        f.write("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        f.write("| dataset | method | mask_id | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n")
+        f.write("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for row in rows:
             f.write(
-                "| {dataset} | {method} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(
+                "| {dataset} | {method} | {mask_id} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(
                     dataset=row.get("dataset"),
                     method=row.get("method"),
+                    mask_id=row.get("mask_id") or "",
                     stage=row.get("opal_stage") or "",
                     skip_rate=float(row.get("skip_rate") or 0.0),
                     ndcg10=float(row.get("NDCG@10") or 0.0),

@@ -232,12 +232,20 @@ def summary_row(payload: Dict[str, object], raw_output_path: str) -> Dict[str, o
     latency = payload.get("latency", {})
     mask_stats = payload.get("mask_stats", {})
     serving_stats = payload.get("serving_stats", {})
+    predictions = payload.get("predictions", [])
+    mask_ids = [str(row.get("mask_id") or row.get("template_id") or "") for row in predictions]
+    mask_id = ""
+    if mask_ids:
+        unique_mask_ids = sorted(set(mask_id for mask_id in mask_ids if mask_id))
+        mask_id = unique_mask_ids[0] if len(unique_mask_ids) == 1 else f"mixed:{len(unique_mask_ids)}"
     return {
         "dataset": metadata.get("dataset"),
         "method": metadata.get("method"),
         "opal_stage": metadata.get("opal_stage"),
         "skip_rate": metadata.get("skip_rate"),
         "budget": metadata.get("top_k_layers"),
+        "static_strategy": metadata.get("static_strategy"),
+        "mask_id": mask_id,
         "checkpoint": metadata.get("checkpoint"),
         "seed": metadata.get("seed"),
         "git_commit": metadata.get("git_commit"),

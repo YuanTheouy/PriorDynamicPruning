@@ -901,6 +901,44 @@ def compute_quality_for_batch(
     return quality_rows_from_logits(full_logits, skip_logits, labels)
 
 
+def add_quality_and_reference_for_batch(
+    model,
+    tokenizer,
+    args,
+    input_ids,
+    attention_mask,
+    batch_targets: Sequence[str],
+    masks: Sequence[Sequence[int]],
+    actions: Sequence[Sequence[int]],
+    compensation_config: Dict[str, object],
+    prefix_allowed_tokens_fn,
+):
+    quality_rows = None
+    if not args.disable_quality_metrics:
+        quality_rows = compute_quality_for_batch(
+            model,
+            tokenizer,
+            args,
+            input_ids,
+            attention_mask,
+            batch_targets,
+            masks,
+            actions,
+            compensation_config,
+        )
+    full_reference_outputs = []
+    if args.compute_full_downstream_reference or args.method != "full":
+        full_reference_outputs = generate_once_untimed(
+            model,
+            tokenizer,
+            args,
+            input_ids,
+            attention_mask,
+            prefix_allowed_tokens_fn,
+        )
+    return quality_rows, full_reference_outputs
+
+
 def generate_grouped_by_mask(
     model,
     tokenizer,
@@ -1489,27 +1527,18 @@ def main():
                         timer,
                         timer_metadata=batch_metadata,
                     )
-                if not args.disable_quality_metrics:
-                    quality_rows = compute_quality_for_batch(
-                        model,
-                        tokenizer,
-                        args,
-                        input_ids,
-                        attention_mask,
-                        batch_targets,
-                        masks,
-                        actions,
-                        comp_config,
-                    )
-                if args.compute_full_downstream_reference or args.method == "opal_q":
-                    full_reference_outputs = generate_once_untimed(
-                        model,
-                        tokenizer,
-                        args,
-                        input_ids,
-                        attention_mask,
-                        prefix_allowed_tokens_fn,
-                    )
+                quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                    model,
+                    tokenizer,
+                    args,
+                    input_ids,
+                    attention_mask,
+                    batch_targets,
+                    masks,
+                    actions,
+                    comp_config,
+                    prefix_allowed_tokens_fn,
+                )
                 for local_pos, sample_index in enumerate(batch_indices):
                     record = {
                         "index": int(sample_index),
@@ -1565,25 +1594,39 @@ def main():
                         timer,
                         timer_metadata=batch_metadata,
                     )
+                quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                    model,
+                    tokenizer,
+                    args,
+                    input_ids,
+                    attention_mask,
+                    batch_targets,
+                    masks,
+                    actions,
+                    comp_config,
+                    prefix_allowed_tokens_fn,
+                )
                 for local_pos, sample_index in enumerate(batch_indices):
-                    predictions.append(
-                        {
-                            "index": int(sample_index),
-                            "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
-                            "sample_predictions": outputs[local_pos],
-                            "layer_mask": masks[local_pos],
-                            "execution_mask": masks[local_pos],
-                            "action_mask": actions[local_pos],
-                            "mask_id": mask_ids[local_pos],
-                            "action_id": action_plans[local_pos]["action_id"],
-                            "layer_scores": router_scores[local_pos],
-                            "kept_layer_count": sum(masks[local_pos]),
-                            "input_guided_features": input_guided_row_features[local_pos],
-                            "compensation_mask": action_plans[local_pos]["compensation_mask"],
-                            "compensation_gates": action_plans[local_pos]["compensation_gates"],
-                            "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
-                        }
-                    )
+                    record = {
+                        "index": int(sample_index),
+                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                        "sample_predictions": outputs[local_pos],
+                        "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
+                        "layer_mask": masks[local_pos],
+                        "execution_mask": masks[local_pos],
+                        "action_mask": actions[local_pos],
+                        "mask_id": mask_ids[local_pos],
+                        "action_id": action_plans[local_pos]["action_id"],
+                        "layer_scores": router_scores[local_pos],
+                        "kept_layer_count": sum(masks[local_pos]),
+                        "input_guided_features": input_guided_row_features[local_pos],
+                        "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                        "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                        "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                    }
+                    if quality_rows:
+                        record.update(quality_rows[local_pos])
+                    predictions.append(record)
                 continue
 
             if args.method == "layerwise_router":
@@ -1620,25 +1663,39 @@ def main():
                         timer,
                         timer_metadata=batch_metadata,
                     )
+                quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                    model,
+                    tokenizer,
+                    args,
+                    input_ids,
+                    attention_mask,
+                    batch_targets,
+                    masks,
+                    actions,
+                    comp_config,
+                    prefix_allowed_tokens_fn,
+                )
                 for local_pos, sample_index in enumerate(batch_indices):
-                    predictions.append(
-                        {
-                            "index": int(sample_index),
-                            "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
-                            "sample_predictions": outputs[local_pos],
-                            "layer_mask": masks[local_pos],
-                            "execution_mask": masks[local_pos],
-                            "action_mask": actions[local_pos],
-                            "mask_id": mask_ids[local_pos],
-                            "action_id": action_plans[local_pos]["action_id"],
-                            "router_scores": router_scores[local_pos],
-                            "layer_scores": router_scores[local_pos],
-                            "kept_layer_count": sum(masks[local_pos]),
-                            "compensation_mask": action_plans[local_pos]["compensation_mask"],
-                            "compensation_gates": action_plans[local_pos]["compensation_gates"],
-                            "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
-                        }
-                    )
+                    record = {
+                        "index": int(sample_index),
+                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                        "sample_predictions": outputs[local_pos],
+                        "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
+                        "layer_mask": masks[local_pos],
+                        "execution_mask": masks[local_pos],
+                        "action_mask": actions[local_pos],
+                        "mask_id": mask_ids[local_pos],
+                        "action_id": action_plans[local_pos]["action_id"],
+                        "router_scores": router_scores[local_pos],
+                        "layer_scores": router_scores[local_pos],
+                        "kept_layer_count": sum(masks[local_pos]),
+                        "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                        "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                        "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                    }
+                    if quality_rows:
+                        record.update(quality_rows[local_pos])
+                    predictions.append(record)
                 continue
 
             oracle_rows = evaluate_oracle_batch(
@@ -1686,11 +1743,26 @@ def main():
                 predictions.append(record)
             continue
 
+        if args.method != "full":
+            quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                model,
+                tokenizer,
+                args,
+                input_ids,
+                attention_mask,
+                batch_targets,
+                masks,
+                actions,
+                comp_config,
+                prefix_allowed_tokens_fn,
+            )
+
         for local_pos, sample_index in enumerate(batch_indices):
             record = {
                 "index": int(sample_index),
                 "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
                 "sample_predictions": outputs[local_pos],
+                "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
                 "layer_mask": masks[local_pos],
                 "execution_mask": masks[local_pos],
                 "action_mask": actions[local_pos],
@@ -1704,6 +1776,8 @@ def main():
             if args.method == "dynamic":
                 record["router_scores"] = router_scores[local_pos]
                 record["layer_scores"] = router_scores[local_pos]
+            if quality_rows:
+                record.update(quality_rows[local_pos])
             predictions.append(record)
 
     rank_path = dirs["raw_json"] / f"{run_name}_rank{accelerator.process_index}.json"

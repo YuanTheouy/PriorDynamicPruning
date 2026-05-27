@@ -56,6 +56,7 @@ def oracle_eval_fields(oracle_entry: Optional[Dict[str, object]], predicted_mask
     oracle_loss = oracle_entry.get("oracle_loss", oracle_entry.get("NLL_skip"))
     full_loss = oracle_entry.get("full_loss", oracle_entry.get("NLL_full"))
     candidate = candidate_for_mask(oracle_entry, predicted_mask)
+    distance = hamming_distance(oracle_mask, predicted_mask)
     predicted_loss = None
     if candidate is not None:
         predicted_loss = candidate.get("oracle_loss", candidate.get("NLL_skip", candidate.get("loss")))
@@ -63,10 +64,11 @@ def oracle_eval_fields(oracle_entry: Optional[Dict[str, object]], predicted_mask
         mask_regret = float(predicted_loss) - float(oracle_loss)
     elif candidate is not None and candidate.get("rank") is not None and oracle_entry.get("oracle_rank") is not None:
         mask_regret = float(candidate["rank"]) - float(oracle_entry["oracle_rank"])
+    elif distance == 0 and oracle_mask:
+        mask_regret = 0.0
     else:
-        mask_regret = oracle_entry.get("mask_regret")
+        mask_regret = None
 
-    distance = hamming_distance(oracle_mask, predicted_mask)
     return {
         "oracle_mask": oracle_mask,
         "oracle_loss": oracle_loss,
@@ -76,4 +78,3 @@ def oracle_eval_fields(oracle_entry: Optional[Dict[str, object]], predicted_mask
         "hamming_distance": distance,
         "oracle_candidates": oracle_entry.get("oracle_candidates", []) or [],
     }
-

@@ -3,7 +3,7 @@ set -euo pipefail
 
 export REPO_DIR="${REPO_DIR:-/workspace/PriorDynamicPruning}"
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 export NUM_GPUS="${NUM_GPUS:-4}"
 export BASE_PORT="${BASE_PORT:-50000}"
 export NEXT_PORT="$BASE_PORT"
@@ -48,8 +48,60 @@ export SUMMARY_TABLE="${SUMMARY_TABLE:-summary_final_opal_attn_delta_m2000.csv}"
 export RUN_GROUP="${RUN_GROUP:-final_opal_attn_delta_m2000}"
 export SEEDS="${SEEDS:-42 13 3407}"
 
+# By default this script ignores stale tmux/shell experiment variables.  Set
+# OPAL_RESPECT_ENV=1 only when intentionally overriding the full configuration.
+if [ "${OPAL_RESPECT_ENV:-0}" != "1" ]; then
+  export REPO_DIR=/workspace/PriorDynamicPruning
+  export CUDA_DEVICE_ORDER=PCI_BUS_ID
+  export CUDA_VISIBLE_DEVICES=4,5,6,7
+  export NUM_GPUS=4
+  export BASE_PORT=50000
+  export MODEL_PATH=/workspace/ckpts/MiniOneRec/Office_ckpt
+  export CATEGORY=Office_Products
+  export TRAIN_FILE=/workspace/PriorDynamicPruning/data/Amazon/train/Office_Products_5_2016-10-2018-11.csv
+  export TEST_FILE=/workspace/PriorDynamicPruning/data/Amazon/test/Office_Products_5_2016-10-2018-11.csv
+  export INFO_FILE=/workspace/PriorDynamicPruning/data/Amazon/info/Office_Products_5_2016-10-2018-11.txt
+  export OUTPUT_DIR=/workspace/PriorDynamicPruning/results/planrec_experiments
+  export RISK_DIR=/workspace/PriorDynamicPruning/results/opal_risk_labels
+  export CKPT_ROOT=/workspace/PriorDynamicPruning/policy_ckpts/final_opal_attn
+  export PRECISION=bf16
+  export PREFIX_DEPTH=4
+  export SKIP_RATE=0.25
+  export TOP_K_LAYERS=21
+  export TOP_K_ITEMS=50
+  export MAX_NEW_TOKENS=256
+  export LABEL_MAX_SAMPLES=2000
+  export LABEL_BATCH_SIZE=1
+  export TRAIN_BATCH_SIZE=8
+  export EVAL_BATCH_SIZE=1
+  export EPOCHS=20
+  export LR=1e-4
+  export RANKING_LOSS_WEIGHT=0.1
+  export SKIP_SET_LOSS_WEIGHT=0.1
+  export HUBER_BETA=1.0
+  export ROUTER_DIM=256
+  export ROUTER_HEADS=4
+  export RECENT_TOKENS=32
+  export RECENT_DECAY=0.85
+  export WARMUP_BATCHES=0
+  export TIMED_BATCHES=0
+  export EVAL_MAX_BATCHES=500
+  export SUMMARY_TABLE=summary_final_opal_attn_delta_m2000.csv
+  export RUN_GROUP=final_opal_attn_delta_m2000
+  export SEEDS="42 13 3407"
+fi
+export NEXT_PORT="$BASE_PORT"
+
 cd "$REPO_DIR"
 mkdir -p "$RISK_DIR" "$CKPT_ROOT" "$OUTPUT_DIR"
+
+echo "=== Experiment config ==="
+echo "REPO_DIR=${REPO_DIR}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "NUM_GPUS=${NUM_GPUS}"
+echo "TRAIN_FILE=${TRAIN_FILE}"
+echo "TEST_FILE=${TEST_FILE}"
+echo "SEEDS=${SEEDS}"
 
 run_accelerate() {
   local port="$NEXT_PORT"

@@ -1,6 +1,21 @@
 from typing import Dict, List, Optional, Sequence
 
 
+FORMAL_ORACLE_METHODS = {"single_drop", "greedy"}
+FORMAL_ORACLE_REQUIRED_FIELDS = {
+    "sample_id",
+    "skip_rate",
+    "num_layers",
+    "oracle_method",
+    "oracle_mask",
+    "oracle_loss",
+    "full_loss",
+    "best_static_loss",
+    "candidate_count",
+    "oracle_regret_reference",
+}
+
+
 def _mask_key(mask: Sequence[int]) -> str:
     return "".join(str(int(v)) for v in mask)
 
@@ -19,16 +34,44 @@ def load_oracle_cache(path: str) -> Dict[int, Dict[str, object]]:
     rows = payload.get("oracle", payload.get("predictions", []))
     cache = {}
     for row in rows:
-        if "index" not in row:
+        sample_index = row.get("index", row.get("sample_id"))
+        if sample_index is None:
             continue
         oracle_mask = row.get("oracle_mask") or row.get("execution_mask") or row.get("layer_mask") or []
         if not oracle_mask:
             continue
         normalized = dict(row)
+        normalized["index"] = int(sample_index)
+        normalized["sample_id"] = int(sample_index)
         normalized["oracle_mask"] = [int(v) for v in oracle_mask]
         normalized["oracle_mask_key"] = _mask_key(normalized["oracle_mask"])
-        cache[int(row["index"])] = normalized
+        cache[int(sample_index)] = normalized
     return cache
+
+
+def validate_formal_oracle_cache(cache: Dict[int, Dict[str, object]], expected_method: str) -> None:
+    if expected_method not in FORMAL_ORACLE_METHODS:
+        raise ValueError(f"Expected a formal oracle method, got {expected_method!r}.")
+    for sample_index, entry in cache.items():
+        method = str(entry.get("oracle_method") or "")
+        objective = entry.get("objective", entry.get("oracle_objective"))
+        missing = [
+            field
+            for field in FORMAL_ORACLE_REQUIRED_FIELDS
+            if field not in entry or entry.get(field) is None
+        ]
+        if objective is None:
+            missing.append("objective")
+        if method != expected_method:
+            raise ValueError(
+                "Oracle cache method mismatch for sample "
+                f"{sample_index}: expected {expected_method!r}, found {method!r}."
+            )
+        if missing:
+            raise ValueError(
+                "Formal OPAL-2 oracle cache row is missing required fields for sample "
+                f"{sample_index}: {sorted(set(missing))}"
+            )
 
 
 def candidate_for_mask(oracle_entry: Dict[str, object], mask: Sequence[int]) -> Optional[Dict[str, object]]:
@@ -55,6 +98,7 @@ def oracle_eval_fields(oracle_entry: Optional[Dict[str, object]], predicted_mask
     oracle_mask = [int(v) for v in oracle_entry.get("oracle_mask", [])]
     oracle_loss = oracle_entry.get("oracle_loss", oracle_entry.get("NLL_skip"))
     full_loss = oracle_entry.get("full_loss", oracle_entry.get("NLL_full"))
+    oracle_objective = oracle_entry.get("oracle_objective", oracle_entry.get("objective"))
     candidate = candidate_for_mask(oracle_entry, predicted_mask)
     distance = hamming_distance(oracle_mask, predicted_mask)
     predicted_loss = None
@@ -73,6 +117,11 @@ def oracle_eval_fields(oracle_entry: Optional[Dict[str, object]], predicted_mask
         "oracle_mask": oracle_mask,
         "oracle_loss": oracle_loss,
         "full_loss": full_loss,
+        "oracle_method": oracle_entry.get("oracle_method"),
+        "oracle_objective": oracle_objective,
+        "best_static_loss": oracle_entry.get("best_static_loss"),
+        "candidate_count": oracle_entry.get("candidate_count"),
+        "oracle_regret_reference": oracle_entry.get("oracle_regret_reference"),
         "mask_regret": mask_regret,
         "prefix_to_oracle_agreement": 1.0 if distance == 0 and oracle_mask else 0.0,
         "hamming_distance": distance,

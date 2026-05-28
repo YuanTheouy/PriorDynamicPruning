@@ -24,7 +24,7 @@ from models.router import LayerRouter, mask_distillation_loss, risk_ranking_loss
 from models.pruned_teacher import PrunedTeacherWrapper
 from utils_distill import get_sid_token_ids_from_info
 from data import SidSFTDataset
-from opal_llm.oracle_masks import load_oracle_cache
+from opal_llm.oracle_masks import load_oracle_cache, validate_formal_oracle_cache
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -176,11 +176,17 @@ def main():
     parser.add_argument(
         "--router_input_source",
         choices=["student", "teacher_prefix"],
-        default="student",
+        default="teacher_prefix",
         help="State used by the policy router. Use teacher_prefix for OPAL prefix-hidden training.",
     )
     parser.add_argument("--prefix_depth", type=int, default=4, help="Teacher prefix depth for --router_input_source teacher_prefix")
     parser.add_argument("--oracle_cache", default="", help="Oracle mask cache for OPAL-2 mask/risk distillation.")
+    parser.add_argument(
+        "--oracle_method",
+        choices=["", "template", "single_drop", "greedy"],
+        default="",
+        help="Expected oracle cache construction method; template is sanity/debug only.",
+    )
     parser.add_argument("--mask_distill_weight", type=float, default=0.0)
     parser.add_argument("--risk_ranking_weight", type=float, default=0.0)
     parser.add_argument("--kl_distill_weight", type=float, default=1.0)
@@ -202,6 +208,13 @@ def main():
         raise ValueError("--student_ckpt is required when --router_input_source student")
     if args.router_input_source != "student" and args.train_student:
         raise ValueError("--train_student is only valid with --router_input_source student")
+    if args.oracle_cache and args.oracle_method not in {"single_drop", "greedy"}:
+        raise ValueError(
+            "Formal OPAL-2 requires --oracle_method single_drop or greedy. "
+            "Template/blank oracle caches are debug-only and must not train main OPAL-2 checkpoints."
+        )
+    if args.oracle_cache and args.mask_distill_weight <= 0 and args.risk_ranking_weight <= 0:
+        raise ValueError("OPAL-2 oracle distillation needs --mask_distill_weight or --risk_ranking_weight > 0.")
 
     # Initialize Accelerator
     # Fix unused parameters error in DDP
@@ -230,6 +243,8 @@ def main():
     oracle_cache = load_oracle_cache(args.oracle_cache) if args.oracle_cache else {}
     if args.oracle_cache and not oracle_cache:
         raise ValueError(f"--oracle_cache has no usable oracle rows: {args.oracle_cache}")
+    if args.oracle_cache:
+        validate_formal_oracle_cache(oracle_cache, args.oracle_method)
     
     # 2. Dataset & DataLoader
     dataset = SidSFTDataset(
@@ -528,6 +543,7 @@ def main():
                 "mask_training_mode": "differentiable_soft_mask",
                 "oracle_cache": args.oracle_cache,
                 "oracle_cache_size": len(oracle_cache),
+                "oracle_method": args.oracle_method,
                 "mask_distill_weight": float(args.mask_distill_weight),
                 "risk_ranking_weight": float(args.risk_ranking_weight),
                 "kl_distill_weight": float(args.kl_distill_weight),

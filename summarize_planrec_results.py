@@ -24,6 +24,11 @@ def main():
         default="",
         help="Only include final JSON files whose metadata.run_name contains this substring.",
     )
+    parser.add_argument(
+        "--exclude_debug_sanity",
+        action="store_true",
+        help="Exclude rows marked or inferred as result_scope=debug_sanity.",
+    )
     args = parser.parse_args()
 
     root = Path(args.output_dir)
@@ -32,8 +37,8 @@ def main():
     table_dir.mkdir(parents=True, exist_ok=True)
     table_path = table_dir / args.table_name
     md_path = table_dir / "quality_retention.md"
-    md_header = "| dataset | run_name | method | mask_id | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n"
-    md_separator = "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+    md_header = "| dataset | run_name | scope | method | oracle_method | prompt_only | mask_id | stage | skip_rate | NDCG@10 | retention_NDCG@10 | Delta_NLL | Delta_PPL | KL_full_to_skip | oracle_regret | agreement | hamming | avg_layers | unique_masks |\n"
+    md_separator = "|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
 
     rows = []
     payloads = []
@@ -63,7 +68,10 @@ def main():
             metrics = dict(payload.get("metrics") or {})
             metrics.update(summarize_quality_metrics(quality_rows))
             payload["metrics"] = metrics
-        rows.append(summary_row(payload, str(path)))
+        row = summary_row(payload, str(path))
+        if args.exclude_debug_sanity and row.get("result_scope") == "debug_sanity":
+            continue
+        rows.append(row)
 
     if not rows:
         with table_path.open("w", newline="", encoding="utf-8") as f:
@@ -96,10 +104,15 @@ def main():
         f.write(md_separator)
         for row in rows:
             f.write(
-                "| {dataset} | {run_name} | {method} | {mask_id} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(
+                "| {dataset} | {run_name} | {scope} | {method} | {oracle_method} | {prompt_only} | {mask_id} | {stage} | {skip_rate:.4f} | {ndcg10:.4f} | {retention:.4f} | {delta_nll:.6f} | {delta_ppl:.6f} | {kl:.6f} | {regret:.6f} | {agreement:.4f} | {hamming:.4f} | {layers:.2f} | {unique} |\n".format(
                     dataset=row.get("dataset"),
                     run_name=row.get("run_name") or "",
+                    scope=row.get("result_scope") or "",
                     method=row.get("method"),
+                    oracle_method=row.get("oracle_method") or "",
+                    prompt_only=row.get("prompt_only_router_context")
+                    if row.get("prompt_only_router_context") is not None
+                    else "",
                     mask_id=row.get("mask_id") or "",
                     stage=row.get("opal_stage") or "",
                     skip_rate=float(row.get("skip_rate") or 0.0),

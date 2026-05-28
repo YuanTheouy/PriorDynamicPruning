@@ -12,6 +12,7 @@ from .quality_metrics import summarize_quality_metrics
 
 
 DEFAULT_TOPK = (1, 3, 5, 10, 20, 50)
+FORMAL_ORACLE_METHODS = {"single_drop", "greedy"}
 
 
 def result_dirs(output_dir: str) -> Dict[str, Path]:
@@ -226,6 +227,33 @@ def summarize_serving_records(records: Sequence[Dict[str, object]]) -> Dict[str,
     }
 
 
+def infer_result_scope(metadata: Dict[str, object]) -> str:
+    explicit = metadata.get("result_scope")
+    if explicit:
+        return str(explicit)
+
+    method = metadata.get("method")
+    if method == "oracle":
+        oracle_method = str(metadata.get("oracle_method") or "template")
+        return "formal" if oracle_method in FORMAL_ORACLE_METHODS else "debug_sanity"
+
+    if method == "opal_q":
+        stage = int(metadata.get("opal_stage") or 1)
+        policy_metadata = metadata.get("policy_ckpt_metadata") or {}
+        prompt_only = policy_metadata.get("router_context") == "prompt" or metadata.get("prompt_only_router_context") is True
+        if not metadata.get("policy_ckpt"):
+            return "debug_sanity"
+        if not prompt_only:
+            return "debug_sanity"
+        if stage >= 2:
+            oracle_method = str(metadata.get("oracle_method") or policy_metadata.get("oracle_method") or "template")
+            if oracle_method not in FORMAL_ORACLE_METHODS:
+                return "debug_sanity"
+        return "formal"
+
+    return "formal"
+
+
 def summary_row(payload: Dict[str, object], raw_output_path: str) -> Dict[str, object]:
     metadata = payload.get("metadata", {})
     metrics = payload.get("metrics", {})
@@ -242,8 +270,12 @@ def summary_row(payload: Dict[str, object], raw_output_path: str) -> Dict[str, o
         "dataset": metadata.get("dataset"),
         "run_name": metadata.get("run_name"),
         "method": metadata.get("method"),
+        "result_scope": infer_result_scope(metadata),
         "opal_stage": metadata.get("opal_stage"),
         "skip_rate": metadata.get("skip_rate"),
+        "prompt_only_router_context": metadata.get("prompt_only_router_context"),
+        "oracle_method": metadata.get("oracle_method"),
+        "oracle_objective": metadata.get("oracle_objective"),
         "budget": metadata.get("top_k_layers"),
         "static_strategy": metadata.get("static_strategy"),
         "mask_id": mask_id,

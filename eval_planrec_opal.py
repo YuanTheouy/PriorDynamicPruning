@@ -49,7 +49,7 @@ from opal_llm.mask_utils import (
     mask_from_skip_risk,
     repair_structure_constraints,
 )
-from opal_llm.oracle_masks import load_oracle_cache, oracle_eval_fields
+from opal_llm.oracle_masks import load_oracle_cache, oracle_eval_fields, validate_formal_oracle_cache
 from opal_llm.quality_metrics import build_target_scoring_batch, quality_rows_from_logits
 from opal_llm.timing import ComponentTimer, GenerationTimer
 
@@ -73,6 +73,7 @@ CATEGORY_LABELS = {
     "Sports": "sports and outdoors",
     "Books": "books",
 }
+FORMAL_ORACLE_METHODS = {"single_drop", "greedy"}
 
 
 class IndexedDataset:
@@ -243,6 +244,25 @@ def rank_of(predictions: Sequence[str], target: str) -> int:
     return 1_000_000
 
 
+def oracle_objective_key(objective: str) -> str:
+    if objective in {"kl", "KL_full_to_skip"}:
+        return "KL_full_to_skip"
+    if objective in {"nll", "delta_nll", "Delta_NLL"}:
+        return "Delta_NLL"
+    return "NLL_skip"
+
+
+def oracle_objective_value(quality: Dict[str, object], objective: str) -> float:
+    key = oracle_objective_key(objective)
+    if quality.get(key) is None:
+        return float("inf")
+    return float(quality[key])
+
+
+def execute_actions(mask: Sequence[int]) -> List[int]:
+    return [ACTION_EXECUTE if int(v) else 0 for v in mask]
+
+
 def load_student_router(args, sid_token_ids: Sequence[int], num_layers: int, device):
     if not args.student_ckpt or not args.policy_ckpt:
         raise ValueError("--student_ckpt and --policy_ckpt are required for dynamic planner evaluation")
@@ -277,6 +297,13 @@ def load_policy_router(args, hidden_size: int, num_layers: int, device):
             "OPAL requires a policy checkpoint trained on teacher prefix hidden states. "
             f"Checkpoint source is {router_input_source!r}. "
             "Use --allow_legacy_policy_ckpt only for ablations/debugging."
+        )
+    router_context = metadata.get("router_context")
+    if router_context != "prompt" and not args.allow_legacy_policy_ckpt:
+        raise ValueError(
+            "Strict OPAL-Q evaluation requires a prompt-only H^k router checkpoint. "
+            f"Checkpoint router_context is {router_context!r}. "
+            "Retrain with --router_context prompt, or use --allow_legacy_policy_ckpt only for debug/sanity."
         )
     router.load_state_dict(router_state)
     router.to(dtype_from_precision(args.precision)).to(device).eval()
@@ -992,6 +1019,259 @@ def generate_grouped_by_mask(
     return grouped_outputs
 
 
+def static_quality_reference(
+    model,
+    tokenizer,
+    args,
+    input_ids,
+    attention_mask,
+    targets: Sequence[str],
+    mask_specs: Sequence[LayerMaskSpec],
+):
+    best_losses = {row_pos: float("inf") for row_pos in range(input_ids.size(0))}
+    best_masks = {row_pos: [] for row_pos in range(input_ids.size(0))}
+    static_candidates = filter_masks(mask_specs, budget=args.top_k_layers)
+    for mask_spec in static_candidates:
+        quality_rows = compute_quality_for_batch(
+            model,
+            tokenizer,
+            args,
+            input_ids,
+            attention_mask,
+            targets,
+            [mask_spec.mask for _ in range(input_ids.size(0))],
+            [execute_actions(mask_spec.mask) for _ in range(input_ids.size(0))],
+            {"mode": "none", "rank": 0},
+        )
+        for row_pos, quality in enumerate(quality_rows):
+            loss = oracle_objective_value(quality, args.oracle_objective)
+            if loss < best_losses[row_pos]:
+                best_losses[row_pos] = loss
+                best_masks[row_pos] = list(mask_spec.mask)
+    return {
+        row_pos: {
+            "best_static_loss": best_losses[row_pos],
+            "best_static_mask": best_masks[row_pos],
+        }
+        for row_pos in range(input_ids.size(0))
+    }
+
+
+def score_row_masks(
+    model,
+    tokenizer,
+    args,
+    input_ids,
+    attention_mask,
+    targets: Sequence[str],
+    masks: Sequence[Sequence[int]],
+):
+    return compute_quality_for_batch(
+        model,
+        tokenizer,
+        args,
+        input_ids,
+        attention_mask,
+        targets,
+        masks,
+        [execute_actions(mask) for mask in masks],
+        {"mode": "none", "rank": 0},
+    )
+
+
+def evaluate_single_drop_oracle_batch(
+    model,
+    tokenizer,
+    args,
+    input_ids,
+    attention_mask,
+    prefix_allowed_tokens_fn,
+    mask_specs: Sequence[LayerMaskSpec],
+    batch_indices: Sequence[int],
+    ground_truths: Sequence[str],
+    timer: GenerationTimer,
+    num_layers: int,
+):
+    keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
+    skip_count = max(0, num_layers - keep_count)
+    targets = [ground_truths[int(index)] if int(index) < len(ground_truths) else "" for index in batch_indices]
+    all_keep = [1] * num_layers
+    per_row_candidates = {row_pos: [] for row_pos in range(len(batch_indices))}
+
+    for layer_idx in range(num_layers):
+        candidate_mask = list(all_keep)
+        candidate_mask[layer_idx] = 0
+        masks = [candidate_mask for _ in batch_indices]
+        quality_rows = score_row_masks(model, tokenizer, args, input_ids, attention_mask, targets, masks)
+        for row_pos, quality in enumerate(quality_rows):
+            candidate = {
+                "mask_id": f"single_drop_l{layer_idx}",
+                "execution_mask": candidate_mask,
+                "dropped_layers": [layer_idx],
+                "oracle_method": "single_drop",
+            }
+            candidate.update(quality)
+            candidate["oracle_loss"] = oracle_objective_value(quality, args.oracle_objective)
+            candidate["full_loss"] = quality.get("NLL_full")
+            per_row_candidates[row_pos].append(candidate)
+
+    selected_masks = []
+    for row_pos in range(len(batch_indices)):
+        ranked = sorted(per_row_candidates[row_pos], key=lambda row: float(row["oracle_loss"]))
+        drop_layers = {int(candidate["dropped_layers"][0]) for candidate in ranked[:skip_count]}
+        selected_masks.append([0 if idx in drop_layers else 1 for idx in range(num_layers)])
+
+    final_quality = score_row_masks(model, tokenizer, args, input_ids, attention_mask, targets, selected_masks)
+    static_refs = static_quality_reference(model, tokenizer, args, input_ids, attention_mask, targets, mask_specs)
+    outputs = generate_grouped_by_mask(
+        model=model,
+        tokenizer=tokenizer,
+        args=args,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+        masks=selected_masks,
+        actions=[execute_actions(mask) for mask in selected_masks],
+        compensation_config={"mode": "none", "rank": 0},
+        timer=timer,
+        batch_metadata={"oracle_method": "single_drop", "oracle_objective": oracle_objective_key(args.oracle_objective)},
+    )
+
+    best = {}
+    for row_pos, sample_index in enumerate(batch_indices):
+        target = targets[row_pos]
+        quality = dict(final_quality[row_pos])
+        oracle_loss = oracle_objective_value(quality, args.oracle_objective)
+        mask = selected_masks[row_pos]
+        best[int(sample_index)] = {
+            "score": oracle_loss,
+            "rank": rank_of(outputs[row_pos], target),
+            "predictions": outputs[row_pos],
+            "mask_spec": LayerMaskSpec(
+                mask_id=mask_id_from_mask(mask, prefix="oracle_single_drop"),
+                strategy="single_drop",
+                budget=sum(mask),
+                num_layers=num_layers,
+                mask=mask,
+                metadata={"oracle_method": "single_drop", "objective": oracle_objective_key(args.oracle_objective)},
+            ),
+            "quality": quality,
+            "candidates": per_row_candidates[row_pos] if args.save_oracle_candidates else [],
+            "oracle_method": "single_drop",
+            "candidate_count": num_layers,
+            **static_refs[row_pos],
+        }
+    return best
+
+
+def evaluate_greedy_oracle_batch(
+    model,
+    tokenizer,
+    args,
+    input_ids,
+    attention_mask,
+    prefix_allowed_tokens_fn,
+    mask_specs: Sequence[LayerMaskSpec],
+    batch_indices: Sequence[int],
+    ground_truths: Sequence[str],
+    timer: GenerationTimer,
+    num_layers: int,
+):
+    keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
+    skip_count = max(0, num_layers - keep_count)
+    targets = [ground_truths[int(index)] if int(index) < len(ground_truths) else "" for index in batch_indices]
+    current_masks = [[1] * num_layers for _ in batch_indices]
+    per_row_candidates = {row_pos: [] for row_pos in range(len(batch_indices))}
+    candidate_counts = {row_pos: 0 for row_pos in range(len(batch_indices))}
+
+    for step in range(skip_count):
+        remaining_layers = [
+            [idx for idx, keep in enumerate(mask) if int(keep) == 1]
+            for mask in current_masks
+        ]
+        layer_scores: Dict[int, List[Tuple[float, Dict[str, object], List[int]]]] = {
+            row_pos: [] for row_pos in range(len(batch_indices))
+        }
+        for layer_idx in range(num_layers):
+            masks = []
+            active_rows = []
+            for row_pos, mask in enumerate(current_masks):
+                if layer_idx not in remaining_layers[row_pos]:
+                    masks.append(list(mask))
+                    continue
+                candidate_mask = list(mask)
+                candidate_mask[layer_idx] = 0
+                masks.append(candidate_mask)
+                active_rows.append(row_pos)
+            if not active_rows:
+                continue
+            quality_rows = score_row_masks(model, tokenizer, args, input_ids, attention_mask, targets, masks)
+            for row_pos in active_rows:
+                candidate_mask = masks[row_pos]
+                quality = dict(quality_rows[row_pos])
+                loss = oracle_objective_value(quality, args.oracle_objective)
+                candidate = {
+                    "mask_id": mask_id_from_mask(candidate_mask, prefix=f"greedy_s{step + 1}"),
+                    "execution_mask": candidate_mask,
+                    "dropped_layers": [idx for idx, keep in enumerate(candidate_mask) if int(keep) == 0],
+                    "greedy_step": step + 1,
+                    "oracle_method": "greedy",
+                }
+                candidate.update(quality)
+                candidate["oracle_loss"] = loss
+                candidate["full_loss"] = quality.get("NLL_full")
+                per_row_candidates[row_pos].append(candidate)
+                candidate_counts[row_pos] += 1
+                layer_scores[row_pos].append((loss, candidate, candidate_mask))
+        for row_pos in range(len(batch_indices)):
+            if not layer_scores[row_pos]:
+                continue
+            _, _, best_mask = min(layer_scores[row_pos], key=lambda item: item[0])
+            current_masks[row_pos] = list(best_mask)
+
+    final_quality = score_row_masks(model, tokenizer, args, input_ids, attention_mask, targets, current_masks)
+    static_refs = static_quality_reference(model, tokenizer, args, input_ids, attention_mask, targets, mask_specs)
+    outputs = generate_grouped_by_mask(
+        model=model,
+        tokenizer=tokenizer,
+        args=args,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+        masks=current_masks,
+        actions=[execute_actions(mask) for mask in current_masks],
+        compensation_config={"mode": "none", "rank": 0},
+        timer=timer,
+        batch_metadata={"oracle_method": "greedy", "oracle_objective": oracle_objective_key(args.oracle_objective)},
+    )
+
+    best = {}
+    for row_pos, sample_index in enumerate(batch_indices):
+        target = targets[row_pos]
+        quality = dict(final_quality[row_pos])
+        oracle_loss = oracle_objective_value(quality, args.oracle_objective)
+        mask = current_masks[row_pos]
+        best[int(sample_index)] = {
+            "score": oracle_loss,
+            "rank": rank_of(outputs[row_pos], target),
+            "predictions": outputs[row_pos],
+            "mask_spec": LayerMaskSpec(
+                mask_id=mask_id_from_mask(mask, prefix="oracle_greedy"),
+                strategy="greedy",
+                budget=sum(mask),
+                num_layers=num_layers,
+                mask=mask,
+                metadata={"oracle_method": "greedy", "objective": oracle_objective_key(args.oracle_objective)},
+            ),
+            "quality": quality,
+            "candidates": per_row_candidates[row_pos] if args.save_oracle_candidates else [],
+            "oracle_method": "greedy",
+            "candidate_count": candidate_counts[row_pos],
+            **static_refs[row_pos],
+        }
+    return best
+
+
 def evaluate_oracle_batch(
     model,
     tokenizer,
@@ -1003,7 +1283,37 @@ def evaluate_oracle_batch(
     batch_indices: Sequence[int],
     ground_truths: Sequence[str],
     timer: GenerationTimer,
+    num_layers: int,
 ):
+    if args.oracle_method == "single_drop":
+        return evaluate_single_drop_oracle_batch(
+            model,
+            tokenizer,
+            args,
+            input_ids,
+            attention_mask,
+            prefix_allowed_tokens_fn,
+            mask_specs,
+            batch_indices,
+            ground_truths,
+            timer,
+            num_layers,
+        )
+    if args.oracle_method == "greedy":
+        return evaluate_greedy_oracle_batch(
+            model,
+            tokenizer,
+            args,
+            input_ids,
+            attention_mask,
+            prefix_allowed_tokens_fn,
+            mask_specs,
+            batch_indices,
+            ground_truths,
+            timer,
+            num_layers,
+        )
+
     best = {
         int(index): {
             "score": float("inf"),
@@ -1053,13 +1363,16 @@ def evaluate_oracle_batch(
         for row_pos, sample_index in enumerate(batch_indices):
             target = ground_truths[int(sample_index)] if int(sample_index) < len(ground_truths) else ""
             rank = rank_of(outputs[row_pos], target)
-            candidate = {"mask_id": mask_spec.mask_id, "execution_mask": mask_spec.mask, "rank": rank}
+            candidate = {
+                "mask_id": mask_spec.mask_id,
+                "execution_mask": mask_spec.mask,
+                "rank": rank,
+                "oracle_method": "template",
+            }
             if quality_rows:
                 candidate.update(quality_rows[row_pos])
-            if args.oracle_objective == "kl" and quality_rows:
-                candidate_score = float(quality_rows[row_pos]["KL_full_to_skip"])
-            elif args.oracle_objective == "nll" and quality_rows:
-                candidate_score = float(quality_rows[row_pos]["NLL_skip"])
+            if quality_rows and args.oracle_objective != "rank":
+                candidate_score = oracle_objective_value(quality_rows[row_pos], args.oracle_objective)
             else:
                 candidate_score = float(rank)
             candidate["oracle_loss"] = candidate_score
@@ -1074,6 +1387,8 @@ def evaluate_oracle_batch(
                         "predictions": outputs[row_pos],
                         "mask_spec": mask_spec,
                         "quality": quality_rows[row_pos] if quality_rows else {},
+                        "oracle_method": "template",
+                        "candidate_count": len(filter_masks(mask_specs, budget=args.top_k_layers)),
                     }
                 )
     return best
@@ -1158,7 +1473,13 @@ def build_parser():
     parser.add_argument("--opal_stage", type=int, choices=[1, 2, 3], default=1)
     parser.add_argument("--skip_rate", type=float, default=-1.0)
     parser.add_argument("--oracle_cache", default="")
-    parser.add_argument("--oracle_objective", choices=["nll", "kl", "rank"], default="nll")
+    parser.add_argument(
+        "--oracle_method",
+        choices=["template", "single_drop", "greedy"],
+        default="template",
+        help="template is a candidate-oracle sanity check; single_drop/greedy build formal per-input same-skip-rate oracle masks.",
+    )
+    parser.add_argument("--oracle_objective", choices=["nll", "delta_nll", "kl", "rank"], default="delta_nll")
     parser.add_argument("--max_consecutive_skips", type=int, default=0)
     parser.add_argument("--num_stages", type=int, default=1)
     parser.add_argument("--min_keep_per_stage", type=int, default=0)
@@ -1233,6 +1554,10 @@ def main():
         args.random_masks_per_budget = args.random_templates_per_budget
     if args.group_by_template:
         args.group_by_mask = True
+    if args.oracle_method in {"single_drop", "greedy"} and args.oracle_objective == "rank":
+        raise ValueError("--oracle_objective rank is only valid for --oracle_method template sanity checks.")
+    if args.method == "oracle" and args.oracle_method in {"single_drop", "greedy"} and args.disable_quality_metrics:
+        raise ValueError("Formal OPAL-2 oracle construction requires quality metrics.")
     if args.comp_rank not in ALLOWED_COMPENSATION_RANKS:
         raise ValueError(f"--comp_rank must be one of {sorted(ALLOWED_COMPENSATION_RANKS)}")
     if args.max_compensated_skipped_layers not in ALLOWED_COMPENSATED_LAYERS:
@@ -1312,8 +1637,22 @@ def main():
             raise ValueError("--oracle_cache is required for --method opal_q --opal_stage >= 2")
         if args.opal_stage >= 2 and not oracle_cache:
             raise ValueError(f"--oracle_cache has no usable oracle rows: {args.oracle_cache}")
+        if args.opal_stage >= 2 and args.oracle_method not in FORMAL_ORACLE_METHODS and not args.allow_legacy_policy_ckpt:
+            raise ValueError(
+                "Strict OPAL-2 evaluation requires --oracle_method single_drop or greedy. "
+                "Use --allow_legacy_policy_ckpt only for template/candidate-oracle sanity checks."
+            )
+        if args.opal_stage >= 2 and args.oracle_method in FORMAL_ORACLE_METHODS:
+            validate_formal_oracle_cache(oracle_cache, args.oracle_method)
         if args.policy_ckpt:
             opal_router, opal_router_metadata = load_policy_router(args, model.config.hidden_size, num_layers, device)
+            if args.opal_stage >= 2 and not args.allow_legacy_policy_ckpt:
+                ckpt_oracle_method = str(opal_router_metadata.get("oracle_method") or "")
+                if ckpt_oracle_method not in FORMAL_ORACLE_METHODS:
+                    raise ValueError(
+                        "Strict OPAL-2 evaluation requires a router checkpoint trained with formal oracle distillation. "
+                        f"Checkpoint oracle_method is {ckpt_oracle_method!r}."
+                    )
         elif not args.allow_fallback_router:
             raise ValueError("--policy_ckpt is required for --method opal_q unless --allow_fallback_router is set")
         else:
@@ -1558,7 +1897,8 @@ def main():
                     if quality_rows:
                         record.update(quality_rows[local_pos])
                         if record.get("mask_regret") is None and record.get("oracle_loss") is not None:
-                            record["mask_regret"] = record["NLL_skip"] - float(record["oracle_loss"])
+                            objective = str(record.get("oracle_objective") or args.oracle_objective)
+                            record["mask_regret"] = oracle_objective_value(record, objective) - float(record["oracle_loss"])
                     if record.get("mask_regret") is not None:
                         record["oracle_regret"] = record["mask_regret"]
                     predictions.append(record)
@@ -1709,6 +2049,7 @@ def main():
                 batch_indices,
                 ground_truths,
                 timer,
+                num_layers,
             )
             for local_pos, sample_index in enumerate(batch_indices):
                 feature = input_guided_features(
@@ -1722,6 +2063,7 @@ def main():
                 quality = dict(row.get("quality") or {})
                 record = {
                     "index": int(sample_index),
+                    "sample_id": int(sample_index),
                     "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
                     "sample_predictions": row["predictions"],
                     "layer_mask": selected_mask,
@@ -1732,6 +2074,15 @@ def main():
                     "oracle_rank": row["rank"],
                     "oracle_loss": row["score"],
                     "full_loss": quality.get("NLL_full"),
+                    "skip_rate": actual_skip_rate(selected_mask),
+                    "num_layers": num_layers,
+                    "oracle_method": row.get("oracle_method", args.oracle_method),
+                    "objective": oracle_objective_key(args.oracle_objective),
+                    "oracle_objective": oracle_objective_key(args.oracle_objective),
+                    "best_static_loss": row.get("best_static_loss"),
+                    "best_static_mask": row.get("best_static_mask", []),
+                    "candidate_count": row.get("candidate_count", 0),
+                    "oracle_regret_reference": "best_seen",
                     "mask_regret": 0.0,
                     "oracle_regret": 0.0,
                     "oracle_candidates": row["candidates"] if args.save_oracle_candidates else [],
@@ -1824,8 +2175,33 @@ def main():
             "opal_stage": args.opal_stage if args.method == "opal_q" else None,
             "prefix_depth": args.prefix_depth,
             "oracle_cache": args.oracle_cache,
-            "oracle_objective": args.oracle_objective,
+            "oracle_method": args.oracle_method,
+            "oracle_objective": oracle_objective_key(args.oracle_objective),
             "oracle_cache_size": len(oracle_cache),
+            "prompt_only_router_context": (
+                bool((opal_router_metadata or {}).get("router_context") == "prompt")
+                if args.method == "opal_q" and args.policy_ckpt
+                else args.method == "oracle"
+            ),
+            "result_scope": (
+                "debug_sanity"
+                if (
+                    (args.method == "oracle" and args.oracle_method == "template")
+                    or (
+                        args.method == "opal_q"
+                        and (
+                            not args.policy_ckpt
+                            or (args.policy_ckpt and (opal_router_metadata or {}).get("router_context") != "prompt")
+                            or (args.opal_stage >= 2 and args.oracle_method not in FORMAL_ORACLE_METHODS)
+                            or (
+                                args.opal_stage >= 2
+                                and str((opal_router_metadata or {}).get("oracle_method") or "") not in FORMAL_ORACLE_METHODS
+                            )
+                        )
+                    )
+                )
+                else "formal"
+            ),
             "max_consecutive_skips": args.max_consecutive_skips,
             "num_stages": args.num_stages,
             "min_keep_per_stage": args.min_keep_per_stage,

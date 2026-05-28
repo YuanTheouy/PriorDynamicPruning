@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -118,6 +119,8 @@ def main():
     parser.add_argument("--category", default="Office_Products")
     parser.add_argument("--prefix_depth", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=0)
+    parser.add_argument("--sample_strategy", choices=["first", "random"], default="first")
+    parser.add_argument("--sample_seed", type=int, default=None)
     parser.add_argument("--objective", choices=["KL", "Delta_NLL"], default="KL")
     parser.add_argument("--output", required=True)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -149,8 +152,14 @@ def main():
             seed=args.seed,
         )
     )
-    if args.max_samples > 0:
-        dataset = Subset(dataset, list(range(min(args.max_samples, len(dataset)))))
+    selected_indices = list(range(len(dataset)))
+    if args.max_samples > 0 and args.max_samples < len(selected_indices):
+        if args.sample_strategy == "random":
+            rng = random.Random(args.seed if args.sample_seed is None else args.sample_seed)
+            selected_indices = sorted(rng.sample(selected_indices, int(args.max_samples)))
+        else:
+            selected_indices = selected_indices[: int(args.max_samples)]
+        dataset = Subset(dataset, selected_indices)
 
     dataloader = DataLoader(
         dataset,
@@ -238,6 +247,9 @@ def main():
                     "dataset_prompt": "EvalSidDataset",
                     "prefix_depth": args.prefix_depth,
                     "objective": args.objective,
+                    "sample_strategy": args.sample_strategy,
+                    "sample_seed": args.seed if args.sample_seed is None else args.sample_seed,
+                    "selected_indices": selected_indices,
                     "num_layers": num_layers,
                     "num_samples": len(shard_rows),
                 },

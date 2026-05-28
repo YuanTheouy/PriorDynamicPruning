@@ -64,6 +64,7 @@ ConstrainedLogitsProcessor = None
 EvalSidDataset = None
 OneLayerStudentModel = None
 LayerRouter = None
+OpalRiskRouter = None
 
 
 CATEGORY_LABELS = {
@@ -310,6 +311,25 @@ def load_policy_router(args, hidden_size: int, num_layers: int, device):
     return router, metadata
 
 
+def load_risk_router(args, hidden_size: int, num_layers: int, device):
+    if not args.risk_router_ckpt:
+        raise ValueError("--risk_router_ckpt is required for OPAL risk evaluation")
+    checkpoint = torch.load(args.risk_router_ckpt, map_location="cpu")
+    state = checkpoint.get("model_state_dict", checkpoint)
+    metadata = dict(checkpoint.get("metadata") or {})
+    router = OpalRiskRouter(hidden_size=hidden_size, num_layers=num_layers)
+    router.load_state_dict(state)
+    router.to(device).eval()
+    router_input = str(metadata.get("router_input") or "")
+    if args.method == "opal_risk" and router_input != "prefix_hk":
+        raise ValueError(f"--method opal_risk requires a prefix_hk risk router, got {router_input!r}")
+    if args.method == "raw_input_risk" and router_input != "raw_embedding":
+        raise ValueError(f"--method raw_input_risk requires a raw_embedding risk router, got {router_input!r}")
+    if args.method == "opal_risk" and metadata.get("prompt_only_router_context") is not True:
+        raise ValueError("OPAL risk router checkpoint must use prompt-only H^k.")
+    return router, metadata
+
+
 def pool_request_state(last_hidden_state, attention_mask):
     # MiniOneRec uses left padding for generation; the last active prompt token is
     # therefore the final column for every non-empty row.
@@ -469,8 +489,84 @@ def prefix_hidden_state(
         "prefix",
         run_prefix,
         samples=input_ids.size(0),
-        metadata={"prefix_depth": prefix_depth, "warmup": bool(is_warmup), "method": "opal_q"},
+        metadata={"prefix_depth": prefix_depth, "warmup": bool(is_warmup), "method": args.method},
     )[0]
+
+
+def raw_embedding_request_state(model, input_ids, attention_mask):
+    with torch.no_grad():
+        embeds = model.model.embed_tokens(input_ids)
+        weights = attention_mask.to(dtype=embeds.dtype).unsqueeze(-1)
+        return ((embeds * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)).float()
+
+
+def risk_router_masks(
+    args,
+    model,
+    risk_router,
+    risk_router_metadata: Dict[str, object],
+    input_ids,
+    attention_mask,
+    num_layers: int,
+    component_timer: ComponentTimer,
+    is_warmup: bool = False,
+):
+    router_input = str(
+        risk_router_metadata.get("router_input")
+        or ("raw_embedding" if args.method == "raw_input_risk" else "prefix_hk")
+    )
+    if router_input == "prefix_hk":
+        prefix_hidden = prefix_hidden_state(
+            args,
+            model,
+            input_ids,
+            attention_mask,
+            num_layers,
+            component_timer,
+            is_warmup=is_warmup,
+        )
+        state = pool_request_state(prefix_hidden, attention_mask).float()
+    elif router_input == "raw_embedding":
+        state, _ = component_timer.measure(
+            "router_input",
+            lambda: raw_embedding_request_state(model, input_ids, attention_mask),
+            samples=input_ids.size(0),
+            metadata={"router_input": "raw_embedding", "warmup": bool(is_warmup)},
+        )
+    else:
+        raise ValueError(f"Unsupported risk router input: {router_input}")
+
+    def run_router():
+        with torch.no_grad():
+            return risk_router(state).detach().float()
+
+    pred_risk, _ = component_timer.measure(
+        "router",
+        run_router,
+        samples=input_ids.size(0),
+        metadata={"router_input": router_input, "warmup": bool(is_warmup), "method": args.method},
+    )
+    keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
+    risk_rows = pred_risk.cpu().tolist()
+    masks = [mask_from_skip_risk(row, keep_count=keep_count) for row in risk_rows]
+    mask_ids = [mask_id_from_mask(mask, prefix=args.method) for mask in masks]
+    row_metadata = []
+    for risk, mask in zip(risk_rows, masks):
+        row_metadata.append(
+            {
+                "method": args.method,
+                "router_input": router_input,
+                "prefix_depth": int(args.prefix_depth) if router_input == "prefix_hk" else 0,
+                "pred_risk": risk,
+                "skip_risk": risk,
+                "layer_scores": risk,
+                "skipped_layers": [idx for idx, keep in enumerate(mask) if int(keep) == 0],
+                "kept_layer_count": sum(int(v) for v in mask),
+                "skip_rate": actual_skip_rate(mask),
+                "risk_objective": risk_router_metadata.get("risk_objective"),
+            }
+        )
+    return masks, mask_ids, risk_rows, row_metadata
 
 
 def opal_q_masks(
@@ -1406,6 +1502,7 @@ def import_runtime_dependencies():
     global EvalSidDataset
     global OneLayerStudentModel
     global LayerRouter
+    global OpalRiskRouter
 
     import torch as torch_module
     from accelerate import Accelerator as AcceleratorCls
@@ -1420,6 +1517,7 @@ def import_runtime_dependencies():
     from LogitProcessor import ConstrainedLogitsProcessor as ConstrainedLogitsProcessorCls
     from data import EvalSidDataset as EvalSidDatasetCls
     from models.one_layer_student import OneLayerStudentModel as OneLayerStudentModelCls
+    from models.opal_risk_router import OpalRiskRouter as OpalRiskRouterCls
     from models.router import LayerRouter as LayerRouterCls
 
     torch = torch_module
@@ -1433,13 +1531,25 @@ def import_runtime_dependencies():
     EvalSidDataset = EvalSidDatasetCls
     OneLayerStudentModel = OneLayerStudentModelCls
     LayerRouter = LayerRouterCls
+    OpalRiskRouter = OpalRiskRouterCls
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Unified OPAL-LLM evaluation for MiniOneRec/Qwen.")
     parser.add_argument(
         "--method",
-        choices=["full", "static", "opal", "opal_q", "dynamic", "input_guided", "layerwise_router", "oracle"],
+        choices=[
+            "full",
+            "static",
+            "opal",
+            "opal_q",
+            "opal_risk",
+            "raw_input_risk",
+            "dynamic",
+            "input_guided",
+            "layerwise_router",
+            "oracle",
+        ],
         required=True,
     )
     parser.add_argument("--teacher_model", required=True)
@@ -1448,6 +1558,7 @@ def build_parser():
     parser.add_argument("--category", default="Office_Products")
     parser.add_argument("--student_ckpt", default="")
     parser.add_argument("--policy_ckpt", default="")
+    parser.add_argument("--risk_router_ckpt", default="")
     parser.add_argument(
         "--allow_fallback_router",
         action="store_true",
@@ -1610,7 +1721,7 @@ def main():
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     num_layers = detect_num_layers(model)
-    if args.method == "opal_q":
+    if args.method in {"opal_q", "opal_risk", "raw_input_risk"}:
         args.top_k_layers = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
     effective_top_k_layers = num_layers if args.method == "full" else args.top_k_layers
 
@@ -1623,12 +1734,15 @@ def main():
     if args.method == "static":
         static_mask_spec = static_mask_from_args(args, num_layers, mask_specs)
 
-    student = router = opal_router = None
+    student = router = opal_router = risk_router = None
     opal_router_metadata: Dict[str, object] = {}
+    risk_router_metadata: Dict[str, object] = {}
     if args.method == "dynamic":
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
     elif args.method == "layerwise_router" and args.student_ckpt and args.policy_ckpt:
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
+    elif args.method in {"opal_risk", "raw_input_risk"}:
+        risk_router, risk_router_metadata = load_risk_router(args, model.config.hidden_size, num_layers, device)
     oracle_cache = load_oracle_cache(args.oracle_cache) if args.oracle_cache else {}
     if args.method == "opal":
         opal_router, opal_router_metadata = load_policy_router(args, model.config.hidden_size, num_layers, device)
@@ -1904,6 +2018,82 @@ def main():
                     predictions.append(record)
                 continue
 
+            if args.method in {"opal_risk", "raw_input_risk"}:
+                masks, mask_ids, pred_risks, risk_rows = risk_router_masks(
+                    args,
+                    model,
+                    risk_router,
+                    risk_router_metadata,
+                    input_ids,
+                    attention_mask,
+                    num_layers,
+                    component_timer,
+                    is_warmup=batch_is_warmup,
+                )
+                action_plans = timed_action_plans(args, masks, pred_risks, component_timer, metadata={"warmup": batch_is_warmup})
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
+                    )
+                else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="layerwise_subset", num_groups=1)
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
+                        timer_metadata=batch_metadata,
+                    )
+                quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                    model,
+                    tokenizer,
+                    args,
+                    input_ids,
+                    attention_mask,
+                    batch_targets,
+                    masks,
+                    actions,
+                    comp_config,
+                    prefix_allowed_tokens_fn,
+                )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    record = {
+                        "index": int(sample_index),
+                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                        "sample_predictions": outputs[local_pos],
+                        "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
+                        "layer_mask": masks[local_pos],
+                        "execution_mask": masks[local_pos],
+                        "action_mask": actions[local_pos],
+                        "mask_id": mask_ids[local_pos],
+                        "action_id": action_plans[local_pos]["action_id"],
+                        "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                        "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                        "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                    }
+                    record.update(risk_rows[local_pos])
+                    if quality_rows:
+                        record.update(quality_rows[local_pos])
+                    predictions.append(record)
+                continue
+
             if args.method == "input_guided":
                 (mask_result, _router_time) = component_timer.measure(
                     "router",
@@ -2161,7 +2351,10 @@ def main():
             "checkpoint": args.teacher_model,
             "student_ckpt": args.student_ckpt,
             "policy_ckpt": args.policy_ckpt,
+            "risk_router_ckpt": args.risk_router_ckpt,
             "policy_ckpt_metadata": opal_router_metadata if args.method in {"opal", "opal_q"} else {},
+            "risk_router_metadata": risk_router_metadata if args.method in {"opal_risk", "raw_input_risk"} else {},
+            "risk_router_input": risk_router_metadata.get("router_input") if args.method in {"opal_risk", "raw_input_risk"} else None,
             "allow_fallback_router": args.allow_fallback_router,
             "allow_legacy_policy_ckpt": args.allow_legacy_policy_ckpt,
             "mask_library": args.mask_library or args.save_mask_library or args.template_library or args.save_template_library,
@@ -2179,6 +2372,9 @@ def main():
             "oracle_objective": oracle_objective_key(args.oracle_objective),
             "oracle_cache_size": len(oracle_cache),
             "prompt_only_router_context": (
+                True
+                if args.method in {"opal_risk", "raw_input_risk"}
+                else
                 bool((opal_router_metadata or {}).get("router_context") == "prompt")
                 if args.method == "opal_q" and args.policy_ckpt
                 else args.method == "oracle"
@@ -2207,7 +2403,8 @@ def main():
             "min_keep_per_stage": args.min_keep_per_stage,
             "structure_penalty": args.structure_penalty,
             "quality_metrics_enabled": not args.disable_quality_metrics,
-            "full_downstream_reference": args.compute_full_downstream_reference or args.method == "opal_q",
+            "full_downstream_reference": args.compute_full_downstream_reference
+            or args.method in {"opal_q", "opal_risk", "raw_input_risk"},
             "tail_keep": args.tail_keep,
             "compensation": args.compensation,
             "compensation_impl": "heuristic_non_trainable" if args.compensation != "none" else "none",

@@ -274,6 +274,7 @@ def summary_row(payload: Dict[str, object], raw_output_path: str) -> Dict[str, o
         "opal_stage": metadata.get("opal_stage"),
         "skip_rate": metadata.get("skip_rate"),
         "prompt_only_router_context": metadata.get("prompt_only_router_context"),
+        "risk_router_input": metadata.get("risk_router_input"),
         "oracle_method": metadata.get("oracle_method"),
         "oracle_objective": metadata.get("oracle_objective"),
         "budget": metadata.get("top_k_layers"),

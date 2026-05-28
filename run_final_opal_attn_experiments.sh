@@ -105,7 +105,21 @@ echo "SEEDS=${SEEDS}"
 
 run_accelerate() {
   local port="$NEXT_PORT"
-  export NEXT_PORT="$((NEXT_PORT + 1))"
+  while ! python3 -c 'import socket, sys
+port = int(sys.argv[1])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(("127.0.0.1", port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+' "$port"; do
+    echo "=== Skip occupied accelerate port ${port} ==="
+    port="$((port + 1))"
+  done
+  export NEXT_PORT="$((port + 1))"
   echo "=== accelerate port ${port}: $* ==="
   accelerate launch \
     --num_processes "$NUM_GPUS" \

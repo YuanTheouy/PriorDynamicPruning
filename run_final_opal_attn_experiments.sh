@@ -105,29 +105,48 @@ echo "SEEDS=${SEEDS}"
 
 run_accelerate() {
   local port="$NEXT_PORT"
-  while ! python3 -c 'import socket, sys
+  while true; do
+    while ! python3 -c 'import socket, sys
 port = int(sys.argv[1])
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
-    sock.bind(("127.0.0.1", port))
+    sock.bind(("0.0.0.0", port))
 except OSError:
     sys.exit(1)
 finally:
     sock.close()
 ' "$port"; do
-    echo "=== Skip occupied accelerate port ${port} ==="
-    port="$((port + 1))"
+      echo "=== Skip occupied accelerate port ${port} ==="
+      port="$((port + 1))"
+    done
+
+    export NEXT_PORT="$((port + 1))"
+    echo "=== accelerate port ${port}: $* ==="
+    local port_log
+    port_log="$(mktemp "/tmp/opal_accelerate_${port}_XXXX.log")"
+    set +e
+    accelerate launch \
+      --num_processes "$NUM_GPUS" \
+      --num_machines 1 \
+      --main_process_port "$port" \
+      --mixed_precision "$PRECISION" \
+      --dynamo_backend no \
+      "$@" 2>&1 | tee "$port_log"
+    local status="${PIPESTATUS[0]}"
+    set -e
+    if [ "$status" -eq 0 ]; then
+      rm -f "$port_log"
+      return 0
+    fi
+    if grep -q "EADDRINUSE" "$port_log"; then
+      echo "=== Port ${port} became occupied during launch; retry with next port ==="
+      rm -f "$port_log"
+      port="$((port + 1))"
+      continue
+    fi
+    rm -f "$port_log"
+    return "$status"
   done
-  export NEXT_PORT="$((port + 1))"
-  echo "=== accelerate port ${port}: $* ==="
-  accelerate launch \
-    --num_processes "$NUM_GPUS" \
-    --num_machines 1 \
-    --main_process_port "$port" \
-    --mixed_precision "$PRECISION" \
-    --dynamo_backend no \
-    "$@"
 }
 
 final_json_exists() {

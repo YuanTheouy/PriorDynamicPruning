@@ -66,6 +66,8 @@ OneLayerStudentModel = None
 LayerRouter = None
 OpalRiskRouter = None
 LayerQueryCrossAttentionRiskRouter = None
+PromptCandidateMaskRouter = None
+LayerwiseHiddenRiskRouter = None
 
 
 CATEGORY_LABELS = {
@@ -338,6 +340,62 @@ def load_risk_router(args, hidden_size: int, num_layers: int, device):
         raise ValueError(f"--method raw_input_risk requires a raw_embedding risk router, got {router_input!r}")
     if args.method == "opal_risk" and metadata.get("prompt_only_router_context") is not True:
         raise ValueError("OPAL risk router checkpoint must use prompt-only H^k.")
+    return router, metadata
+
+
+def load_candidate_router(args, hidden_size: int, device):
+    if not args.candidate_router_ckpt:
+        raise ValueError("--candidate_router_ckpt is required for --method pudding_prompt_candidate")
+    checkpoint = torch.load(args.candidate_router_ckpt, map_location="cpu")
+    state = checkpoint.get("model_state_dict", checkpoint)
+    metadata = dict(checkpoint.get("metadata") or {})
+    candidate_masks = list(metadata.get("candidate_masks") or [])
+    if not candidate_masks:
+        raise ValueError("Candidate router checkpoint metadata must contain candidate_masks.")
+    router = PromptCandidateMaskRouter(
+        hidden_size=int(metadata.get("hidden_size") or hidden_size),
+        num_candidates=len(candidate_masks),
+    )
+    router.load_state_dict(state)
+    router.to(device).eval()
+    if metadata.get("prompt_only_router_context") is not True:
+        raise ValueError("PuDDing-style candidate router must be prompt-only.")
+    return router, metadata
+
+
+def load_ig_cluster_artifact(args, device):
+    if not args.ig_cluster_artifact:
+        raise ValueError("--ig_cluster_artifact is required for --method ig_cluster_mask")
+    artifact = torch.load(args.ig_cluster_artifact, map_location="cpu")
+    metadata = dict(artifact.get("metadata") or {})
+    centers = artifact.get("centers")
+    masks = artifact.get("masks")
+    if centers is None or masks is None:
+        raise ValueError("IG cluster artifact must contain centers and masks.")
+    if metadata.get("prompt_only_router_context") is not True:
+        raise ValueError("IG cluster artifact must be prompt-only.")
+    return {
+        "centers": centers.float().to(device),
+        "masks": [[int(v) for v in row] for row in masks.detach().cpu().long().tolist()],
+        "cluster_risks": artifact.get("cluster_risks"),
+        "metadata": metadata,
+    }
+
+
+def load_layerwise_hidden_router(args, hidden_size: int, num_layers: int, device):
+    if not args.layerwise_router_ckpt:
+        raise ValueError("--layerwise_router_ckpt is required for --method layerwise_hidden_router")
+    checkpoint = torch.load(args.layerwise_router_ckpt, map_location="cpu")
+    state = checkpoint.get("model_state_dict", checkpoint)
+    metadata = dict(checkpoint.get("metadata") or {})
+    router = LayerwiseHiddenRiskRouter(
+        hidden_size=int(metadata.get("hidden_size") or hidden_size),
+        num_layers=num_layers,
+    )
+    router.load_state_dict(state)
+    router.to(device).eval()
+    if metadata.get("prompt_only_router_context") is not True:
+        raise ValueError("Layerwise hidden router checkpoint must be prompt-only.")
     return router, metadata
 
 
@@ -704,6 +762,139 @@ def risk_router_masks(
                 "kept_layer_count": sum(int(v) for v in mask),
                 "skip_rate": actual_skip_rate(mask),
                 "risk_objective": risk_router_metadata.get("risk_objective"),
+            }
+        )
+    return masks, mask_ids, risk_rows, row_metadata
+
+
+def pudding_prompt_candidate_masks(
+    args,
+    model,
+    candidate_router,
+    candidate_metadata: Dict[str, object],
+    input_ids,
+    attention_mask,
+):
+    candidate_specs = list(candidate_metadata.get("candidate_masks") or [])
+    if not candidate_specs:
+        raise ValueError("Candidate router metadata has no candidate_masks.")
+    candidate_masks = [[int(v) for v in row["mask"]] for row in candidate_specs]
+    candidate_ids = [
+        str(row.get("mask_id") or mask_id_from_mask(mask, prefix="pudding_candidate"))
+        for row, mask in zip(candidate_specs, candidate_masks)
+    ]
+    state = raw_embedding_request_state(model, input_ids, attention_mask)
+    with torch.no_grad():
+        pred_losses = candidate_router(state).detach().float()
+    selected = torch.argmin(pred_losses, dim=-1).detach().cpu().tolist()
+    loss_rows = pred_losses.detach().cpu().tolist()
+    masks = [candidate_masks[int(idx)] for idx in selected]
+    mask_ids = [candidate_ids[int(idx)] for idx in selected]
+    row_metadata = []
+    for idx, losses, mask in zip(selected, loss_rows, masks):
+        row_metadata.append(
+            {
+                "method": "pudding_prompt_candidate",
+                "source_baseline": "PuDDing-style prompt-only candidate-mask regression",
+                "router_input": candidate_metadata.get("router_input") or "raw_prompt_embedding_mean",
+                "candidate_objective": candidate_metadata.get("candidate_objective"),
+                "candidate_count": len(candidate_masks),
+                "selected_candidate_index": int(idx),
+                "selected_candidate_mask_id": candidate_ids[int(idx)],
+                "pred_candidate_losses": losses,
+                "kept_layer_count": sum(int(v) for v in mask),
+                "skip_rate": actual_skip_rate(mask),
+            }
+        )
+    return masks, mask_ids, loss_rows, row_metadata
+
+
+def ig_cluster_masks(args, model, artifact: Dict[str, object], input_ids, attention_mask):
+    metadata = dict(artifact.get("metadata") or {})
+    centers = artifact["centers"]
+    cluster_masks = artifact["masks"]
+    state = raw_embedding_request_state(model, input_ids, attention_mask).float()
+    if bool(metadata.get("normalize_embeddings")):
+        state = torch.nn.functional.normalize(state, p=2, dim=-1)
+    distances = torch.cdist(state.float(), centers.float(), p=2)
+    selected = torch.argmin(distances, dim=-1).detach().cpu().tolist()
+    distance_rows = distances.detach().cpu().tolist()
+    mask_ids = list(metadata.get("mask_ids") or [])
+    cluster_sizes = list(metadata.get("cluster_sizes") or [])
+    masks = [cluster_masks[int(idx)] for idx in selected]
+    selected_mask_ids = [
+        mask_ids[int(idx)] if int(idx) < len(mask_ids) else mask_id_from_mask(cluster_masks[int(idx)], prefix="ig_cluster")
+        for idx in selected
+    ]
+    row_metadata = []
+    for idx, row_distances, mask in zip(selected, distance_rows, masks):
+        row_metadata.append(
+            {
+                "method": "ig_cluster_mask",
+                "source_baseline": "IG-Pruning-style prompt-cluster mask selection",
+                "router_input": metadata.get("router_input") or "raw_prompt_embedding_mean",
+                "num_clusters": int(metadata.get("num_clusters") or len(cluster_masks)),
+                "selected_cluster": int(idx),
+                "selected_cluster_distance": float(row_distances[int(idx)]),
+                "cluster_size": int(cluster_sizes[int(idx)]) if int(idx) < len(cluster_sizes) else None,
+                "cluster_distances": row_distances,
+                "kept_layer_count": sum(int(v) for v in mask),
+                "skip_rate": actual_skip_rate(mask),
+            }
+        )
+    return masks, selected_mask_ids, distance_rows, row_metadata
+
+
+def layerwise_prompt_states(model, input_ids, attention_mask, num_layers: int, pooling: str):
+    clear_custom_policy(model)
+    with torch.no_grad():
+        outputs = model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+    hidden_states = outputs.hidden_states
+    if hidden_states is None or len(hidden_states) < num_layers:
+        raise ValueError("Model did not return enough hidden states for layerwise_hidden_router.")
+    pooled = [
+        pool_request_state(hidden_states[layer_idx], attention_mask, pooling=pooling)
+        for layer_idx in range(num_layers)
+    ]
+    return torch.stack(pooled, dim=1).float()
+
+
+def layerwise_hidden_router_masks(
+    args,
+    model,
+    layerwise_router,
+    layerwise_metadata: Dict[str, object],
+    input_ids,
+    attention_mask,
+    num_layers: int,
+):
+    risk_pooling = str(layerwise_metadata.get("risk_pooling") or args.risk_pooling)
+    states = layerwise_prompt_states(model, input_ids, attention_mask, num_layers, pooling=risk_pooling)
+    with torch.no_grad():
+        pred_risk = layerwise_router(states).detach().float()
+    keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
+    risk_rows = pred_risk.cpu().tolist()
+    masks = [mask_from_skip_risk(row, keep_count=keep_count) for row in risk_rows]
+    mask_ids = [mask_id_from_mask(mask, prefix="layerwise_hidden") for mask in masks]
+    row_metadata = []
+    for risk, mask in zip(risk_rows, masks):
+        row_metadata.append(
+            {
+                "method": "layerwise_hidden_router",
+                "source_baseline": "Dr.LLM-style prompt-only layer-wise hidden-state router",
+                "router_input": layerwise_metadata.get("router_input") or "prompt_layerwise_hidden_states",
+                "risk_pooling": risk_pooling,
+                "pred_risk": risk,
+                "skip_risk": risk,
+                "layer_scores": risk,
+                "kept_layer_count": sum(int(v) for v in mask),
+                "skip_rate": actual_skip_rate(mask),
+                "risk_objective": layerwise_metadata.get("risk_objective"),
             }
         )
     return masks, mask_ids, risk_rows, row_metadata
@@ -1644,6 +1835,8 @@ def import_runtime_dependencies():
     global LayerRouter
     global OpalRiskRouter
     global LayerQueryCrossAttentionRiskRouter
+    global PromptCandidateMaskRouter
+    global LayerwiseHiddenRiskRouter
 
     import torch as torch_module
     from accelerate import Accelerator as AcceleratorCls
@@ -1660,7 +1853,9 @@ def import_runtime_dependencies():
     from models.one_layer_student import OneLayerStudentModel as OneLayerStudentModelCls
     from models.opal_risk_router import (
         LayerQueryCrossAttentionRiskRouter as LayerQueryCrossAttentionRiskRouterCls,
+        LayerwiseHiddenRiskRouter as LayerwiseHiddenRiskRouterCls,
         OpalRiskRouter as OpalRiskRouterCls,
+        PromptCandidateMaskRouter as PromptCandidateMaskRouterCls,
     )
     from models.router import LayerRouter as LayerRouterCls
 
@@ -1677,6 +1872,8 @@ def import_runtime_dependencies():
     LayerRouter = LayerRouterCls
     OpalRiskRouter = OpalRiskRouterCls
     LayerQueryCrossAttentionRiskRouter = LayerQueryCrossAttentionRiskRouterCls
+    PromptCandidateMaskRouter = PromptCandidateMaskRouterCls
+    LayerwiseHiddenRiskRouter = LayerwiseHiddenRiskRouterCls
 
 
 def build_parser():
@@ -1693,6 +1890,9 @@ def build_parser():
             "dynamic",
             "input_guided",
             "layerwise_router",
+            "pudding_prompt_candidate",
+            "ig_cluster_mask",
+            "layerwise_hidden_router",
             "oracle",
         ],
         required=True,
@@ -1704,6 +1904,9 @@ def build_parser():
     parser.add_argument("--student_ckpt", default="")
     parser.add_argument("--policy_ckpt", default="")
     parser.add_argument("--risk_router_ckpt", default="")
+    parser.add_argument("--candidate_router_ckpt", default="")
+    parser.add_argument("--ig_cluster_artifact", default="")
+    parser.add_argument("--layerwise_router_ckpt", default="")
     parser.add_argument("--risk_pooling", choices=["mean", "last"], default="mean")
     parser.add_argument("--recent_tokens", type=int, default=32)
     parser.add_argument("--recent_decay", type=float, default=0.85)
@@ -1869,7 +2072,7 @@ def main():
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     num_layers = detect_num_layers(model)
-    if args.method in {"opal_q", "opal_risk", "raw_input_risk"}:
+    if args.method in {"opal_q", "opal_risk", "raw_input_risk", "pudding_prompt_candidate", "ig_cluster_mask", "layerwise_hidden_router"}:
         args.top_k_layers = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
     effective_top_k_layers = num_layers if args.method == "full" else args.top_k_layers
 
@@ -1882,15 +2085,26 @@ def main():
     if args.method == "static":
         static_mask_spec = static_mask_from_args(args, num_layers, mask_specs)
 
-    student = router = opal_router = risk_router = None
+    student = router = opal_router = risk_router = candidate_router = layerwise_hidden_router = None
+    ig_cluster_artifact: Dict[str, object] = {}
     opal_router_metadata: Dict[str, object] = {}
     risk_router_metadata: Dict[str, object] = {}
+    candidate_router_metadata: Dict[str, object] = {}
+    layerwise_hidden_metadata: Dict[str, object] = {}
     if args.method == "dynamic":
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
     elif args.method == "layerwise_router" and args.student_ckpt and args.policy_ckpt:
         student, router = load_student_router(args, sid_token_ids, num_layers, device)
     elif args.method in {"opal_risk", "raw_input_risk"}:
         risk_router, risk_router_metadata = load_risk_router(args, model.config.hidden_size, num_layers, device)
+    elif args.method == "pudding_prompt_candidate":
+        candidate_router, candidate_router_metadata = load_candidate_router(args, model.config.hidden_size, device)
+    elif args.method == "ig_cluster_mask":
+        ig_cluster_artifact = load_ig_cluster_artifact(args, device)
+    elif args.method == "layerwise_hidden_router":
+        layerwise_hidden_router, layerwise_hidden_metadata = load_layerwise_hidden_router(
+            args, model.config.hidden_size, num_layers, device
+        )
     oracle_cache = load_oracle_cache(args.oracle_cache) if args.oracle_cache else {}
     if args.method == "opal":
         opal_router, opal_router_metadata = load_policy_router(args, model.config.hidden_size, num_layers, device)
@@ -2242,6 +2456,213 @@ def main():
                     predictions.append(record)
                 continue
 
+            if args.method == "pudding_prompt_candidate":
+                (mask_result, _router_time) = component_timer.measure(
+                    "router",
+                    lambda: pudding_prompt_candidate_masks(
+                        args,
+                        model,
+                        candidate_router,
+                        candidate_router_metadata,
+                        input_ids,
+                        attention_mask,
+                    ),
+                    samples=batch_size,
+                    metadata={"router_source": "pudding_prompt_candidate", "warmup": batch_is_warmup},
+                )
+                masks, mask_ids, router_scores, related_rows = mask_result
+                action_plans = timed_action_plans(args, masks, None, component_timer, metadata={"warmup": batch_is_warmup})
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, actions, comp_config, timer
+                    )
+                else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="candidate_mask_selection", num_groups=1)
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
+                        timer_metadata=batch_metadata,
+                    )
+                quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                    model,
+                    tokenizer,
+                    args,
+                    input_ids,
+                    attention_mask,
+                    batch_targets,
+                    masks,
+                    actions,
+                    comp_config,
+                    prefix_allowed_tokens_fn,
+                )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    record = {
+                        "index": int(sample_index),
+                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                        "sample_predictions": outputs[local_pos],
+                        "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
+                        "layer_mask": masks[local_pos],
+                        "execution_mask": masks[local_pos],
+                        "action_mask": actions[local_pos],
+                        "mask_id": mask_ids[local_pos],
+                        "action_id": action_plans[local_pos]["action_id"],
+                        "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                        "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                        "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                        "router_scores": router_scores[local_pos],
+                    }
+                    record.update(related_rows[local_pos])
+                    if quality_rows:
+                        record.update(quality_rows[local_pos])
+                    predictions.append(record)
+                continue
+
+            if args.method == "ig_cluster_mask":
+                (mask_result, _router_time) = component_timer.measure(
+                    "router",
+                    lambda: ig_cluster_masks(args, model, ig_cluster_artifact, input_ids, attention_mask),
+                    samples=batch_size,
+                    metadata={"router_source": "ig_cluster_mask", "warmup": batch_is_warmup},
+                )
+                masks, mask_ids, router_scores, related_rows = mask_result
+                action_plans = timed_action_plans(args, masks, None, component_timer, metadata={"warmup": batch_is_warmup})
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, actions, comp_config, timer
+                    )
+                else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="cluster_mask_selection", num_groups=1)
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
+                        timer_metadata=batch_metadata,
+                    )
+                quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                    model,
+                    tokenizer,
+                    args,
+                    input_ids,
+                    attention_mask,
+                    batch_targets,
+                    masks,
+                    actions,
+                    comp_config,
+                    prefix_allowed_tokens_fn,
+                )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    record = {
+                        "index": int(sample_index),
+                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                        "sample_predictions": outputs[local_pos],
+                        "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
+                        "layer_mask": masks[local_pos],
+                        "execution_mask": masks[local_pos],
+                        "action_mask": actions[local_pos],
+                        "mask_id": mask_ids[local_pos],
+                        "action_id": action_plans[local_pos]["action_id"],
+                        "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                        "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                        "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                        "router_scores": router_scores[local_pos],
+                    }
+                    record.update(related_rows[local_pos])
+                    if quality_rows:
+                        record.update(quality_rows[local_pos])
+                    predictions.append(record)
+                continue
+
+            if args.method == "layerwise_hidden_router":
+                (mask_result, _router_time) = component_timer.measure(
+                    "router",
+                    lambda: layerwise_hidden_router_masks(
+                        args,
+                        model,
+                        layerwise_hidden_router,
+                        layerwise_hidden_metadata,
+                        input_ids,
+                        attention_mask,
+                        num_layers,
+                    ),
+                    samples=batch_size,
+                    metadata={"router_source": "layerwise_hidden_router", "warmup": batch_is_warmup},
+                )
+                masks, mask_ids, router_scores, related_rows = mask_result
+                action_plans = timed_action_plans(args, masks, router_scores, component_timer, metadata={"warmup": batch_is_warmup})
+                actions = [plan["action_mask"] for plan in action_plans]
+                comp_config = compensation_config_from_args(args, action_plans)
+                if args.group_by_mask:
+                    outputs = generate_grouped_by_mask(
+                        model, tokenizer, args, input_ids, attention_mask, prefix_allowed_tokens_fn, masks, actions, comp_config, timer
+                    )
+                else:
+                    batch_metadata = summarize_batch_masks(masks, grouping_strategy="layerwise_hidden_subset", num_groups=1)
+                    outputs = generate_once(
+                        model,
+                        tokenizer,
+                        args,
+                        input_ids,
+                        attention_mask,
+                        prefix_allowed_tokens_fn,
+                        masks,
+                        actions,
+                        comp_config,
+                        timer,
+                        timer_metadata=batch_metadata,
+                    )
+                quality_rows, full_reference_outputs = add_quality_and_reference_for_batch(
+                    model,
+                    tokenizer,
+                    args,
+                    input_ids,
+                    attention_mask,
+                    batch_targets,
+                    masks,
+                    actions,
+                    comp_config,
+                    prefix_allowed_tokens_fn,
+                )
+                for local_pos, sample_index in enumerate(batch_indices):
+                    record = {
+                        "index": int(sample_index),
+                        "input": tokenizer.decode(input_ids[local_pos], skip_special_tokens=True),
+                        "sample_predictions": outputs[local_pos],
+                        "full_sample_predictions": full_reference_outputs[local_pos] if full_reference_outputs else [],
+                        "layer_mask": masks[local_pos],
+                        "execution_mask": masks[local_pos],
+                        "action_mask": actions[local_pos],
+                        "mask_id": mask_ids[local_pos],
+                        "action_id": action_plans[local_pos]["action_id"],
+                        "compensation_mask": action_plans[local_pos]["compensation_mask"],
+                        "compensation_gates": action_plans[local_pos]["compensation_gates"],
+                        "compensated_layer_count": action_plans[local_pos]["compensated_layer_count"],
+                        "router_scores": router_scores[local_pos],
+                    }
+                    record.update(related_rows[local_pos])
+                    if quality_rows:
+                        record.update(quality_rows[local_pos])
+                    predictions.append(record)
+                continue
+
             if args.method == "input_guided":
                 (mask_result, _router_time) = component_timer.measure(
                     "router",
@@ -2500,8 +2921,14 @@ def main():
             "student_ckpt": args.student_ckpt,
             "policy_ckpt": args.policy_ckpt,
             "risk_router_ckpt": args.risk_router_ckpt,
+            "candidate_router_ckpt": args.candidate_router_ckpt,
+            "ig_cluster_artifact": args.ig_cluster_artifact,
+            "layerwise_router_ckpt": args.layerwise_router_ckpt,
             "policy_ckpt_metadata": opal_router_metadata if args.method in {"opal", "opal_q"} else {},
             "risk_router_metadata": risk_router_metadata if args.method in {"opal_risk", "raw_input_risk"} else {},
+            "candidate_router_metadata": candidate_router_metadata if args.method == "pudding_prompt_candidate" else {},
+            "ig_cluster_metadata": (ig_cluster_artifact.get("metadata") if args.method == "ig_cluster_mask" else {}),
+            "layerwise_hidden_metadata": layerwise_hidden_metadata if args.method == "layerwise_hidden_router" else {},
             "risk_router_input": risk_router_metadata.get("router_input") if args.method in {"opal_risk", "raw_input_risk"} else None,
             "allow_fallback_router": args.allow_fallback_router,
             "allow_legacy_policy_ckpt": args.allow_legacy_policy_ckpt,
@@ -2521,7 +2948,7 @@ def main():
             "oracle_cache_size": len(oracle_cache),
             "prompt_only_router_context": (
                 True
-                if args.method in {"opal_risk", "raw_input_risk"}
+                if args.method in {"opal_risk", "raw_input_risk", "pudding_prompt_candidate", "ig_cluster_mask", "layerwise_hidden_router"}
                 else
                 bool((opal_router_metadata or {}).get("router_context") == "prompt")
                 if args.method == "opal_q" and args.policy_ckpt
@@ -2552,7 +2979,7 @@ def main():
             "structure_penalty": args.structure_penalty,
             "quality_metrics_enabled": not args.disable_quality_metrics,
             "full_downstream_reference": args.compute_full_downstream_reference
-            or args.method in {"opal_q", "opal_risk", "raw_input_risk"},
+            or args.method in {"opal_q", "opal_risk", "raw_input_risk", "pudding_prompt_candidate", "ig_cluster_mask", "layerwise_hidden_router"},
             "tail_keep": args.tail_keep,
             "compensation": args.compensation,
             "compensation_impl": "heuristic_non_trainable" if args.compensation != "none" else "none",

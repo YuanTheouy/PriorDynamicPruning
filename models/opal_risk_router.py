@@ -23,6 +23,53 @@ class OpalRiskRouter(nn.Module):
         return self.net(state).float()
 
 
+class PromptCandidateMaskRouter(nn.Module):
+    """Predict candidate-mask losses from a prompt-only representation."""
+
+    def __init__(self, hidden_size: int, num_candidates: int, dropout: float = 0.0, input_size: int = None):
+        super().__init__()
+        input_size = int(input_size or hidden_size)
+        inner = max(64, input_size // 2)
+        self.num_candidates = int(num_candidates)
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_size),
+            nn.Linear(input_size, inner),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(inner, self.num_candidates),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.net(state).float()
+
+
+class LayerwiseHiddenRiskRouter(nn.Module):
+    """Predict per-layer skip risk from prompt-only hidden states at each layer."""
+
+    def __init__(self, hidden_size: int, num_layers: int, dropout: float = 0.0, input_size: int = None):
+        super().__init__()
+        input_size = int(input_size or hidden_size)
+        inner = max(64, input_size // 2)
+        self.num_layers = int(num_layers)
+        self.layer_embedding = nn.Parameter(torch.empty(self.num_layers, input_size))
+        nn.init.normal_(self.layer_embedding, mean=0.0, std=input_size ** -0.5)
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_size),
+            nn.Linear(input_size, inner),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(inner, 1),
+        )
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        if states.dim() != 3:
+            raise ValueError(f"LayerwiseHiddenRiskRouter expects [batch, layers, hidden], got {tuple(states.shape)}")
+        if states.size(1) != self.num_layers:
+            raise ValueError(f"Expected {self.num_layers} layers, got {states.size(1)}")
+        x = states.float() + self.layer_embedding.unsqueeze(0)
+        return self.net(x).squeeze(-1).float()
+
+
 class LayerQueryCrossAttentionRiskRouter(nn.Module):
     """Predict per-layer skip risk with learnable layer queries over prompt states."""
 

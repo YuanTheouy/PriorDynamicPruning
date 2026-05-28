@@ -36,3 +36,14 @@ def risk_pairwise_ranking_loss(pred_risk: torch.Tensor, target_risk: torch.Tenso
     # If target_i > target_j, pred_i should also be greater than pred_j.
     losses = F.softplus(-(pred_diff - float(margin) * order) * order)
     return losses[valid].mean()
+
+
+def risk_skip_set_loss(pred_risk: torch.Tensor, target_risk: torch.Tensor, skip_count: int) -> torch.Tensor:
+    """Train the decision boundary used at inference: the lowest-risk layers are skipped."""
+    skip_count = max(0, min(int(skip_count), int(target_risk.size(-1))))
+    if skip_count <= 0:
+        return pred_risk.float().new_tensor(0.0)
+    skip_targets = torch.zeros_like(target_risk.float())
+    skip_indices = torch.topk(target_risk.float(), k=skip_count, dim=-1, largest=False).indices
+    skip_targets.scatter_(dim=-1, index=skip_indices, value=1.0)
+    return F.binary_cross_entropy_with_logits(-pred_risk.float(), skip_targets)

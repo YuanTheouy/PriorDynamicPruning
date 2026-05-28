@@ -16,8 +16,17 @@ sys.path.insert(0, transformers_src_path)
 
 from transformers import AutoTokenizer, Qwen2ForCausalLM
 
-from data import SidSFTDataset
+from data import EvalSidDataset
 from opal_llm.quality_metrics import quality_rows_from_logits
+
+
+CATEGORY_LABELS = {
+    "Industrial_and_Scientific": "industrial and scientific items",
+    "Office_Products": "office products",
+    "Toys_and_Games": "toys and games",
+    "Sports": "sports and outdoors",
+    "Books": "books",
+}
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -129,12 +138,15 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    dataset_category = CATEGORY_LABELS.get(args.category, args.category)
     dataset = IndexedDataset(
-        SidSFTDataset(
+        EvalSidDataset(
             train_file=data_file,
             tokenizer=tokenizer,
-            category=args.category,
-            max_len=1024,
+            category=dataset_category,
+            max_len=2560,
+            test=False,
+            seed=args.seed,
         )
     )
     if args.max_samples > 0:
@@ -223,6 +235,7 @@ def main():
                     "teacher_model": args.teacher_model,
                     "data_file": data_file,
                     "category": args.category,
+                    "dataset_prompt": "EvalSidDataset",
                     "prefix_depth": args.prefix_depth,
                     "objective": args.objective,
                     "num_layers": num_layers,

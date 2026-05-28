@@ -17,8 +17,23 @@ sys.path.insert(0, transformers_src_path)
 
 from transformers import AutoTokenizer, Qwen2ForCausalLM
 
-from data import SidSFTDataset
-from models.opal_risk_router import OpalRiskRouter, risk_pairwise_ranking_loss, risk_regression_loss
+from data import EvalSidDataset
+from models.opal_risk_router import (
+    OpalRiskRouter,
+    risk_pairwise_ranking_loss,
+    risk_regression_loss,
+    risk_skip_set_loss,
+)
+from opal_llm.mask_utils import keep_count_from_skip_rate
+
+
+CATEGORY_LABELS = {
+    "Industrial_and_Scientific": "industrial and scientific items",
+    "Office_Products": "office products",
+    "Toys_and_Games": "toys and games",
+    "Sports": "sports and outdoors",
+    "Books": "books",
+}
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -98,7 +113,20 @@ def gather_last_token_state(last_hidden_state, attention_mask):
     return last_hidden_state[torch.arange(last_hidden_state.size(0), device=last_hidden_state.device), last_indices]
 
 
-def teacher_prefix_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int):
+def masked_mean_state(hidden_state, attention_mask):
+    weights = attention_mask.to(dtype=hidden_state.dtype).unsqueeze(-1)
+    return (hidden_state * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+
+def pool_hidden_state(hidden_state, attention_mask, pooling: str):
+    if pooling == "last":
+        return gather_last_token_state(hidden_state, attention_mask)
+    if pooling == "mean":
+        return masked_mean_state(hidden_state, attention_mask)
+    raise ValueError(f"Unsupported risk pooling: {pooling}")
+
+
+def teacher_prefix_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int, pooling: str):
     prefix_depth = max(0, min(int(prefix_depth), int(num_layers)))
     prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(num_layers)]
     set_custom_policy(model, torch.tensor([prefix_mask] * input_ids.size(0), dtype=torch.float32, device=input_ids.device))
@@ -107,7 +135,7 @@ def teacher_prefix_state(model, input_ids, attention_mask, num_layers: int, pref
             hidden = model.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
     finally:
         clear_custom_policy(model)
-    return gather_last_token_state(hidden, attention_mask).float()
+    return pool_hidden_state(hidden, attention_mask, pooling).float()
 
 
 def raw_embedding_state(model, input_ids, attention_mask):
@@ -166,10 +194,14 @@ def main():
     parser.add_argument("--risk_label_file", required=True)
     parser.add_argument("--router_input", choices=["prefix_hk", "raw_embedding"], default="prefix_hk")
     parser.add_argument("--prefix_depth", type=int, default=4)
+    parser.add_argument("--risk_pooling", choices=["mean", "last"], default="mean")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--ranking_loss_weight", type=float, default=0.0)
+    parser.add_argument("--skip_set_loss_weight", type=float, default=0.0)
+    parser.add_argument("--skip_rate", type=float, default=-1.0)
+    parser.add_argument("--top_k_layers", type=int, default=0)
     parser.add_argument("--huber_beta", type=float, default=1.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--output_dir", required=True)
@@ -189,12 +221,15 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     risk_labels, label_metadata = load_risk_labels(args.risk_label_file)
+    dataset_category = CATEGORY_LABELS.get(args.category, args.category)
     dataset = IndexedDataset(
-        SidSFTDataset(
+        EvalSidDataset(
             train_file=args.train_file,
             tokenizer=tokenizer,
-            category=args.category,
-            max_len=1024,
+            category=dataset_category,
+            max_len=2560,
+            test=False,
+            seed=args.seed,
         )
     )
     covered_indices = sorted(index for index in risk_labels if 0 <= index < len(dataset))
@@ -214,6 +249,12 @@ def main():
         param.requires_grad = False
     num_layers = detect_num_layers(model)
     hidden_size = int(model.config.hidden_size)
+    keep_count = keep_count_from_skip_rate(
+        num_layers,
+        args.skip_rate,
+        args.top_k_layers if args.top_k_layers > 0 else num_layers,
+    )
+    skip_count = num_layers - keep_count
     router = OpalRiskRouter(hidden_size=hidden_size, num_layers=num_layers, dropout=args.dropout).to(device)
     optimizer = torch.optim.AdamW(router.parameters(), lr=args.lr)
     router, optimizer, dataloader = accelerator.prepare(router, optimizer, dataloader)
@@ -223,7 +264,10 @@ def main():
             json.dumps(
                 {
                     "router_input": args.router_input,
+                    "risk_pooling": args.risk_pooling if args.router_input == "prefix_hk" else "mean",
+                    "dataset_prompt": "EvalSidDataset",
                     "num_layers": num_layers,
+                    "skip_count": skip_count,
                     "risk_label_rows": len(risk_labels),
                     "covered_rows": len(covered_indices),
                     "device": str(device),
@@ -239,6 +283,7 @@ def main():
         total_loss = 0.0
         total_regression = 0.0
         total_ranking = 0.0
+        total_skip_set = 0.0
         used_steps = 0
         iterator = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}") if accelerator.is_main_process else dataloader
         for batch in iterator:
@@ -253,14 +298,26 @@ def main():
                 tokenizer.pad_token_id,
             )
             if args.router_input == "prefix_hk":
-                state = teacher_prefix_state(model, router_input_ids, router_attention_mask, num_layers, args.prefix_depth)
+                state = teacher_prefix_state(
+                    model,
+                    router_input_ids,
+                    router_attention_mask,
+                    num_layers,
+                    args.prefix_depth,
+                    args.risk_pooling,
+                )
             else:
                 state = raw_embedding_state(model, router_input_ids, router_attention_mask)
             target = torch.tensor([risk_labels[index] for index in batch_indices], dtype=torch.float32, device=device)
             pred = router(state)
             regression = risk_regression_loss(pred, target, beta=args.huber_beta)
             ranking = risk_pairwise_ranking_loss(pred, target) if args.ranking_loss_weight > 0 else pred.new_tensor(0.0)
-            loss = regression + float(args.ranking_loss_weight) * ranking
+            skip_set = risk_skip_set_loss(pred, target, skip_count) if args.skip_set_loss_weight > 0 else pred.new_tensor(0.0)
+            loss = (
+                regression
+                + float(args.ranking_loss_weight) * ranking
+                + float(args.skip_set_loss_weight) * skip_set
+            )
 
             optimizer.zero_grad()
             accelerator.backward(loss)
@@ -269,6 +326,7 @@ def main():
             total_loss += float(loss.detach().float().item())
             total_regression += float(regression.detach().float().item())
             total_ranking += float(ranking.detach().float().item())
+            total_skip_set += float(skip_set.detach().float().item())
             used_steps += 1
             if accelerator.is_main_process:
                 iterator.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -278,7 +336,8 @@ def main():
                         f"LOSS DEBUG epoch={epoch + 1} step={used_steps} "
                         f"loss={total_loss / denom:.6f} "
                         f"huber={total_regression / denom:.6f} "
-                        f"ranking={total_ranking / denom:.6f}"
+                        f"ranking={total_ranking / denom:.6f} "
+                        f"skip_set={total_skip_set / denom:.6f}"
                     )
 
         denom = max(1, used_steps)
@@ -287,6 +346,7 @@ def main():
             "loss": total_loss / denom,
             "huber": total_regression / denom,
             "ranking": total_ranking / denom,
+            "skip_set": total_skip_set / denom,
             "steps": used_steps,
         }
         history.append(epoch_metrics)
@@ -301,12 +361,18 @@ def main():
             "router_input": args.router_input,
             "prompt_only_router_context": True,
             "prefix_depth": int(args.prefix_depth) if args.router_input == "prefix_hk" else 0,
+            "risk_pooling": args.risk_pooling if args.router_input == "prefix_hk" else "mean",
+            "dataset_prompt": "EvalSidDataset",
             "num_layers": int(num_layers),
             "hidden_size": int(hidden_size),
             "teacher_model": args.teacher_model,
             "risk_label_file": args.risk_label_file,
             "risk_objective": label_metadata.get("objective"),
             "ranking_loss_weight": float(args.ranking_loss_weight),
+            "skip_set_loss_weight": float(args.skip_set_loss_weight),
+            "skip_rate": float(args.skip_rate),
+            "top_k_layers": int(args.top_k_layers),
+            "skip_count": int(skip_count),
             "huber_beta": float(args.huber_beta),
             "seed": int(args.seed),
         }

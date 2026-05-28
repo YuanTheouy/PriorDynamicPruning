@@ -330,11 +330,15 @@ def load_risk_router(args, hidden_size: int, num_layers: int, device):
     return router, metadata
 
 
-def pool_request_state(last_hidden_state, attention_mask):
-    # MiniOneRec uses left padding for generation; the last active prompt token is
-    # therefore the final column for every non-empty row.
-    del attention_mask
-    return last_hidden_state[:, -1, :]
+def pool_request_state(last_hidden_state, attention_mask, pooling: str = "last"):
+    if pooling == "last":
+        # MiniOneRec uses left padding for generation; the last active prompt token is
+        # therefore the final column for every non-empty row.
+        return last_hidden_state[:, -1, :]
+    if pooling == "mean":
+        weights = attention_mask.to(dtype=last_hidden_state.dtype).unsqueeze(-1)
+        return (last_hidden_state * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+    raise ValueError(f"Unsupported risk pooling: {pooling}")
 
 
 def fallback_utility_scores(state, num_layers: int):
@@ -516,6 +520,7 @@ def risk_router_masks(
         or ("raw_embedding" if args.method == "raw_input_risk" else "prefix_hk")
     )
     if router_input == "prefix_hk":
+        risk_pooling = str(risk_router_metadata.get("risk_pooling") or args.risk_pooling)
         prefix_hidden = prefix_hidden_state(
             args,
             model,
@@ -525,8 +530,9 @@ def risk_router_masks(
             component_timer,
             is_warmup=is_warmup,
         )
-        state = pool_request_state(prefix_hidden, attention_mask).float()
+        state = pool_request_state(prefix_hidden, attention_mask, pooling=risk_pooling).float()
     elif router_input == "raw_embedding":
+        risk_pooling = "mean"
         state, _ = component_timer.measure(
             "router_input",
             lambda: raw_embedding_request_state(model, input_ids, attention_mask),
@@ -556,6 +562,7 @@ def risk_router_masks(
             {
                 "method": args.method,
                 "router_input": router_input,
+                "risk_pooling": risk_pooling,
                 "prefix_depth": int(args.prefix_depth) if router_input == "prefix_hk" else 0,
                 "pred_risk": risk,
                 "skip_risk": risk,
@@ -1559,6 +1566,7 @@ def build_parser():
     parser.add_argument("--student_ckpt", default="")
     parser.add_argument("--policy_ckpt", default="")
     parser.add_argument("--risk_router_ckpt", default="")
+    parser.add_argument("--risk_pooling", choices=["mean", "last"], default="mean")
     parser.add_argument(
         "--allow_fallback_router",
         action="store_true",

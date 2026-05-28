@@ -19,6 +19,7 @@ from transformers import AutoTokenizer, Qwen2ForCausalLM
 
 from data import EvalSidDataset
 from models.opal_risk_router import (
+    LayerQueryCrossAttentionRiskRouter,
     OpalRiskRouter,
     risk_pairwise_ranking_loss,
     risk_regression_loss,
@@ -34,6 +35,7 @@ CATEGORY_LABELS = {
     "Sports": "sports and outdoors",
     "Books": "books",
 }
+ATTENTION_ROUTER_INPUTS = {"prefix_hk_raw_attn"}
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -109,13 +111,33 @@ def prompt_only_inputs(input_ids, attention_mask, labels, pad_token_id):
 
 
 def gather_last_token_state(last_hidden_state, attention_mask):
-    last_indices = attention_mask.long().sum(dim=1).clamp(min=1) - 1
-    return last_hidden_state[torch.arange(last_hidden_state.size(0), device=last_hidden_state.device), last_indices]
+    rows = []
+    for hidden, mask in zip(last_hidden_state, attention_mask):
+        active = mask.ne(0).nonzero(as_tuple=False).flatten()
+        rows.append(hidden[active[-1]] if active.numel() > 0 else hidden[-1])
+    return torch.stack(rows, dim=0)
 
 
 def masked_mean_state(hidden_state, attention_mask):
     weights = attention_mask.to(dtype=hidden_state.dtype).unsqueeze(-1)
     return (hidden_state * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+
+def recency_weighted_state(hidden_state, attention_mask, recent_tokens: int, recent_decay: float):
+    recent_tokens = max(1, int(recent_tokens))
+    recent_decay = float(recent_decay)
+    rows = []
+    for hidden, mask in zip(hidden_state, attention_mask):
+        active = mask.ne(0).nonzero(as_tuple=False).flatten()
+        if active.numel() == 0:
+            rows.append(hidden[-1])
+        else:
+            recent = hidden.index_select(0, active[-recent_tokens:])
+            powers = torch.arange(recent.size(0) - 1, -1, -1, device=hidden.device, dtype=torch.float32)
+            weights = torch.pow(torch.tensor(recent_decay, device=hidden.device, dtype=torch.float32), powers)
+            weights = (weights / weights.sum().clamp_min(1e-12)).to(dtype=recent.dtype).unsqueeze(-1)
+            rows.append((recent * weights).sum(dim=0))
+    return torch.stack(rows, dim=0)
 
 
 def pool_hidden_state(hidden_state, attention_mask, pooling: str):
@@ -126,24 +148,92 @@ def pool_hidden_state(hidden_state, attention_mask, pooling: str):
     raise ValueError(f"Unsupported risk pooling: {pooling}")
 
 
-def teacher_prefix_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int, pooling: str):
+def teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int):
     prefix_depth = max(0, min(int(prefix_depth), int(num_layers)))
     prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(num_layers)]
     set_custom_policy(model, torch.tensor([prefix_mask] * input_ids.size(0), dtype=torch.float32, device=input_ids.device))
     try:
         with torch.no_grad():
-            hidden = model.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
+            return model.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
     finally:
         clear_custom_policy(model)
+
+
+def teacher_prefix_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int, pooling: str):
+    hidden = teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers, prefix_depth)
     return pool_hidden_state(hidden, attention_mask, pooling).float()
 
 
-def raw_embedding_state(model, input_ids, attention_mask):
+def raw_embedding_hidden_state(model, input_ids):
     with torch.no_grad():
-        embeds = model.model.embed_tokens(input_ids)
-        weights = attention_mask.to(dtype=embeds.dtype).unsqueeze(-1)
-        pooled = (embeds * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-    return pooled.float()
+        return model.model.embed_tokens(input_ids)
+
+
+def raw_embedding_state(model, input_ids, attention_mask):
+    embeds = raw_embedding_hidden_state(model, input_ids)
+    return masked_mean_state(embeds, attention_mask).float()
+
+
+def fusion_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int, recent_tokens: int, recent_decay: float):
+    raw_hidden = raw_embedding_hidden_state(model, input_ids)
+    hk_hidden = teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers, prefix_depth)
+    features = [
+        gather_last_token_state(raw_hidden, attention_mask),
+        recency_weighted_state(raw_hidden, attention_mask, recent_tokens, recent_decay),
+        gather_last_token_state(hk_hidden, attention_mask),
+        recency_weighted_state(hk_hidden, attention_mask, recent_tokens, recent_decay),
+    ]
+    return torch.cat(features, dim=-1).float()
+
+
+def last_fusion_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int):
+    raw_hidden = raw_embedding_hidden_state(model, input_ids)
+    hk_hidden = teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers, prefix_depth)
+    return torch.cat(
+        [
+            gather_last_token_state(raw_hidden, attention_mask),
+            gather_last_token_state(hk_hidden, attention_mask),
+        ],
+        dim=-1,
+    ).float()
+
+
+def router_state_size(hidden_size: int, router_input: str) -> int:
+    if router_input in ATTENTION_ROUTER_INPUTS:
+        return int(hidden_size)
+    if router_input == "prefix_hk_raw_fusion":
+        return int(hidden_size) * 4
+    if router_input == "prefix_hk_raw_last":
+        return int(hidden_size) * 2
+    return int(hidden_size)
+
+
+def router_prefix_depth(router_input: str, prefix_depth: int) -> int:
+    return int(prefix_depth) if router_input in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"} else 0
+
+
+def router_pooling_metadata(router_input: str, risk_pooling: str) -> str:
+    if router_input == "prefix_hk":
+        return risk_pooling
+    if router_input == "prefix_hk_raw_attn":
+        return "layer_query_cross_attention"
+    if router_input == "prefix_hk_raw_fusion":
+        return "raw_last+raw_recent_weighted+hk_last+hk_recent_weighted"
+    if router_input == "prefix_hk_raw_last":
+        return "raw_last+hk_last"
+    return "mean"
+
+
+def router_features_metadata(router_input: str):
+    if router_input == "prefix_hk_raw_attn":
+        return ["raw_token_sequence", "hk_token_sequence", "attention_mask", "layer_queries"]
+    if router_input == "prefix_hk_raw_fusion":
+        return ["raw_last", "raw_recent_weighted", "hk_last", "hk_recent_weighted"]
+    if router_input == "prefix_hk_raw_last":
+        return ["raw_last", "hk_last"]
+    if router_input == "prefix_hk":
+        return ["hk_pooled"]
+    return ["raw_embedding_mean"]
 
 
 def collate_batch(batch, pad_token_id: int):
@@ -192,9 +282,17 @@ def main():
     parser.add_argument("--info_file", required=True)
     parser.add_argument("--category", default="Office_Products")
     parser.add_argument("--risk_label_file", required=True)
-    parser.add_argument("--router_input", choices=["prefix_hk", "raw_embedding"], default="prefix_hk")
+    parser.add_argument(
+        "--router_input",
+        choices=["prefix_hk", "raw_embedding", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"],
+        default="prefix_hk",
+    )
     parser.add_argument("--prefix_depth", type=int, default=4)
     parser.add_argument("--risk_pooling", choices=["mean", "last"], default="mean")
+    parser.add_argument("--recent_tokens", type=int, default=32)
+    parser.add_argument("--recent_decay", type=float, default=0.85)
+    parser.add_argument("--router_dim", type=int, default=256)
+    parser.add_argument("--router_heads", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -249,13 +347,25 @@ def main():
         param.requires_grad = False
     num_layers = detect_num_layers(model)
     hidden_size = int(model.config.hidden_size)
+    state_size = router_state_size(hidden_size, args.router_input)
     keep_count = keep_count_from_skip_rate(
         num_layers,
         args.skip_rate,
         args.top_k_layers if args.top_k_layers > 0 else num_layers,
     )
     skip_count = num_layers - keep_count
-    router = OpalRiskRouter(hidden_size=hidden_size, num_layers=num_layers, dropout=args.dropout).to(device)
+    if args.router_input in ATTENTION_ROUTER_INPUTS:
+        router = LayerQueryCrossAttentionRiskRouter(
+            base_hidden_size=hidden_size,
+            num_layers=num_layers,
+            router_dim=args.router_dim,
+            router_heads=args.router_heads,
+            dropout=args.dropout,
+        ).to(device)
+        router_architecture = "layer_query_cross_attention"
+    else:
+        router = OpalRiskRouter(hidden_size=state_size, num_layers=num_layers, dropout=args.dropout).to(device)
+        router_architecture = "pooled_mlp"
     optimizer = torch.optim.AdamW(router.parameters(), lr=args.lr)
     router, optimizer, dataloader = accelerator.prepare(router, optimizer, dataloader)
 
@@ -264,9 +374,17 @@ def main():
             json.dumps(
                 {
                     "router_input": args.router_input,
-                    "risk_pooling": args.risk_pooling if args.router_input == "prefix_hk" else "mean",
+                    "risk_pooling": router_pooling_metadata(args.router_input, args.risk_pooling),
+                    "router_features": router_features_metadata(args.router_input),
                     "dataset_prompt": "EvalSidDataset",
                     "num_layers": num_layers,
+                    "base_hidden_size": hidden_size,
+                    "state_size": state_size,
+                    "router_architecture": router_architecture,
+                    "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+                    "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+                    "recent_tokens": int(args.recent_tokens),
+                    "recent_decay": float(args.recent_decay),
                     "skip_count": skip_count,
                     "risk_label_rows": len(risk_labels),
                     "covered_rows": len(covered_indices),
@@ -306,10 +424,41 @@ def main():
                     args.prefix_depth,
                     args.risk_pooling,
                 )
+                pred = router(state)
+            elif args.router_input == "prefix_hk_raw_fusion":
+                state = fusion_state(
+                    model,
+                    router_input_ids,
+                    router_attention_mask,
+                    num_layers,
+                    args.prefix_depth,
+                    args.recent_tokens,
+                    args.recent_decay,
+                )
+                pred = router(state)
+            elif args.router_input == "prefix_hk_raw_last":
+                state = last_fusion_state(
+                    model,
+                    router_input_ids,
+                    router_attention_mask,
+                    num_layers,
+                    args.prefix_depth,
+                )
+                pred = router(state)
+            elif args.router_input == "prefix_hk_raw_attn":
+                raw_hidden = raw_embedding_hidden_state(model, router_input_ids)
+                hk_hidden = teacher_prefix_hidden_state(
+                    model,
+                    router_input_ids,
+                    router_attention_mask,
+                    num_layers,
+                    args.prefix_depth,
+                )
+                pred = router(raw_hidden, hk_hidden, router_attention_mask)
             else:
                 state = raw_embedding_state(model, router_input_ids, router_attention_mask)
+                pred = router(state)
             target = torch.tensor([risk_labels[index] for index in batch_indices], dtype=torch.float32, device=device)
-            pred = router(state)
             regression = risk_regression_loss(pred, target, beta=args.huber_beta)
             ranking = risk_pairwise_ranking_loss(pred, target) if args.ranking_loss_weight > 0 else pred.new_tensor(0.0)
             skip_set = risk_skip_set_loss(pred, target, skip_count) if args.skip_set_loss_weight > 0 else pred.new_tensor(0.0)
@@ -360,11 +509,19 @@ def main():
             "method": "prefix_supervised_layer_risk_prediction",
             "router_input": args.router_input,
             "prompt_only_router_context": True,
-            "prefix_depth": int(args.prefix_depth) if args.router_input == "prefix_hk" else 0,
-            "risk_pooling": args.risk_pooling if args.router_input == "prefix_hk" else "mean",
+            "prefix_depth": router_prefix_depth(args.router_input, args.prefix_depth),
+            "risk_pooling": router_pooling_metadata(args.router_input, args.risk_pooling),
+            "router_features": router_features_metadata(args.router_input),
             "dataset_prompt": "EvalSidDataset",
             "num_layers": int(num_layers),
-            "hidden_size": int(hidden_size),
+            "hidden_size": int(state_size),
+            "base_hidden_size": int(hidden_size),
+            "state_size": int(state_size),
+            "router_architecture": router_architecture,
+            "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+            "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+            "recent_tokens": int(args.recent_tokens),
+            "recent_decay": float(args.recent_decay),
             "teacher_model": args.teacher_model,
             "risk_label_file": args.risk_label_file,
             "risk_objective": label_metadata.get("objective"),

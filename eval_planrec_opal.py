@@ -65,6 +65,7 @@ EvalSidDataset = None
 OneLayerStudentModel = None
 LayerRouter = None
 OpalRiskRouter = None
+LayerQueryCrossAttentionRiskRouter = None
 
 
 CATEGORY_LABELS = {
@@ -317,12 +318,22 @@ def load_risk_router(args, hidden_size: int, num_layers: int, device):
     checkpoint = torch.load(args.risk_router_ckpt, map_location="cpu")
     state = checkpoint.get("model_state_dict", checkpoint)
     metadata = dict(checkpoint.get("metadata") or {})
-    router = OpalRiskRouter(hidden_size=hidden_size, num_layers=num_layers)
+    state_size = int(metadata.get("state_size") or metadata.get("hidden_size") or hidden_size)
+    router_input = str(metadata.get("router_input") or "")
+    router_architecture = str(metadata.get("router_architecture") or "")
+    if router_input == "prefix_hk_raw_attn" or router_architecture == "layer_query_cross_attention":
+        router = LayerQueryCrossAttentionRiskRouter(
+            base_hidden_size=int(metadata.get("base_hidden_size") or hidden_size),
+            num_layers=num_layers,
+            router_dim=int(metadata.get("router_dim") or 256),
+            router_heads=int(metadata.get("router_heads") or 4),
+        )
+    else:
+        router = OpalRiskRouter(hidden_size=state_size, num_layers=num_layers)
     router.load_state_dict(state)
     router.to(device).eval()
-    router_input = str(metadata.get("router_input") or "")
-    if args.method == "opal_risk" and router_input != "prefix_hk":
-        raise ValueError(f"--method opal_risk requires a prefix_hk risk router, got {router_input!r}")
+    if args.method == "opal_risk" and router_input not in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"}:
+        raise ValueError(f"--method opal_risk requires a prefix_hk/fusion risk router, got {router_input!r}")
     if args.method == "raw_input_risk" and router_input != "raw_embedding":
         raise ValueError(f"--method raw_input_risk requires a raw_embedding risk router, got {router_input!r}")
     if args.method == "opal_risk" and metadata.get("prompt_only_router_context") is not True:
@@ -330,11 +341,34 @@ def load_risk_router(args, hidden_size: int, num_layers: int, device):
     return router, metadata
 
 
+def gather_last_active_state(hidden_state, attention_mask):
+    rows = []
+    for hidden, mask in zip(hidden_state, attention_mask):
+        active = mask.ne(0).nonzero(as_tuple=False).flatten()
+        rows.append(hidden[active[-1]] if active.numel() > 0 else hidden[-1])
+    return torch.stack(rows, dim=0)
+
+
+def recency_weighted_state(hidden_state, attention_mask, recent_tokens: int, recent_decay: float):
+    recent_tokens = max(1, int(recent_tokens))
+    recent_decay = float(recent_decay)
+    rows = []
+    for hidden, mask in zip(hidden_state, attention_mask):
+        active = mask.ne(0).nonzero(as_tuple=False).flatten()
+        if active.numel() == 0:
+            rows.append(hidden[-1])
+        else:
+            recent = hidden.index_select(0, active[-recent_tokens:])
+            powers = torch.arange(recent.size(0) - 1, -1, -1, device=hidden.device, dtype=torch.float32)
+            weights = torch.pow(torch.tensor(recent_decay, device=hidden.device, dtype=torch.float32), powers)
+            weights = (weights / weights.sum().clamp_min(1e-12)).to(dtype=recent.dtype).unsqueeze(-1)
+            rows.append((recent * weights).sum(dim=0))
+    return torch.stack(rows, dim=0)
+
+
 def pool_request_state(last_hidden_state, attention_mask, pooling: str = "last"):
     if pooling == "last":
-        # MiniOneRec uses left padding for generation; the last active prompt token is
-        # therefore the final column for every non-empty row.
-        return last_hidden_state[:, -1, :]
+        return gather_last_active_state(last_hidden_state, attention_mask)
     if pooling == "mean":
         weights = attention_mask.to(dtype=last_hidden_state.dtype).unsqueeze(-1)
         return (last_hidden_state * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
@@ -497,11 +531,37 @@ def prefix_hidden_state(
     )[0]
 
 
-def raw_embedding_request_state(model, input_ids, attention_mask):
+def raw_embedding_hidden_state(model, input_ids):
     with torch.no_grad():
-        embeds = model.model.embed_tokens(input_ids)
-        weights = attention_mask.to(dtype=embeds.dtype).unsqueeze(-1)
-        return ((embeds * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)).float()
+        return model.model.embed_tokens(input_ids)
+
+
+def raw_embedding_request_state(model, input_ids, attention_mask):
+    embeds = raw_embedding_hidden_state(model, input_ids)
+    weights = attention_mask.to(dtype=embeds.dtype).unsqueeze(-1)
+    return ((embeds * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)).float()
+
+
+def fusion_request_state(model, input_ids, attention_mask, prefix_hidden, recent_tokens: int, recent_decay: float):
+    raw_hidden = raw_embedding_hidden_state(model, input_ids)
+    features = [
+        gather_last_active_state(raw_hidden, attention_mask),
+        recency_weighted_state(raw_hidden, attention_mask, recent_tokens, recent_decay),
+        gather_last_active_state(prefix_hidden, attention_mask),
+        recency_weighted_state(prefix_hidden, attention_mask, recent_tokens, recent_decay),
+    ]
+    return torch.cat(features, dim=-1).float()
+
+
+def last_fusion_request_state(model, input_ids, attention_mask, prefix_hidden):
+    raw_hidden = raw_embedding_hidden_state(model, input_ids)
+    return torch.cat(
+        [
+            gather_last_active_state(raw_hidden, attention_mask),
+            gather_last_active_state(prefix_hidden, attention_mask),
+        ],
+        dim=-1,
+    ).float()
 
 
 def risk_router_masks(
@@ -531,6 +591,71 @@ def risk_router_masks(
             is_warmup=is_warmup,
         )
         state = pool_request_state(prefix_hidden, attention_mask, pooling=risk_pooling).float()
+    elif router_input == "prefix_hk_raw_fusion":
+        recent_tokens = int(risk_router_metadata.get("recent_tokens") or args.recent_tokens)
+        recent_decay = float(risk_router_metadata.get("recent_decay") or args.recent_decay)
+        risk_pooling = str(
+            risk_router_metadata.get("risk_pooling")
+            or "raw_last+raw_recent_weighted+hk_last+hk_recent_weighted"
+        )
+        prefix_hidden = prefix_hidden_state(
+            args,
+            model,
+            input_ids,
+            attention_mask,
+            num_layers,
+            component_timer,
+            is_warmup=is_warmup,
+        )
+        state, _ = component_timer.measure(
+            "router_input",
+            lambda: fusion_request_state(model, input_ids, attention_mask, prefix_hidden, recent_tokens, recent_decay),
+            samples=input_ids.size(0),
+            metadata={
+                "router_input": "prefix_hk_raw_fusion",
+                "recent_tokens": recent_tokens,
+                "recent_decay": recent_decay,
+                "warmup": bool(is_warmup),
+            },
+        )
+    elif router_input == "prefix_hk_raw_last":
+        risk_pooling = str(risk_router_metadata.get("risk_pooling") or "raw_last+hk_last")
+        prefix_hidden = prefix_hidden_state(
+            args,
+            model,
+            input_ids,
+            attention_mask,
+            num_layers,
+            component_timer,
+            is_warmup=is_warmup,
+        )
+        state, _ = component_timer.measure(
+            "router_input",
+            lambda: last_fusion_request_state(model, input_ids, attention_mask, prefix_hidden),
+            samples=input_ids.size(0),
+            metadata={"router_input": "prefix_hk_raw_last", "warmup": bool(is_warmup)},
+        )
+    elif router_input == "prefix_hk_raw_attn":
+        risk_pooling = str(risk_router_metadata.get("risk_pooling") or "layer_query_cross_attention")
+        prefix_hidden = prefix_hidden_state(
+            args,
+            model,
+            input_ids,
+            attention_mask,
+            num_layers,
+            component_timer,
+            is_warmup=is_warmup,
+        )
+        state, _ = component_timer.measure(
+            "router_input",
+            lambda: (raw_embedding_hidden_state(model, input_ids), prefix_hidden, attention_mask),
+            samples=input_ids.size(0),
+            metadata={
+                "router_input": "prefix_hk_raw_attn",
+                "router_architecture": "layer_query_cross_attention",
+                "warmup": bool(is_warmup),
+            },
+        )
     elif router_input == "raw_embedding":
         risk_pooling = "mean"
         state, _ = component_timer.measure(
@@ -544,6 +669,8 @@ def risk_router_masks(
 
     def run_router():
         with torch.no_grad():
+            if isinstance(state, tuple):
+                return risk_router(*state).detach().float()
             return risk_router(state).detach().float()
 
     pred_risk, _ = component_timer.measure(
@@ -563,7 +690,13 @@ def risk_router_masks(
                 "method": args.method,
                 "router_input": router_input,
                 "risk_pooling": risk_pooling,
-                "prefix_depth": int(args.prefix_depth) if router_input == "prefix_hk" else 0,
+                "router_features": risk_router_metadata.get("router_features"),
+                "router_architecture": risk_router_metadata.get("router_architecture"),
+                "router_dim": risk_router_metadata.get("router_dim"),
+                "router_heads": risk_router_metadata.get("router_heads"),
+                "recent_tokens": risk_router_metadata.get("recent_tokens"),
+                "recent_decay": risk_router_metadata.get("recent_decay"),
+                "prefix_depth": int(args.prefix_depth) if router_input in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"} else 0,
                 "pred_risk": risk,
                 "skip_risk": risk,
                 "layer_scores": risk,
@@ -1510,6 +1643,7 @@ def import_runtime_dependencies():
     global OneLayerStudentModel
     global LayerRouter
     global OpalRiskRouter
+    global LayerQueryCrossAttentionRiskRouter
 
     import torch as torch_module
     from accelerate import Accelerator as AcceleratorCls
@@ -1524,7 +1658,10 @@ def import_runtime_dependencies():
     from LogitProcessor import ConstrainedLogitsProcessor as ConstrainedLogitsProcessorCls
     from data import EvalSidDataset as EvalSidDatasetCls
     from models.one_layer_student import OneLayerStudentModel as OneLayerStudentModelCls
-    from models.opal_risk_router import OpalRiskRouter as OpalRiskRouterCls
+    from models.opal_risk_router import (
+        LayerQueryCrossAttentionRiskRouter as LayerQueryCrossAttentionRiskRouterCls,
+        OpalRiskRouter as OpalRiskRouterCls,
+    )
     from models.router import LayerRouter as LayerRouterCls
 
     torch = torch_module
@@ -1539,6 +1676,7 @@ def import_runtime_dependencies():
     OneLayerStudentModel = OneLayerStudentModelCls
     LayerRouter = LayerRouterCls
     OpalRiskRouter = OpalRiskRouterCls
+    LayerQueryCrossAttentionRiskRouter = LayerQueryCrossAttentionRiskRouterCls
 
 
 def build_parser():
@@ -1567,6 +1705,8 @@ def build_parser():
     parser.add_argument("--policy_ckpt", default="")
     parser.add_argument("--risk_router_ckpt", default="")
     parser.add_argument("--risk_pooling", choices=["mean", "last"], default="mean")
+    parser.add_argument("--recent_tokens", type=int, default=32)
+    parser.add_argument("--recent_decay", type=float, default=0.85)
     parser.add_argument(
         "--allow_fallback_router",
         action="store_true",

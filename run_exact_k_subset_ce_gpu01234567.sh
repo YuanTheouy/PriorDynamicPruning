@@ -39,6 +39,7 @@ export TRAIN_BATCH_SIZE="${OPAL_TRAIN_BATCH_SIZE:-8}"
 export EVAL_BATCH_SIZE=1
 export EPOCHS="${OPAL_EPOCHS:-40}"
 export LR="${OPAL_LR:-1e-4}"
+export MAX_GRAD_NORM="${OPAL_MAX_GRAD_NORM:-1.0}"
 export ROUTER_DIM="${OPAL_ROUTER_DIM:-256}"
 export ROUTER_HEADS="${OPAL_ROUTER_HEADS:-4}"
 export PROTECTED_HEAD=4
@@ -114,6 +115,40 @@ final_json_exists() {
   test -s "${OUTPUT_DIR}/raw_json/${run_name}.json"
 }
 
+checkpoint_usable() {
+  local ckpt="$1"
+  local metrics
+  metrics="$(dirname "$ckpt")/training_metrics.json"
+  if [ ! -s "$ckpt" ]; then
+    return 1
+  fi
+  python3 - "$metrics" <<'PY'
+import json
+import math
+import os
+import sys
+
+path = sys.argv[1]
+if not os.path.exists(path):
+    sys.exit(0)
+
+def finite_tree(value):
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(finite_tree(v) for v in value.values())
+    if isinstance(value, list):
+        return all(finite_tree(v) for v in value)
+    return True
+
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if finite_tree(data) else 1)
+PY
+}
+
 if [ -s "$LABEL_FILE" ] && [ "$(wc -l < "$LABEL_FILE")" -ge "$LABEL_MAX_SAMPLES" ]; then
   echo "=== Reuse final-KL greedy labels: ${LABEL_FILE} ==="
 else
@@ -142,7 +177,7 @@ train_bce_router_if_needed() {
   local risk_pooling="${3:-mean}"
   local out_dir="${BCE_CKPT_ROOT}/${BCE_RUN_GROUP}/${variant}"
   local ckpt="${out_dir}/risk_router.pt"
-  if [ -s "$ckpt" ]; then
+  if checkpoint_usable "$ckpt"; then
     echo "=== Reuse BCE checkpoint: ${ckpt} ==="
     return
   fi
@@ -169,6 +204,7 @@ train_bce_router_if_needed() {
     --router_heads "$ROUTER_HEADS" \
     --output_dir "$out_dir" \
     --precision "$PRECISION" \
+    --max_grad_norm "$MAX_GRAD_NORM" \
     --loss_log_interval 10 \
     --seed "$SEED"
 }
@@ -179,7 +215,7 @@ train_exact_router_if_needed() {
   local risk_pooling="${3:-mean}"
   local out_dir="${EXACT_CKPT_ROOT}/${RUN_GROUP}/${variant}"
   local ckpt="${out_dir}/risk_router.pt"
-  if [ -s "$ckpt" ]; then
+  if checkpoint_usable "$ckpt"; then
     echo "=== Reuse exact-k CE checkpoint: ${ckpt} ==="
     return
   fi
@@ -206,6 +242,7 @@ train_exact_router_if_needed() {
     --router_heads "$ROUTER_HEADS" \
     --output_dir "$out_dir" \
     --precision "$PRECISION" \
+    --max_grad_norm "$MAX_GRAD_NORM" \
     --loss_log_interval 10 \
     --seed "$SEED"
 }

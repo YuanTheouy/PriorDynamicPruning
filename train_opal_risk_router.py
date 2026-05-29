@@ -347,6 +347,7 @@ def main():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--loss_log_interval", type=int, default=50)
+    parser.add_argument("--max_grad_norm", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -549,7 +550,24 @@ def main():
                 )
 
             optimizer.zero_grad()
+            if not torch.isfinite(loss.detach()):
+                pred_stats = pred.detach().float()
+                finite_pred = pred_stats[torch.isfinite(pred_stats)]
+                if finite_pred.numel() > 0:
+                    pred_min = float(finite_pred.min().item())
+                    pred_max = float(finite_pred.max().item())
+                else:
+                    pred_min = float("nan")
+                    pred_max = float("nan")
+                raise FloatingPointError(
+                    "Non-finite router loss before backward: "
+                    f"loss={float(loss.detach().float().item())} "
+                    f"router_input={args.router_input} set_loss_type={args.set_loss_type} "
+                    f"pred_min={pred_min} pred_max={pred_max}"
+                )
             accelerator.backward(loss)
+            if float(args.max_grad_norm) > 0:
+                accelerator.clip_grad_norm_(router.parameters(), float(args.max_grad_norm))
             optimizer.step()
 
             total_loss += float(loss.detach().float().item())

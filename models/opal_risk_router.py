@@ -200,6 +200,7 @@ def exact_k_subset_ce_loss(
     skip_mask: torch.Tensor,
     allowed_layers: list[int],
     skip_count: int,
+    score_clip: float = 50.0,
 ) -> torch.Tensor:
     """Cross entropy over all allowed cardinality-K skip subsets.
 
@@ -215,6 +216,8 @@ def exact_k_subset_ce_loss(
         raise ValueError(f"pred_risk must be [batch, layers], got {tuple(pred_risk.shape)}")
     if skip_mask.shape != pred_risk.shape:
         raise ValueError(f"skip_mask shape {tuple(skip_mask.shape)} does not match pred_risk {tuple(pred_risk.shape)}")
+    if not torch.isfinite(pred_risk).all():
+        raise ValueError("pred_risk contains NaN/Inf before exact_k_subset_ce_loss")
     if skip_count <= 0:
         return pred_risk.new_tensor(0.0)
     if not allowed_layers:
@@ -224,6 +227,8 @@ def exact_k_subset_ce_loss(
 
     allowed = torch.tensor(allowed_layers, dtype=torch.long, device=pred_risk.device)
     scores = -pred_risk.index_select(dim=1, index=allowed)
+    if score_clip and float(score_clip) > 0:
+        scores = scores.clamp(min=-float(score_clip), max=float(score_clip))
     target = skip_mask.index_select(dim=1, index=allowed)
     target_counts = target.sum(dim=1)
     if not torch.allclose(target_counts, torch.full_like(target_counts, float(skip_count))):
@@ -234,10 +239,14 @@ def exact_k_subset_ce_loss(
 
     losses = []
     for row_scores, row_target in zip(scores, target):
-        dp = [row_scores.new_tensor(0.0)] + [row_scores.new_full((), -float("inf")) for _ in range(skip_count)]
+        dp = [row_scores.new_tensor(0.0)] + [None for _ in range(skip_count)]
+        seen = 0
         for score in row_scores:
-            for j in range(skip_count, 0, -1):
-                dp[j] = torch.logaddexp(dp[j], dp[j - 1] + score)
+            upper = min(skip_count, seen + 1)
+            for j in range(upper, 0, -1):
+                include_score = dp[j - 1] + score
+                dp[j] = include_score if dp[j] is None else torch.logaddexp(dp[j], include_score)
+            seen += 1
         teacher_score = row_scores[row_target > 0.5].sum()
         losses.append(dp[skip_count] - teacher_score)
     return torch.stack(losses).mean()

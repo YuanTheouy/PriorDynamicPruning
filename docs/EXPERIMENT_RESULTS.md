@@ -417,3 +417,71 @@ Before scaling to m5000/full, inspect greedy-label mask diversity and layer
 frequency. If labels are diverse but the router still collapses, change the
 loss rather than the architecture.
 ```
+
+### Greedy Set Train-Label Overlap Diagnostic
+
+Purpose:
+
+```text
+BCE training loss can improve without producing the same top-7 mask used at
+inference. After m2000, prefix_hk_raw_attn has lower BCE loss than raw_input,
+but raw_input has slightly better eval KL. This suggests a remaining gap
+between the BCE membership objective and the final top-7 mask objective.
+```
+
+Diagnostic:
+
+```text
+For each greedy-set training label:
+  router predicts per-layer risk once
+  predicted skipped set = 7 lowest-risk layers
+  compare predicted skipped set with greedy skip_mask
+
+Report:
+  exact_match_rate
+  overlap@7
+  hamming distance
+  pairwise order accuracy between labeled skipped and kept layers
+  unique predicted masks
+```
+
+Server command:
+
+```bash
+cd /workspace/PriorDynamicPruning
+git fetch origin codex/opal-llm-experiments
+git pull --ff-only origin codex/opal-llm-experiments
+git rev-parse --short HEAD
+
+OPAL_LABEL_MAX_SAMPLES=2000 \
+bash ./run_final_kl_greedy_set_overlap_diagnostic_gpu01234567.sh 2>&1 | tee /tmp/final_kl_greedy_set_overlap_m2000_seed42_gpu01234567.log
+```
+
+Inspect compact summary:
+
+```bash
+cd /workspace/PriorDynamicPruning
+
+export DIAG_DIR=/workspace/PriorDynamicPruning/results/opal_greedy_set_diagnostics
+export RUN_GROUP=final_kl_greedy_set_m2000_seed42
+
+python3 - <<'PY'
+import json, os
+for variant in ["raw_input_risk", "prefix_hk_raw_attn"]:
+    path = f"{os.environ['DIAG_DIR']}/{os.environ['RUN_GROUP']}_{variant}_train_overlap.summary.json"
+    s = json.load(open(path))
+    print("\n===", variant, "===")
+    for key in [
+        "num_samples",
+        "exact_match_rate",
+        "mean_overlap_ratio",
+        "mean_overlap_count",
+        "mean_hamming_count",
+        "mean_pairwise_order_accuracy",
+        "mean_keep_minus_skip_risk_margin",
+        "unique_predicted_masks",
+        "unique_label_masks",
+    ]:
+        print(key, s.get(key))
+PY
+```

@@ -418,6 +418,41 @@ frequency. If labels are diverse but the router still collapses, change the
 loss rather than the architecture.
 ```
 
+### m2000 Heldout Eval
+
+Setting:
+
+```text
+dataset: Office_Products
+seed: 42
+label samples: m2000
+skip_rate: 0.25
+protected_head: 4
+protected_tail: 2
+objective: final_KL greedy set supervision
+loss: BCEWithLogits(-pred_risk, greedy_skip_mask)
+```
+
+Result:
+
+| method | NDCG@10 | retention | Delta_NLL | Delta_PPL | KL_full_to_skip | unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| prefix_hk_raw_attn | 0.1161 | 0.8376 | 0.471371 | 19.105898 | 1.048630 | 62 |
+| raw_input_risk | 0.1142 | 0.8238 | 0.290139 | 10.679864 | 1.022843 | 19 |
+
+Interpretation:
+
+```text
+Increasing greedy-set labels from m500 to m2000 restores dynamic behavior for
+prefix_hk_raw_attn: unique_masks increases from 1 to 62. The attention router
+also improves NDCG@10 / retention and is more dynamic than raw_input_risk.
+
+However, raw_input_risk is still slightly better on the primary heldout KL
+metric and on Delta_NLL / Delta_PPL. This motivates checking train-label
+overlap and then strengthening the loss toward top-7 ranking rather than only
+independent BCE membership.
+```
+
 ### Greedy Set Train-Label Overlap Diagnostic
 
 Purpose:

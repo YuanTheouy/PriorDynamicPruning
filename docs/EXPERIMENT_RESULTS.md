@@ -278,3 +278,66 @@ Result status:
 Pending server run. Fill this section after the m500 greedy-set experiment
 produces raw_input_risk and prefix_hk_raw_attn eval JSON files.
 ```
+
+### Two-Step Greedy/Router Diagnostic
+
+Purpose:
+
+```text
+Before paying the full 7-layer greedy-label cost, test whether the router's
+top-ranked layers already diverge from true final-KL greedy choices in the
+first two steps.
+```
+
+Diagnostic:
+
+```text
+step 1:
+  i* = argmin_i KL(full || skip {i})
+  compare i* with router top1
+
+step 2:
+  j* = argmin_j KL(full || skip {i*, j})
+  compare j* with the router's best remaining layer after i*
+  also check whether {i*, j*} is contained in router top7
+```
+
+This does not choose all 7 skipped layers and does not train a new router. It
+only probes whether combination / conditional effects are strong enough to
+justify full greedy set supervision.
+
+Server command:
+
+```bash
+cd /workspace/PriorDynamicPruning
+git fetch origin codex/opal-llm-experiments
+git pull --ff-only origin codex/opal-llm-experiments
+git rev-parse --short HEAD
+
+bash ./run_final_kl_greedy_twostep_diagnostic_gpu01234567.sh 2>&1 | tee /tmp/final_kl_greedy_twostep_diag_m500_seed42_gpu01234567.log
+```
+
+Faster smoke:
+
+```bash
+OPAL_DIAG_MAX_SAMPLES=100 \
+bash ./run_final_kl_greedy_twostep_diagnostic_gpu01234567.sh 2>&1 | tee /tmp/final_kl_greedy_twostep_diag_m100_seed42_gpu01234567.log
+```
+
+Outputs:
+
+```text
+/workspace/PriorDynamicPruning/results/opal_greedy_diagnostics/
+  final_kl_greedy_twostep_diag_m500_seed42_raw_input_risk.summary.json
+  final_kl_greedy_twostep_diag_m500_seed42_prefix_hk_raw_attn.summary.json
+```
+
+Key summary fields:
+
+| field | meaning |
+|---|---|
+| `top1_match_rate` | router top1 equals `argmin_i KL({i})` |
+| `conditional_step2_match_rate` | after greedy step1, router's best remaining layer equals `argmin_j KL({i*,j})` |
+| `both_greedy_first2_in_router_top7_rate` | true greedy first two layers are both inside router top7 |
+| `mean_step1_kl_gap_router_top1_minus_greedy` | KL penalty from using router top1 instead of greedy step1 |
+| `mean_step2_kl_gap_router_conditional_minus_greedy` | KL penalty from using router conditional top2 instead of greedy step2 |

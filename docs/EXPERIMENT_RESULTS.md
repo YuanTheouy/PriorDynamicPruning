@@ -354,3 +354,32 @@ Key summary fields:
 | `both_greedy_first2_in_router_top7_rate` | true greedy first two layers are both inside router top7 |
 | `mean_step1_kl_gap_router_top1_minus_greedy` | KL penalty from using router top1 instead of greedy step1 |
 | `mean_step2_kl_gap_router_conditional_minus_greedy` | KL penalty from using router conditional top2 instead of greedy step2 |
+
+Result:
+
+| method | top1 match | conditional step2 match | greedy first2 in router top7 | step1 KL gap | step2 KL gap | router top1 true KL rank |
+|---|---:|---:|---:|---:|---:|---:|
+| raw_input_risk | 0.0060 | 0.0139 | 0.0198 | 0.2584 | 0.2541 | 13.97 |
+| prefix_hk_raw_attn | 0.0060 | 0.0119 | 0.0615 | 0.2655 | 0.2692 | 14.24 |
+
+Interpretation:
+
+```text
+The current one-layer-drop router ranking is badly misaligned with true
+final-KL greedy decisions. Router top1 almost never equals the true best
+single skipped layer, and the second conditional greedy choice is also almost
+never the router's next preferred layer.
+
+This supports the hypothesis that prefix_hk_raw_attn can fit one-layer labels
+well while still evaluating unstably, because the one-layer proxy objective is
+not aligned with the final skip-7 objective.
+```
+
+Next action:
+
+```text
+Run final-KL greedy set supervision with more labels, starting from m2000.
+Before scaling to m5000/full, inspect greedy-label mask diversity and layer
+frequency. If labels are diverse but the router still collapses, change the
+loss rather than the architecture.
+```

@@ -31,7 +31,7 @@ export SKIP_RATE=0.25
 export TOP_K_LAYERS=21
 export TOP_K_ITEMS=50
 export MAX_NEW_TOKENS=256
-export LABEL_MAX_SAMPLES=500
+export LABEL_MAX_SAMPLES="${OPAL_LABEL_MAX_SAMPLES:-500}"
 export LABEL_BATCH_SIZE=1
 export TRAIN_BATCH_SIZE="${OPAL_TRAIN_BATCH_SIZE:-8}"
 export EVAL_BATCH_SIZE=1
@@ -44,8 +44,8 @@ export PROTECTED_TAIL=2
 export WARMUP_BATCHES=0
 export TIMED_BATCHES=0
 export EVAL_MAX_BATCHES="${OPAL_EVAL_MAX_BATCHES:-500}"
-export RUN_GROUP=final_kl_greedy_set_m500_seed42
-export SUMMARY_TABLE=summary_final_kl_greedy_set_m500_seed42.csv
+export RUN_GROUP="final_kl_greedy_set_m${LABEL_MAX_SAMPLES}_seed${SEED}"
+export SUMMARY_TABLE="summary_${RUN_GROUP}.csv"
 export LABEL_FILE="${LABEL_DIR}/${CATEGORY}_final_KL_greedy_set_m${LABEL_MAX_SAMPLES}_seed${SEED}_head${PROTECTED_HEAD}_tail${PROTECTED_TAIL}.jsonl"
 
 cd "$REPO_DIR"

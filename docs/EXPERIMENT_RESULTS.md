@@ -292,6 +292,40 @@ so the result is not yet evidence for a strong dynamic OPAL router. The next
 check should inspect greedy-label mask diversity and BCE training metrics.
 ```
 
+Greedy label diversity check:
+
+```text
+rows: 504
+unique_greedy_masks: 495
+most common exact mask frequency: 3 / 504 = 0.006
+```
+
+Top layer marginals:
+
+| layer | frequency |
+|---:|---:|
+| 10 | 0.800 |
+| 4 | 0.712 |
+| 9 | 0.675 |
+| 5 | 0.617 |
+| 12 | 0.587 |
+| 6 | 0.472 |
+| 16 | 0.454 |
+| 20 | 0.387 |
+| 11 | 0.385 |
+| 15 | 0.331 |
+
+Interpretation:
+
+```text
+The final-KL greedy oracle itself is highly dynamic at the exact-mask level:
+495 unique masks across 504 examples. Therefore prefix_hk_raw_attn collapsing
+to unique_masks=1 is not caused by static greedy labels. The more likely cause
+is that pure BCE skip-set supervision first learns the strong layer marginal
+prior, and the m500 sample size / current loss does not force enough
+input-conditional ranking among layers.
+```
+
 ### Two-Step Greedy/Router Diagnostic
 
 Purpose:

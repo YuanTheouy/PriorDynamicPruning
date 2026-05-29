@@ -272,11 +272,24 @@ python3 summarize_planrec_results.py \
 cat "$OUTPUT_DIR/tables/quality_retention.md"
 ```
 
-Result status:
+Result:
+
+| method | NDCG@10 | retention | Delta_NLL | Delta_PPL | KL_full_to_skip | unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| prefix_hk_raw_attn | 0.1087 | 0.7840 | 0.6868 | 31.3273 | 1.1502 | 1 |
+| raw_input_risk | 0.1069 | 0.7713 | 1.0075 | 55.1635 | 1.2333 | 6 |
+
+Interpretation:
 
 ```text
-Pending server run. Fill this section after the m500 greedy-set experiment
-produces raw_input_risk and prefix_hk_raw_attn eval JSON files.
+Final-KL greedy set supervision improves prefix_hk_raw_attn over raw_input_risk
+on the intended KL metric, and also improves Delta_NLL / Delta_PPL / NDCG in
+this m500 seed42 run.
+
+However, prefix_hk_raw_attn collapsed to unique_masks=1. This means the learned
+attention router behaves like a static mask under this BCE skip-set objective,
+so the result is not yet evidence for a strong dynamic OPAL router. The next
+check should inspect greedy-label mask diversity and BCE training metrics.
 ```
 
 ### Two-Step Greedy/Router Diagnostic

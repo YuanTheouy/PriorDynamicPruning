@@ -80,11 +80,15 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
         router_dim: int = 256,
         router_heads: int = 4,
         dropout: float = 0.0,
+        use_hk_last_residual: bool = False,
+        use_raw_last_residual: bool = False,
     ):
         super().__init__()
         self.num_layers = int(num_layers)
         self.router_dim = int(router_dim)
         self.router_heads = int(router_heads)
+        self.use_hk_last_residual = bool(use_hk_last_residual)
+        self.use_raw_last_residual = bool(use_raw_last_residual)
         if self.router_dim <= 0:
             raise ValueError("router_dim must be positive")
         if self.router_heads <= 0 or self.router_dim % self.router_heads != 0:
@@ -112,6 +116,30 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
             nn.Dropout(float(dropout)),
             nn.Linear(self.router_dim, 1),
         )
+        if self.use_hk_last_residual:
+            self.hk_last_head = OpalRiskRouter(
+                hidden_size=int(base_hidden_size),
+                num_layers=self.num_layers,
+                dropout=dropout,
+            )
+        else:
+            self.hk_last_head = None
+        if self.use_raw_last_residual:
+            self.raw_last_head = OpalRiskRouter(
+                hidden_size=int(base_hidden_size),
+                num_layers=self.num_layers,
+                dropout=dropout,
+            )
+        else:
+            self.raw_last_head = None
+
+    @staticmethod
+    def _last_active_state(seq: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        rows = []
+        for hidden, mask in zip(seq, attention_mask):
+            active = mask.ne(0).nonzero(as_tuple=False).flatten()
+            rows.append(hidden[active[-1]] if active.numel() > 0 else hidden[-1])
+        return torch.stack(rows, dim=0)
 
     def forward(
         self,
@@ -132,7 +160,12 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        return self.risk_head(context).squeeze(-1).float()
+        risk = self.risk_head(context).squeeze(-1).float()
+        if self.hk_last_head is not None:
+            risk = risk + self.hk_last_head(self._last_active_state(hk_seq, attention_mask))
+        if self.raw_last_head is not None:
+            risk = risk + self.raw_last_head(self._last_active_state(raw_seq, attention_mask))
+        return risk.float()
 
 
 def risk_regression_loss(pred_risk: torch.Tensor, target_risk: torch.Tensor, beta: float = 1.0) -> torch.Tensor:

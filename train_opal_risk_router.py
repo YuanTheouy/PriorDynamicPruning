@@ -35,7 +35,11 @@ CATEGORY_LABELS = {
     "Sports": "sports and outdoors",
     "Books": "books",
 }
-ATTENTION_ROUTER_INPUTS = {"prefix_hk_raw_attn"}
+ATTENTION_ROUTER_INPUTS = {
+    "prefix_hk_raw_attn",
+    "prefix_hk_raw_attn_hk_last_resid",
+    "prefix_hk_raw_attn_raw_hk_last_resid",
+}
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -209,13 +213,13 @@ def router_state_size(hidden_size: int, router_input: str) -> int:
 
 
 def router_prefix_depth(router_input: str, prefix_depth: int) -> int:
-    return int(prefix_depth) if router_input in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"} else 0
+    return int(prefix_depth) if router_input in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last"} or router_input in ATTENTION_ROUTER_INPUTS else 0
 
 
 def router_pooling_metadata(router_input: str, risk_pooling: str) -> str:
     if router_input == "prefix_hk":
         return risk_pooling
-    if router_input == "prefix_hk_raw_attn":
+    if router_input in ATTENTION_ROUTER_INPUTS:
         return "layer_query_cross_attention"
     if router_input == "prefix_hk_raw_fusion":
         return "raw_last+raw_recent_weighted+hk_last+hk_recent_weighted"
@@ -225,8 +229,13 @@ def router_pooling_metadata(router_input: str, risk_pooling: str) -> str:
 
 
 def router_features_metadata(router_input: str):
-    if router_input == "prefix_hk_raw_attn":
-        return ["raw_token_sequence", "hk_token_sequence", "attention_mask", "layer_queries"]
+    if router_input in ATTENTION_ROUTER_INPUTS:
+        features = ["raw_token_sequence", "hk_token_sequence", "attention_mask", "layer_queries"]
+        if router_input in {"prefix_hk_raw_attn_hk_last_resid", "prefix_hk_raw_attn_raw_hk_last_resid"}:
+            features.append("hk_last_residual")
+        if router_input == "prefix_hk_raw_attn_raw_hk_last_resid":
+            features.append("raw_last_residual")
+        return features
     if router_input == "prefix_hk_raw_fusion":
         return ["raw_last", "raw_recent_weighted", "hk_last", "hk_recent_weighted"]
     if router_input == "prefix_hk_raw_last":
@@ -284,7 +293,15 @@ def main():
     parser.add_argument("--risk_label_file", required=True)
     parser.add_argument(
         "--router_input",
-        choices=["prefix_hk", "raw_embedding", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"],
+        choices=[
+            "prefix_hk",
+            "raw_embedding",
+            "prefix_hk_raw_fusion",
+            "prefix_hk_raw_last",
+            "prefix_hk_raw_attn",
+            "prefix_hk_raw_attn_hk_last_resid",
+            "prefix_hk_raw_attn_raw_hk_last_resid",
+        ],
         default="prefix_hk",
     )
     parser.add_argument("--prefix_depth", type=int, default=4)
@@ -361,6 +378,11 @@ def main():
             router_dim=args.router_dim,
             router_heads=args.router_heads,
             dropout=args.dropout,
+            use_hk_last_residual=args.router_input in {
+                "prefix_hk_raw_attn_hk_last_resid",
+                "prefix_hk_raw_attn_raw_hk_last_resid",
+            },
+            use_raw_last_residual=args.router_input == "prefix_hk_raw_attn_raw_hk_last_resid",
         ).to(device)
         router_architecture = "layer_query_cross_attention"
     else:
@@ -383,6 +405,11 @@ def main():
                     "router_architecture": router_architecture,
                     "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
                     "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+                    "use_hk_last_residual": args.router_input in {
+                        "prefix_hk_raw_attn_hk_last_resid",
+                        "prefix_hk_raw_attn_raw_hk_last_resid",
+                    },
+                    "use_raw_last_residual": args.router_input == "prefix_hk_raw_attn_raw_hk_last_resid",
                     "recent_tokens": int(args.recent_tokens),
                     "recent_decay": float(args.recent_decay),
                     "skip_count": skip_count,
@@ -445,7 +472,7 @@ def main():
                     args.prefix_depth,
                 )
                 pred = router(state)
-            elif args.router_input == "prefix_hk_raw_attn":
+            elif args.router_input in ATTENTION_ROUTER_INPUTS:
                 raw_hidden = raw_embedding_hidden_state(model, router_input_ids)
                 hk_hidden = teacher_prefix_hidden_state(
                     model,
@@ -520,6 +547,11 @@ def main():
             "router_architecture": router_architecture,
             "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
             "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+            "use_hk_last_residual": args.router_input in {
+                "prefix_hk_raw_attn_hk_last_resid",
+                "prefix_hk_raw_attn_raw_hk_last_resid",
+            },
+            "use_raw_last_residual": args.router_input == "prefix_hk_raw_attn_raw_hk_last_resid",
             "recent_tokens": int(args.recent_tokens),
             "recent_decay": float(args.recent_decay),
             "teacher_model": args.teacher_model,

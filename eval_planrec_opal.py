@@ -78,6 +78,11 @@ CATEGORY_LABELS = {
     "Books": "books",
 }
 FORMAL_ORACLE_METHODS = {"single_drop", "greedy"}
+ATTENTION_RISK_ROUTER_INPUTS = {
+    "prefix_hk_raw_attn",
+    "prefix_hk_raw_attn_hk_last_resid",
+    "prefix_hk_raw_attn_raw_hk_last_resid",
+}
 
 
 class IndexedDataset:
@@ -323,18 +328,20 @@ def load_risk_router(args, hidden_size: int, num_layers: int, device):
     state_size = int(metadata.get("state_size") or metadata.get("hidden_size") or hidden_size)
     router_input = str(metadata.get("router_input") or "")
     router_architecture = str(metadata.get("router_architecture") or "")
-    if router_input == "prefix_hk_raw_attn" or router_architecture == "layer_query_cross_attention":
+    if router_input in ATTENTION_RISK_ROUTER_INPUTS or router_architecture == "layer_query_cross_attention":
         router = LayerQueryCrossAttentionRiskRouter(
             base_hidden_size=int(metadata.get("base_hidden_size") or hidden_size),
             num_layers=num_layers,
             router_dim=int(metadata.get("router_dim") or 256),
             router_heads=int(metadata.get("router_heads") or 4),
+            use_hk_last_residual=bool(metadata.get("use_hk_last_residual")),
+            use_raw_last_residual=bool(metadata.get("use_raw_last_residual")),
         )
     else:
         router = OpalRiskRouter(hidden_size=state_size, num_layers=num_layers)
     router.load_state_dict(state)
     router.to(device).eval()
-    if args.method == "opal_risk" and router_input not in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"}:
+    if args.method == "opal_risk" and router_input not in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last"} and router_input not in ATTENTION_RISK_ROUTER_INPUTS:
         raise ValueError(f"--method opal_risk requires a prefix_hk/fusion risk router, got {router_input!r}")
     if args.method == "raw_input_risk" and router_input != "raw_embedding":
         raise ValueError(f"--method raw_input_risk requires a raw_embedding risk router, got {router_input!r}")
@@ -693,7 +700,7 @@ def risk_router_masks(
             samples=input_ids.size(0),
             metadata={"router_input": "prefix_hk_raw_last", "warmup": bool(is_warmup)},
         )
-    elif router_input == "prefix_hk_raw_attn":
+    elif router_input in ATTENTION_RISK_ROUTER_INPUTS:
         risk_pooling = str(risk_router_metadata.get("risk_pooling") or "layer_query_cross_attention")
         prefix_hidden = prefix_hidden_state(
             args,
@@ -709,8 +716,10 @@ def risk_router_masks(
             lambda: (raw_embedding_hidden_state(model, input_ids), prefix_hidden, attention_mask),
             samples=input_ids.size(0),
             metadata={
-                "router_input": "prefix_hk_raw_attn",
+                "router_input": router_input,
                 "router_architecture": "layer_query_cross_attention",
+                "use_hk_last_residual": risk_router_metadata.get("use_hk_last_residual"),
+                "use_raw_last_residual": risk_router_metadata.get("use_raw_last_residual"),
                 "warmup": bool(is_warmup),
             },
         )
@@ -752,9 +761,11 @@ def risk_router_masks(
                 "router_architecture": risk_router_metadata.get("router_architecture"),
                 "router_dim": risk_router_metadata.get("router_dim"),
                 "router_heads": risk_router_metadata.get("router_heads"),
+                "use_hk_last_residual": risk_router_metadata.get("use_hk_last_residual"),
+                "use_raw_last_residual": risk_router_metadata.get("use_raw_last_residual"),
                 "recent_tokens": risk_router_metadata.get("recent_tokens"),
                 "recent_decay": risk_router_metadata.get("recent_decay"),
-                "prefix_depth": int(args.prefix_depth) if router_input in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last", "prefix_hk_raw_attn"} else 0,
+                "prefix_depth": int(args.prefix_depth) if router_input in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last"} or router_input in ATTENTION_RISK_ROUTER_INPUTS else 0,
                 "pred_risk": risk,
                 "skip_risk": risk,
                 "layer_scores": risk,

@@ -45,8 +45,10 @@ from opal_llm.mask_library import (
 )
 from opal_llm.mask_utils import (
     actual_skip_rate,
+    allowed_layers_from_protected,
     keep_count_from_skip_rate,
     mask_from_skip_risk,
+    mask_from_skip_risk_allowed,
     repair_structure_constraints,
 )
 from opal_llm.oracle_masks import load_oracle_cache, oracle_eval_fields, validate_formal_oracle_cache
@@ -748,7 +750,20 @@ def risk_router_masks(
     )
     keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
     risk_rows = pred_risk.cpu().tolist()
-    masks = [mask_from_skip_risk(row, keep_count=keep_count) for row in risk_rows]
+    allowed_layers = risk_router_metadata.get("allowed_layers")
+    if not allowed_layers and (
+        risk_router_metadata.get("protected_head") is not None
+        or risk_router_metadata.get("protected_tail") is not None
+    ):
+        allowed_layers = allowed_layers_from_protected(
+            num_layers,
+            risk_router_metadata.get("protected_head"),
+            risk_router_metadata.get("protected_tail"),
+        )
+    masks = [
+        mask_from_skip_risk_allowed(row, keep_count=keep_count, allowed_layers=allowed_layers)
+        for row in risk_rows
+    ]
     mask_ids = [mask_id_from_mask(mask, prefix=args.method) for mask in masks]
     row_metadata = []
     for risk, mask in zip(risk_rows, masks):
@@ -773,6 +788,9 @@ def risk_router_masks(
                 "kept_layer_count": sum(int(v) for v in mask),
                 "skip_rate": actual_skip_rate(mask),
                 "risk_objective": risk_router_metadata.get("risk_objective"),
+                "protected_head": risk_router_metadata.get("protected_head"),
+                "protected_tail": risk_router_metadata.get("protected_tail"),
+                "allowed_layers": allowed_layers,
             }
         )
     return masks, mask_ids, risk_rows, row_metadata

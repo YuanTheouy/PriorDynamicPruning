@@ -193,3 +193,51 @@ def risk_skip_set_loss(pred_risk: torch.Tensor, target_risk: torch.Tensor, skip_
     skip_indices = torch.topk(target_risk.float(), k=skip_count, dim=-1, largest=False).indices
     skip_targets.scatter_(dim=-1, index=skip_indices, value=1.0)
     return F.binary_cross_entropy_with_logits(-pred_risk.float(), skip_targets)
+
+
+def exact_k_subset_ce_loss(
+    pred_risk: torch.Tensor,
+    skip_mask: torch.Tensor,
+    allowed_layers: list[int],
+    skip_count: int,
+) -> torch.Tensor:
+    """Cross entropy over all allowed cardinality-K skip subsets.
+
+    `pred_risk` is lower-is-better-to-skip, so the subset score uses
+    `score = -pred_risk`. The partition function is computed with log-space DP
+    instead of enumerating all C(N, K) subsets.
+    """
+    pred_risk = pred_risk.float()
+    skip_mask = skip_mask.float()
+    allowed_layers = [int(idx) for idx in allowed_layers]
+    skip_count = int(skip_count)
+    if pred_risk.dim() != 2:
+        raise ValueError(f"pred_risk must be [batch, layers], got {tuple(pred_risk.shape)}")
+    if skip_mask.shape != pred_risk.shape:
+        raise ValueError(f"skip_mask shape {tuple(skip_mask.shape)} does not match pred_risk {tuple(pred_risk.shape)}")
+    if skip_count <= 0:
+        return pred_risk.new_tensor(0.0)
+    if not allowed_layers:
+        raise ValueError("allowed_layers must be non-empty for exact_k_subset_ce_loss")
+    if skip_count > len(allowed_layers):
+        raise ValueError(f"skip_count={skip_count} exceeds allowed layer count={len(allowed_layers)}")
+
+    allowed = torch.tensor(allowed_layers, dtype=torch.long, device=pred_risk.device)
+    scores = -pred_risk.index_select(dim=1, index=allowed)
+    target = skip_mask.index_select(dim=1, index=allowed)
+    target_counts = target.sum(dim=1)
+    if not torch.allclose(target_counts, torch.full_like(target_counts, float(skip_count))):
+        raise ValueError(
+            "Each skip_mask row must contain exactly skip_count skipped layers inside allowed_layers; "
+            f"got counts={target_counts.detach().cpu().tolist()} skip_count={skip_count}"
+        )
+
+    losses = []
+    for row_scores, row_target in zip(scores, target):
+        dp = [row_scores.new_tensor(0.0)] + [row_scores.new_full((), -float("inf")) for _ in range(skip_count)]
+        for score in row_scores:
+            for j in range(skip_count, 0, -1):
+                dp[j] = torch.logaddexp(dp[j], dp[j - 1] + score)
+        teacher_score = row_scores[row_target > 0.5].sum()
+        losses.append(dp[skip_count] - teacher_score)
+    return torch.stack(losses).mean()

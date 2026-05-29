@@ -22,11 +22,12 @@ from data import EvalSidDataset
 from models.opal_risk_router import (
     LayerQueryCrossAttentionRiskRouter,
     OpalRiskRouter,
+    exact_k_subset_ce_loss,
     risk_pairwise_ranking_loss,
     risk_regression_loss,
     risk_skip_set_loss,
 )
-from opal_llm.mask_utils import keep_count_from_skip_rate
+from opal_llm.mask_utils import allowed_layers_from_protected, keep_count_from_skip_rate
 
 
 CATEGORY_LABELS = {
@@ -288,13 +289,19 @@ def load_supervision_labels(path: str):
             elif supervision_type != row_type:
                 raise ValueError(f"Mixed supervision label types in {path}: {supervision_type} and {row_type}")
             metadata.setdefault("supervision_type", row.get("supervision_type") or row_type)
-            metadata.setdefault("objective", row.get("objective"))
-            metadata.setdefault("num_layers", row.get("num_layers"))
-            metadata.setdefault("prefix_depth", row.get("prefix_depth"))
-            metadata.setdefault("search", row.get("search"))
-            metadata.setdefault("protected_head", row.get("protected_head"))
-            metadata.setdefault("protected_tail", row.get("protected_tail"))
-            metadata.setdefault("skip_count", row.get("skip_count"))
+            for key in [
+                "objective",
+                "num_layers",
+                "prefix_depth",
+                "search",
+                "protected_head",
+                "protected_tail",
+                "skip_count",
+                "allowed_layers",
+            ]:
+                value = row.get(key)
+                if value is not None and metadata.get(key) is None:
+                    metadata[key] = value
     if not labels:
         raise ValueError(f"No supervision labels found in {path}")
     metadata["supervision_type"] = supervision_type or metadata.get("supervision_type") or "risk_regression"
@@ -332,6 +339,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--ranking_loss_weight", type=float, default=0.0)
     parser.add_argument("--skip_set_loss_weight", type=float, default=0.0)
+    parser.add_argument("--set_loss_type", choices=["bce", "exact_k_ce"], default="bce")
     parser.add_argument("--skip_rate", type=float, default=-1.0)
     parser.add_argument("--top_k_layers", type=int, default=0)
     parser.add_argument("--huber_beta", type=float, default=1.0)
@@ -389,6 +397,13 @@ def main():
         args.top_k_layers if args.top_k_layers > 0 else num_layers,
     )
     skip_count = num_layers - keep_count
+    protected_head = label_metadata.get("protected_head")
+    protected_tail = label_metadata.get("protected_tail")
+    allowed_layers = label_metadata.get("allowed_layers")
+    if not allowed_layers and (protected_head is not None or protected_tail is not None):
+        allowed_layers = allowed_layers_from_protected(num_layers, protected_head, protected_tail)
+    if not allowed_layers:
+        allowed_layers = list(range(num_layers))
     if args.router_input in ATTENTION_ROUTER_INPUTS:
         router = LayerQueryCrossAttentionRiskRouter(
             base_hidden_size=hidden_size,
@@ -432,9 +447,11 @@ def main():
                     "recent_decay": float(args.recent_decay),
                     "skip_count": skip_count,
                     "supervision_type": supervision_type,
+                    "set_loss_type": args.set_loss_type if supervision_type == "skip_set" else None,
                     "label_search": label_metadata.get("search"),
                     "protected_head": label_metadata.get("protected_head"),
                     "protected_tail": label_metadata.get("protected_tail"),
+                    "allowed_layers": allowed_layers,
                     "risk_label_rows": len(risk_labels),
                     "covered_rows": len(covered_indices),
                     "device": str(device),
@@ -511,7 +528,15 @@ def main():
             if supervision_type == "skip_set":
                 regression = pred.new_tensor(0.0)
                 ranking = pred.new_tensor(0.0)
-                skip_set = F.binary_cross_entropy_with_logits(-pred.float(), target.float())
+                if args.set_loss_type == "exact_k_ce":
+                    skip_set = exact_k_subset_ce_loss(
+                        pred,
+                        target,
+                        allowed_layers=allowed_layers,
+                        skip_count=int(label_metadata.get("skip_count") or skip_count),
+                    )
+                else:
+                    skip_set = F.binary_cross_entropy_with_logits(-pred.float(), target.float())
                 loss = skip_set
             else:
                 regression = risk_regression_loss(pred, target, beta=args.huber_beta)
@@ -593,8 +618,10 @@ def main():
             "label_search": label_metadata.get("search"),
             "protected_head": label_metadata.get("protected_head"),
             "protected_tail": label_metadata.get("protected_tail"),
+            "allowed_layers": allowed_layers,
             "ranking_loss_weight": float(args.ranking_loss_weight),
             "skip_set_loss_weight": float(args.skip_set_loss_weight),
+            "set_loss_type": args.set_loss_type if supervision_type == "skip_set" else None,
             "skip_rate": float(args.skip_rate),
             "top_k_layers": int(args.top_k_layers),
             "skip_count": int(skip_count),

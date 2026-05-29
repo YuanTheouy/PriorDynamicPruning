@@ -541,3 +541,150 @@ remaining gap between train greedy-set fitting and heldout final-KL robustness.
 The next loss should directly strengthen top-7 ranking, e.g. BCE plus
 within-sample pairwise set-ranking loss.
 ```
+
+## 2026-05-29 Exact K-Subset CE
+
+Purpose:
+
+```text
+Replace independent BCE skip-set membership supervision with an exact
+cardinality-K subset cross entropy. The router still outputs per-layer risk
+once, and inference still skips the 7 lowest-risk allowed layers.
+```
+
+Loss:
+
+```text
+score_l = -pred_risk_l
+F(S) = sum_{l in S} score_l
+Loss = -F(S*) + log sum_{|T|=K, T subset allowed_layers} exp(F(T))
+```
+
+The normalizer is computed by log-space DP, not by enumerating all masks.
+
+Fixed setting:
+
+```text
+dataset: Office_Products
+seed: 42
+label samples: m2000
+skip_rate: 0.25
+protected_head: 4
+protected_tail: 2
+allowed layers: [4, ..., 25]
+K: 7
+teacher labels: final-KL forward-greedy skip sets
+```
+
+First-round comparison:
+
+| router | label | loss |
+|---|---|---|
+| raw_input_risk | final-KL greedy set m2000 | BCE baseline |
+| prefix_hk_raw_attn | final-KL greedy set m2000 | BCE baseline |
+| raw_input_risk | final-KL greedy set m2000 | Exact K-subset CE |
+| prefix_hk_last | final-KL greedy set m2000 | Exact K-subset CE |
+| prefix_hk_raw_attn | final-KL greedy set m2000 | Exact K-subset CE |
+
+Result table to fill after server run:
+
+| method | label_type | loss_type | label_samples | skip_rate | protected_head | protected_tail | train_loss | Delta_NLL | Delta_PPL | KL_full_to_skip | NDCG@10 | retention_NDCG@10 | unique_masks | avg_kept_layers |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| raw_input_risk | final-KL greedy set | BCE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
+| prefix_hk_raw_attn | final-KL greedy set | BCE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
+| raw_input_risk | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
+| prefix_hk_last | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
+| prefix_hk_raw_attn | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
+
+Server command:
+
+```bash
+cd /workspace/PriorDynamicPruning
+git fetch origin codex/opal-llm-experiments
+git pull --ff-only origin codex/opal-llm-experiments
+git rev-parse --short HEAD
+
+bash ./run_exact_k_subset_ce_gpu01234567.sh 2>&1 | tee /tmp/exact_k_subset_ce_m2000_seed42_gpu01234567.log
+```
+
+The runner reuses existing m2000 final-KL greedy labels and BCE checkpoints
+when present; otherwise it builds/trains the missing pieces before running the
+Exact K-subset CE variants.
+
+Inspect heldout eval:
+
+```bash
+cd /workspace/PriorDynamicPruning
+export OUTPUT_DIR=/workspace/PriorDynamicPruning/results/planrec_experiments
+export RUN_GROUP=final_kl_greedy_set_exact_k_ce_m2000_seed42
+
+python3 summarize_planrec_results.py \
+  --output_dir "$OUTPUT_DIR" \
+  --table_name summary_${RUN_GROUP}.csv \
+  --run_name_contains "$RUN_GROUP" \
+  --exclude_debug_sanity
+
+cat "$OUTPUT_DIR/tables/quality_retention.md"
+```
+
+Inspect training loss:
+
+```bash
+cd /workspace/PriorDynamicPruning
+python3 - <<'PY'
+import glob, json, os
+roots = [
+    "/workspace/PriorDynamicPruning/policy_ckpts/final_kl_greedy_set/final_kl_greedy_set_m2000_seed42",
+    "/workspace/PriorDynamicPruning/policy_ckpts/final_kl_greedy_set_exact_k_ce/final_kl_greedy_set_exact_k_ce_m2000_seed42",
+]
+for root in roots:
+    for path in sorted(glob.glob(root + "/*/training_metrics.json")):
+        variant = os.path.basename(os.path.dirname(path))
+        hist = json.load(open(path)).get("history", [])
+        if not hist:
+            continue
+        best = min(hist, key=lambda row: row.get("loss", float("inf")))
+        last = hist[-1]
+        print(f"{variant}\tbest={best['loss']:.6f}@ep{best['epoch']}\tlast={last['loss']:.6f}@ep{last['epoch']}")
+PY
+```
+
+Inspect train-label overlap:
+
+```bash
+cd /workspace/PriorDynamicPruning
+export DIAG_DIR=/workspace/PriorDynamicPruning/results/opal_greedy_set_diagnostics
+export RUN_GROUP=final_kl_greedy_set_exact_k_ce_m2000_seed42
+
+python3 - <<'PY'
+import json, os
+for variant in [
+    "raw_input_risk_bce",
+    "prefix_hk_raw_attn_bce",
+    "raw_input_risk_exact_k_ce",
+    "prefix_hk_last_exact_k_ce",
+    "prefix_hk_raw_attn_exact_k_ce",
+]:
+    path = f"{os.environ['DIAG_DIR']}/{os.environ['RUN_GROUP']}_{variant}_train_overlap.summary.json"
+    s = json.load(open(path))
+    print("\n===", variant, "===")
+    for key in [
+        "num_samples",
+        "exact_match_rate",
+        "mean_overlap_ratio",
+        "mean_overlap_count",
+        "mean_hamming_count",
+        "mean_pairwise_order_accuracy",
+        "unique_predicted_masks",
+        "unique_label_masks",
+    ]:
+        print(key, s.get(key))
+PY
+```
+
+Result status:
+
+```text
+Pending server run. Fill heldout eval and overlap tables after the exact-k CE
+experiment produces JSON results.
+```

@@ -1,4 +1,4 @@
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 def keep_count_from_skip_rate(num_layers: int, skip_rate: float, fallback_top_k: int) -> int:
@@ -23,6 +23,37 @@ def mask_from_skip_risk(skip_risk: Sequence[float], keep_count: int) -> List[int
     ranked = sorted(range(len(skip_risk)), key=lambda idx: float(skip_risk[idx]), reverse=True)
     keep = set(ranked[:keep_count])
     return [1 if idx in keep else 0 for idx in range(len(skip_risk))]
+
+
+def allowed_layers_from_protected(
+    num_layers: int,
+    protected_head: Optional[int] = None,
+    protected_tail: Optional[int] = None,
+) -> List[int]:
+    protected_head = max(0, int(protected_head or 0))
+    protected_tail = max(0, int(protected_tail or 0))
+    end = max(protected_head, int(num_layers) - protected_tail)
+    return list(range(protected_head, end))
+
+
+def mask_from_skip_risk_allowed(
+    skip_risk: Sequence[float],
+    keep_count: int,
+    allowed_layers: Optional[Sequence[int]] = None,
+) -> List[int]:
+    if allowed_layers is None:
+        return mask_from_skip_risk(skip_risk, keep_count)
+    num_layers = len(skip_risk)
+    keep_count = max(0, min(num_layers, int(keep_count)))
+    skip_count = num_layers - keep_count
+    allowed = [int(idx) for idx in allowed_layers if 0 <= int(idx) < num_layers]
+    if skip_count > len(allowed):
+        raise ValueError(f"skip_count={skip_count} exceeds allowed layer count={len(allowed)}")
+    mask = [1 for _ in range(num_layers)]
+    skipped = sorted(allowed, key=lambda idx: float(skip_risk[idx]))[:skip_count]
+    for idx in skipped:
+        mask[idx] = 0
+    return mask
 
 
 def max_consecutive_skips(mask: Sequence[int]) -> int:
@@ -137,4 +168,3 @@ def repair_structure_constraints(
         ),
     }
     return mask, stats
-

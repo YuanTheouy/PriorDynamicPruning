@@ -28,7 +28,7 @@ from diagnose_greedy_router_alignment import (
     load_router,
     predict_risk,
 )
-from opal_llm.mask_utils import mask_from_skip_risk
+from opal_llm.mask_utils import allowed_layers_from_protected, mask_from_skip_risk_allowed
 
 
 def read_label_rows(path: str, max_samples: int, sample_strategy: str, sample_seed: int):
@@ -189,7 +189,23 @@ def main():
                     num_layers,
                     args.prefix_depth,
                 )
-                keep_mask = mask_from_skip_risk(pred_risk.detach().float().cpu().tolist(), keep_count=keep_count)
+                allowed_layers = label_row.get("allowed_layers") or router_metadata.get("allowed_layers")
+                if not allowed_layers and (
+                    label_row.get("protected_head") is not None
+                    or label_row.get("protected_tail") is not None
+                    or router_metadata.get("protected_head") is not None
+                    or router_metadata.get("protected_tail") is not None
+                ):
+                    allowed_layers = allowed_layers_from_protected(
+                        num_layers,
+                        label_row.get("protected_head", router_metadata.get("protected_head")),
+                        label_row.get("protected_tail", router_metadata.get("protected_tail")),
+                    )
+                keep_mask = mask_from_skip_risk_allowed(
+                    pred_risk.detach().float().cpu().tolist(),
+                    keep_count=keep_count,
+                    allowed_layers=allowed_layers,
+                )
                 pred_skip_mask = torch.tensor([0 if int(value) == 1 else 1 for value in keep_mask], dtype=torch.float32)
                 target_cpu = target_skip_mask.detach().cpu()
 

@@ -485,3 +485,24 @@ for variant in ["raw_input_risk", "prefix_hk_raw_attn"]:
         print(key, s.get(key))
 PY
 ```
+
+Result:
+
+| method | exact match | overlap@7 | overlap ratio | hamming | pairwise order acc | keep-skip margin | unique predicted masks | unique label masks |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| raw_input_risk | 0.0080 | 4.326 | 0.6180 | 5.348 | 0.8708 | 3.7749 | 17 | 1367 |
+| prefix_hk_raw_attn | 0.0055 | 4.463 | 0.6376 | 5.074 | 0.8810 | 4.0683 | 54 | 1367 |
+
+Interpretation:
+
+```text
+prefix_hk_raw_attn does fit the final-KL greedy set labels better than
+raw_input_risk on train-label overlap, pairwise skipped-vs-kept ordering,
+and dynamicity. Therefore its lower BCE loss is not purely cosmetic.
+
+However, exact top-7 mask match is almost zero for both routers, and m2000
+heldout eval KL is still slightly better for raw_input_risk. This suggests a
+remaining gap between train greedy-set fitting and heldout final-KL robustness.
+The next loss should directly strengthen top-7 ranking, e.g. BCE plus
+within-sample pairwise set-ranking loss.
+```

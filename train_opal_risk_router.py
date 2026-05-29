@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader, Subset
@@ -267,20 +268,36 @@ def detect_num_layers(model) -> int:
     raise ValueError("Could not detect decoder layer count.")
 
 
-def load_risk_labels(path: str):
+def load_supervision_labels(path: str):
     labels = {}
     metadata = {}
+    supervision_type = None
     with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             row = json.loads(line)
-            labels[int(row["sample_id"])] = [float(v) for v in row["risk_labels"]]
+            if "skip_mask" in row:
+                row_type = "skip_set"
+                labels[int(row["sample_id"])] = [float(v) for v in row["skip_mask"]]
+            else:
+                row_type = "risk_regression"
+                labels[int(row["sample_id"])] = [float(v) for v in row["risk_labels"]]
+            if supervision_type is None:
+                supervision_type = row_type
+            elif supervision_type != row_type:
+                raise ValueError(f"Mixed supervision label types in {path}: {supervision_type} and {row_type}")
+            metadata.setdefault("supervision_type", row.get("supervision_type") or row_type)
             metadata.setdefault("objective", row.get("objective"))
             metadata.setdefault("num_layers", row.get("num_layers"))
             metadata.setdefault("prefix_depth", row.get("prefix_depth"))
+            metadata.setdefault("search", row.get("search"))
+            metadata.setdefault("protected_head", row.get("protected_head"))
+            metadata.setdefault("protected_tail", row.get("protected_tail"))
+            metadata.setdefault("skip_count", row.get("skip_count"))
     if not labels:
-        raise ValueError(f"No risk labels found in {path}")
+        raise ValueError(f"No supervision labels found in {path}")
+    metadata["supervision_type"] = supervision_type or metadata.get("supervision_type") or "risk_regression"
     return labels, metadata
 
 
@@ -335,7 +352,8 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    risk_labels, label_metadata = load_risk_labels(args.risk_label_file)
+    risk_labels, label_metadata = load_supervision_labels(args.risk_label_file)
+    supervision_type = str(label_metadata.get("supervision_type") or "risk_regression")
     dataset_category = CATEGORY_LABELS.get(args.category, args.category)
     dataset = IndexedDataset(
         EvalSidDataset(
@@ -413,6 +431,10 @@ def main():
                     "recent_tokens": int(args.recent_tokens),
                     "recent_decay": float(args.recent_decay),
                     "skip_count": skip_count,
+                    "supervision_type": supervision_type,
+                    "label_search": label_metadata.get("search"),
+                    "protected_head": label_metadata.get("protected_head"),
+                    "protected_tail": label_metadata.get("protected_tail"),
                     "risk_label_rows": len(risk_labels),
                     "covered_rows": len(covered_indices),
                     "device": str(device),
@@ -486,14 +508,20 @@ def main():
                 state = raw_embedding_state(model, router_input_ids, router_attention_mask)
                 pred = router(state)
             target = torch.tensor([risk_labels[index] for index in batch_indices], dtype=torch.float32, device=device)
-            regression = risk_regression_loss(pred, target, beta=args.huber_beta)
-            ranking = risk_pairwise_ranking_loss(pred, target) if args.ranking_loss_weight > 0 else pred.new_tensor(0.0)
-            skip_set = risk_skip_set_loss(pred, target, skip_count) if args.skip_set_loss_weight > 0 else pred.new_tensor(0.0)
-            loss = (
-                regression
-                + float(args.ranking_loss_weight) * ranking
-                + float(args.skip_set_loss_weight) * skip_set
-            )
+            if supervision_type == "skip_set":
+                regression = pred.new_tensor(0.0)
+                ranking = pred.new_tensor(0.0)
+                skip_set = F.binary_cross_entropy_with_logits(-pred.float(), target.float())
+                loss = skip_set
+            else:
+                regression = risk_regression_loss(pred, target, beta=args.huber_beta)
+                ranking = risk_pairwise_ranking_loss(pred, target) if args.ranking_loss_weight > 0 else pred.new_tensor(0.0)
+                skip_set = risk_skip_set_loss(pred, target, skip_count) if args.skip_set_loss_weight > 0 else pred.new_tensor(0.0)
+                loss = (
+                    regression
+                    + float(args.ranking_loss_weight) * ranking
+                    + float(args.skip_set_loss_weight) * skip_set
+                )
 
             optimizer.zero_grad()
             accelerator.backward(loss)
@@ -533,7 +561,11 @@ def main():
         unwrapped = accelerator.unwrap_model(router)
         checkpoint_path = Path(args.output_dir) / "risk_router.pt"
         metadata = {
-            "method": "prefix_supervised_layer_risk_prediction",
+            "method": (
+                "final_kl_greedy_set_supervision"
+                if supervision_type == "skip_set"
+                else "prefix_supervised_layer_risk_prediction"
+            ),
             "router_input": args.router_input,
             "prompt_only_router_context": True,
             "prefix_depth": router_prefix_depth(args.router_input, args.prefix_depth),
@@ -557,6 +589,10 @@ def main():
             "teacher_model": args.teacher_model,
             "risk_label_file": args.risk_label_file,
             "risk_objective": label_metadata.get("objective"),
+            "supervision_type": supervision_type,
+            "label_search": label_metadata.get("search"),
+            "protected_head": label_metadata.get("protected_head"),
+            "protected_tail": label_metadata.get("protected_tail"),
             "ranking_loss_weight": float(args.ranking_loss_weight),
             "skip_set_loss_weight": float(args.skip_set_loss_weight),
             "skip_rate": float(args.skip_rate),

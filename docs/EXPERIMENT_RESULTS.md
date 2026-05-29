@@ -189,3 +189,92 @@ python3 summarize_planrec_results.py \
 
 cat "$OUTPUT_DIR/tables/quality_retention.md"
 ```
+
+## 2026-05-29 Final-KL Greedy Set Supervision
+
+Purpose:
+
+```text
+Test whether prefix_hk_raw_attn was unstable because one-layer-drop labels
+optimize a first-order proxy, while deployment skips 7 layers jointly.
+```
+
+Incremental change:
+
+```text
+old label:
+  risk_l = KL or Delta_NLL after dropping layer l alone
+
+new label:
+  skip_mask = 7 skipped layers selected by forward greedy search that minimizes
+              final KL(full logits || skip-mask logits)
+```
+
+Constraints:
+
+```text
+no soft gate
+no Gumbel
+no STE
+no inference-time search
+no beam2 / topM / swap / lookahead in the first pass
+```
+
+Fixed experiment:
+
+```text
+dataset: Office_Products
+seed: 42
+label samples: m500
+skip_rate: 0.25
+protected_head: 4
+protected_tail: 2
+allowed layers: [4, ..., num_layers - 3]
+search: forward greedy
+objective: final_KL
+compared routers: raw_input_risk vs prefix_hk_raw_attn
+training loss: BCEWithLogits(-pred_risk, greedy_skip_mask)
+inference: one router forward, skip the 7 lowest predicted-risk layers
+```
+
+Implemented files:
+
+| file | purpose |
+|---|---|
+| `build_final_kl_greedy_set_labels.py` | builds `skip_mask` labels via final-KL forward greedy search |
+| `train_opal_risk_router.py` | auto-detects `skip_mask` labels and trains pure BCE skip-set supervision |
+| `run_final_kl_greedy_set_supervision_gpu01234567.sh` | one-shot server runner for m500 seed42 raw vs attention |
+
+Server command:
+
+```bash
+cd /workspace/PriorDynamicPruning
+git fetch origin codex/opal-llm-experiments
+git pull --ff-only origin codex/opal-llm-experiments
+git rev-parse --short HEAD
+
+bash ./run_final_kl_greedy_set_supervision_gpu01234567.sh 2>&1 | tee /tmp/final_kl_greedy_set_m500_seed42_gpu01234567.log
+```
+
+Inspect results:
+
+```bash
+cd /workspace/PriorDynamicPruning
+export OUTPUT_DIR=/workspace/PriorDynamicPruning/results/planrec_experiments
+export RUN_GROUP=final_kl_greedy_set_m500_seed42
+
+python3 summarize_planrec_results.py \
+  --output_dir "$OUTPUT_DIR" \
+  --table_name summary_${RUN_GROUP}.csv \
+  --run_name_contains "$RUN_GROUP" \
+  --exclude_debug_sanity
+
+cat "$OUTPUT_DIR/tables/quality_retention.md"
+```
+
+Result status:
+
+```text
+Pending server run. Fill this section after the m500 greedy-set experiment
+produces raw_input_risk and prefix_hk_raw_attn eval JSON files.
+```

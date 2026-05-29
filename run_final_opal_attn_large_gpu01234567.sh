@@ -46,8 +46,11 @@ export RECENT_DECAY=0.85
 export WARMUP_BATCHES=0
 export TIMED_BATCHES=0
 export EVAL_MAX_BATCHES="${OPAL_EVAL_MAX_BATCHES:-500}"
-export SUMMARY_TABLE="${OPAL_SUMMARY_TABLE:-summary_final_opal_attn_large_delta_m${LABEL_MAX_SAMPLES}.csv}"
-export RUN_GROUP="${OPAL_RUN_GROUP:-final_opal_attn_large_delta_m${LABEL_MAX_SAMPLES}}"
+export RISK_OBJECTIVE="${OPAL_RISK_OBJECTIVE:-Delta_NLL}"
+export OBJECTIVE_TAG
+OBJECTIVE_TAG="$(echo "$RISK_OBJECTIVE" | tr '[:upper:]' '[:lower:]')"
+export SUMMARY_TABLE="${OPAL_SUMMARY_TABLE:-summary_final_opal_attn_large_${OBJECTIVE_TAG}_m${LABEL_MAX_SAMPLES}.csv}"
+export RUN_GROUP="${OPAL_RUN_GROUP:-final_opal_attn_large_${OBJECTIVE_TAG}_m${LABEL_MAX_SAMPLES}}"
 export SEEDS="${OPAL_SEEDS:-42 13 3407}"
 export SKIP_FULL="${OPAL_SKIP_FULL:-0}"
 export SKIP_STATIC="${OPAL_SKIP_STATIC:-0}"
@@ -60,6 +63,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "NUM_GPUS=${NUM_GPUS}"
 echo "TRAIN_FILE=${TRAIN_FILE}"
 echo "LABEL_MAX_SAMPLES=${LABEL_MAX_SAMPLES}"
+echo "RISK_OBJECTIVE=${RISK_OBJECTIVE}"
 echo "EPOCHS=${EPOCHS}"
 echo "SEEDS=${SEEDS}"
 echo "RUN_GROUP=${RUN_GROUP}"
@@ -124,7 +128,7 @@ build_labels_if_needed() {
     echo "=== Reuse risk labels: ${label_file} ==="
     return
   fi
-  echo "=== Build random Delta_NLL risk labels seed=${seed} m=${LABEL_MAX_SAMPLES} ==="
+  echo "=== Build random ${RISK_OBJECTIVE} risk labels seed=${seed} m=${LABEL_MAX_SAMPLES} ==="
   run_accelerate ./build_layer_risk_labels.py \
     --teacher_model "$MODEL_PATH" \
     --train_file "$TRAIN_FILE" \
@@ -134,7 +138,7 @@ build_labels_if_needed() {
     --max_samples "$LABEL_MAX_SAMPLES" \
     --sample_strategy random \
     --sample_seed "$seed" \
-    --objective Delta_NLL \
+    --objective "$RISK_OBJECTIVE" \
     --output "$label_file" \
     --batch_size "$LABEL_BATCH_SIZE" \
     --precision "$PRECISION" \
@@ -274,7 +278,7 @@ eval_router_if_needed() {
 
 for SEED in $SEEDS; do
   export SEED
-  export LABEL_FILE="${RISK_DIR}/${CATEGORY}_risk_Delta_NLL_random_m${LABEL_MAX_SAMPLES}_seed${SEED}.jsonl"
+  export LABEL_FILE="${RISK_DIR}/${CATEGORY}_risk_${RISK_OBJECTIVE}_random_m${LABEL_MAX_SAMPLES}_seed${SEED}.jsonl"
   build_labels_if_needed "$SEED" "$LABEL_FILE"
 
   train_router_if_needed "$SEED" "$LABEL_FILE" raw_input_risk raw_embedding none

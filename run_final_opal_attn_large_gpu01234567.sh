@@ -49,6 +49,8 @@ export EVAL_MAX_BATCHES="${OPAL_EVAL_MAX_BATCHES:-500}"
 export SUMMARY_TABLE="${OPAL_SUMMARY_TABLE:-summary_final_opal_attn_large_delta_m${LABEL_MAX_SAMPLES}.csv}"
 export RUN_GROUP="${OPAL_RUN_GROUP:-final_opal_attn_large_delta_m${LABEL_MAX_SAMPLES}}"
 export SEEDS="${OPAL_SEEDS:-42 13 3407}"
+export SKIP_FULL="${OPAL_SKIP_FULL:-0}"
+export SKIP_STATIC="${OPAL_SKIP_STATIC:-0}"
 
 cd "$REPO_DIR"
 mkdir -p "$RISK_DIR" "$CKPT_ROOT" "$OUTPUT_DIR"
@@ -61,6 +63,8 @@ echo "LABEL_MAX_SAMPLES=${LABEL_MAX_SAMPLES}"
 echo "EPOCHS=${EPOCHS}"
 echo "SEEDS=${SEEDS}"
 echo "RUN_GROUP=${RUN_GROUP}"
+echo "OPAL_SKIP_FULL=${SKIP_FULL}"
+echo "OPAL_SKIP_STATIC=${SKIP_STATIC}"
 
 run_accelerate() {
   local port="$NEXT_PORT"
@@ -280,10 +284,18 @@ for SEED in $SEEDS; do
   train_router_if_needed "$SEED" "$LABEL_FILE" prefix_hk_raw_attn_hk_last_resid prefix_hk_raw_attn_hk_last_resid none
   train_router_if_needed "$SEED" "$LABEL_FILE" prefix_hk_raw_attn_raw_hk_last_resid prefix_hk_raw_attn_raw_hk_last_resid none
 
-  eval_full_if_needed "$SEED"
-  for STATIC_STRATEGY in ends_heavy uniform shortgpt first_k last_k middle_heavy; do
-    eval_static_if_needed "$SEED" "$STATIC_STRATEGY"
-  done
+  if [ "$SKIP_FULL" != "1" ]; then
+    eval_full_if_needed "$SEED"
+  else
+    echo "=== Skip full eval seed=${SEED} because OPAL_SKIP_FULL=1 ==="
+  fi
+  if [ "$SKIP_STATIC" != "1" ]; then
+    for STATIC_STRATEGY in ends_heavy uniform shortgpt first_k last_k middle_heavy; do
+      eval_static_if_needed "$SEED" "$STATIC_STRATEGY"
+    done
+  else
+    echo "=== Skip static eval seed=${SEED} because OPAL_SKIP_STATIC=1 ==="
+  fi
 
   eval_router_if_needed "$SEED" raw_input_risk raw_input_risk
   eval_router_if_needed "$SEED" prefix_hk_last opal_risk

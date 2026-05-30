@@ -59,3 +59,25 @@ Evaluation is prompt-only. Target/answer tokens can be used only offline for
 training labels or validation selection, never inside per-example test-time
 routing.
 ```
+
+### Office Products 25% Skip Related Baseline Results
+
+Completed on `Office_Products`, seeds `42 / 13 / 3407`, same 7 skipped / 21 kept
+budget. Three-seed averages:
+
+| method | mean Delta_NLL ↓ | mean Delta_PPL ↓ | mean KL ↓ | mean NDCG@10 | mean retention | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| OPAL-PrefixLast | **-0.224583** | **-4.882415** | 1.697355 | 0.1598 | 0.8810 | 54.3 |
+| raw_input_risk | -0.149916 | -3.334785 | 1.738470 | **0.1619** | **0.8923** | 29.3 |
+| OPAL-Attn | -0.137910 | -3.115666 | 1.663331 | 0.1503 | 0.8286 | 9.3 |
+| static best-on-val | -0.005696 | 0.187665 | **1.474916** | 0.1593 | 0.8780 | 1.0 |
+| IG-style cluster | -0.000690 | -0.001417 | 1.818229 | 0.1532 | 0.8445 | 7.3 |
+| PuDDing-style candidate | 0.089038 | 2.318122 | 1.711482 | 0.1494 | 0.8235 | 2.3 |
+| layerwise hidden router | 0.099545 | 2.663132 | 1.937508 | 0.1562 | 0.8609 | 23.3 |
+| random dynamic hash | 1.764607 | 123.841179 | 2.690828 | 0.1429 | 0.7877 | 12.0 |
+
+Related-baseline conclusion:
+
+- OPAL-PrefixLast beats all implemented related baselines on mean `Delta_NLL` and `Delta_PPL`.
+- static best-on-val has the best mean KL, mostly due to seed 3407 selecting a strong validation mask, but it does not preserve likelihood as well as OPAL-PrefixLast.
+- PuDDing-style, IG-style, layerwise hidden router, and random dynamic hash do not outperform OPAL-PrefixLast under the fixed budget.

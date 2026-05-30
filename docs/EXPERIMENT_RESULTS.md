@@ -787,4 +787,35 @@ Existing reusable Office/25% OPAL rows from `final_opal_attn_delta_m2000`:
 | static ends_heavy | 0.055907 | 1.589131 | 1.676606 | 0.1479 | 0.8443 | 1.0 |
 | static uniform | 0.389392 | 13.157743 | 1.666112 | 0.1456 | 0.8310 | 1.0 |
 
-Final fair-baseline rows are pending server execution of the convergence runner.
+### Priority 1 Completed: Office Products 25% Skip, 3 Seeds
+
+Server summary:
+
+```text
+table = /workspace/PriorDynamicPruning/results/planrec_experiments/tables/summary_submission_office25_delta_m2000.csv
+rows = 33
+seeds = 42 / 13 / 3407
+```
+
+Three-seed averages, sorted by `Delta_NLL`:
+
+| method | mean NDCG@10 | mean retention | mean Delta_NLL ↓ | mean Delta_PPL ↓ | mean KL ↓ | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| OPAL-PrefixLast | 0.1598 | 0.8810 | **-0.224583** | **-4.882415** | 1.697355 | 54.3 |
+| raw_input_risk | **0.1619** | **0.8923** | -0.149916 | -3.334785 | 1.738470 | 29.3 |
+| OPAL-Attn | 0.1503 | 0.8286 | -0.137910 | -3.115666 | 1.663331 | 9.3 |
+| static best-on-val | 0.1593 | 0.8780 | -0.005696 | 0.187665 | **1.474916** | 1.0 |
+| IG-style cluster | 0.1532 | 0.8445 | -0.000690 | -0.001417 | 1.818229 | 7.3 |
+| PuDDing-style candidate | 0.1494 | 0.8235 | 0.089038 | 2.318122 | 1.711482 | 2.3 |
+| layerwise hidden router | 0.1562 | 0.8609 | 0.099545 | 2.663132 | 1.937508 | 23.3 |
+| static ends_heavy | 0.1495 | 0.8241 | 0.111737 | 2.942057 | 1.657790 | 1.0 |
+| static uniform | 0.1524 | 0.8403 | 0.445838 | 13.981243 | 1.684163 | 1.0 |
+| random dynamic hash | 0.1429 | 0.7877 | 1.764607 | 123.841179 | 2.690828 | 12.0 |
+
+Main conclusions:
+
+- OPAL-PrefixLast is the strongest method on the submission-primary likelihood metrics: best mean `Delta_NLL` and best mean `Delta_PPL` across three seeds.
+- raw_input_risk is the strongest row on downstream `NDCG@10` / retention, but it is weaker than OPAL-PrefixLast on `Delta_NLL`, `Delta_PPL`, and KL.
+- OPAL-Attn remains a useful ablation: it has the best dynamic-router KL and a compact mask set, but it is weaker than OPAL-PrefixLast on the three-seed likelihood averages and downstream retention.
+- static best-on-val is a strong fixed-mask baseline and wins mean KL because seed 3407 selects a good `random_diverse_k21_v24` mask on validation. OPAL-PrefixLast still clearly beats it on `Delta_NLL` and `Delta_PPL`.
+- PuDDing-style, IG-style, layerwise-hidden, and random dynamic baselines do not beat OPAL-PrefixLast on the likelihood preservation objective.

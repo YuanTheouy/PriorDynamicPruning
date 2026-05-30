@@ -726,3 +726,65 @@ Result status:
 Completed for Office_Products, seed 42, skip_rate 0.25, protected_head 4,
 protected_tail 2, final-KL greedy set m2000.
 ```
+
+## 2026-05-30 Submission Convergence Experiments
+
+Decision for the submission round:
+
+```text
+Main method is frozen.
+OPAL-PrefixLast = prefix_hk_last + one-layer Delta_NLL labels + hard top-K skip.
+```
+
+No further method expansion for this phase. Exact K-subset CE, final-KL greedy
+set supervision, and `prefix_hk_raw_attn` variants are analysis-only ablations.
+
+Added runner:
+
+```bash
+cd /workspace/PriorDynamicPruning
+
+SUBMISSION_TASKS=office25 \
+SUBMISSION_SEEDS="42" \
+bash ./run_submission_convergence_experiments_gpu01234567.sh 2>&1 | tee /tmp/submission_office25_seed42.log
+
+SUBMISSION_TASKS=office25 \
+SUBMISSION_SEEDS="42 13 3407" \
+bash ./run_submission_convergence_experiments_gpu01234567.sh 2>&1 | tee /tmp/submission_office25_3seeds.log
+
+SUBMISSION_TASKS=industrial25 \
+SUBMISSION_SEEDS="42" \
+bash ./run_submission_convergence_experiments_gpu01234567.sh 2>&1 | tee /tmp/submission_industrial25_seed42.log
+
+SUBMISSION_TASKS=office36 \
+SUBMISSION_SEEDS="42" \
+bash ./run_submission_convergence_experiments_gpu01234567.sh 2>&1 | tee /tmp/submission_office36_seed42.log
+```
+
+The Office 25% main-table runner includes:
+
+| row | method in table | implementation |
+|---:|---|---|
+| 1 | full model | `--method full` |
+| 2 | static uniform | `--method static --static_strategy uniform` |
+| 3 | static ends_heavy | `--method static --static_strategy ends_heavy` |
+| 4 | static best-on-val | validation candidate losses + selected fixed mask |
+| 5 | random dynamic mask | prompt-hash `input_guided` baseline |
+| 6 | raw_input_risk | `raw_embedding` risk router |
+| 7 | OPAL-PrefixLast | frozen main: `prefix_hk`, `risk_pooling=last` |
+| 8 | OPAL-Attn | analysis/ablation: `prefix_hk_raw_attn` |
+| 9 | PuDDing-style prompt candidate | `pudding_prompt_candidate` |
+| 10 | IG-style cluster mask | `ig_cluster_mask` |
+| 11 | layerwise_hidden_router / Dr.LLM-style | `layerwise_hidden_router` |
+
+Existing reusable Office/25% OPAL rows from `final_opal_attn_delta_m2000`:
+
+| method | mean Delta_NLL ↓ | mean Delta_PPL ↓ | mean KL ↓ | mean NDCG@10 | mean retention | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| OPAL-PrefixLast (`prefix_hk_last`) | **-0.245278** | **-5.851168** | 1.729122 | 0.1454 | 0.8297 | 70.7 |
+| raw_input_risk | -0.161006 | -3.981497 | 1.775815 | 0.1443 | 0.8234 | 40.0 |
+| OPAL-Attn (`prefix_hk_raw_attn`) | -0.147499 | -3.696668 | 1.705995 | 0.1373 | 0.7835 | 11.3 |
+| static ends_heavy | 0.055907 | 1.589131 | 1.676606 | 0.1479 | 0.8443 | 1.0 |
+| static uniform | 0.389392 | 13.157743 | 1.666112 | 0.1456 | 0.8310 | 1.0 |
+
+Final fair-baseline rows are pending server execution of the convergence runner.

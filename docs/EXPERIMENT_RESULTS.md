@@ -586,15 +586,53 @@ First-round comparison:
 | prefix_hk_last | final-KL greedy set m2000 | Exact K-subset CE |
 | prefix_hk_raw_attn | final-KL greedy set m2000 | Exact K-subset CE |
 
-Result table to fill after server run:
+Heldout eval result:
 
 | method | label_type | loss_type | label_samples | skip_rate | protected_head | protected_tail | train_loss | Delta_NLL | Delta_PPL | KL_full_to_skip | NDCG@10 | retention_NDCG@10 | unique_masks | avg_kept_layers |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| raw_input_risk | final-KL greedy set | BCE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
-| prefix_hk_raw_attn | final-KL greedy set | BCE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
-| raw_input_risk | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
-| prefix_hk_last | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
-| prefix_hk_raw_attn | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | pending | pending | pending | pending | pending | pending | pending | pending |
+| raw_input_risk | final-KL greedy set | BCE | 2000 | 0.25 | 4 | 2 | see metrics | **0.290139** | **10.679864** | 1.022843 | 0.1142 | 0.8238 | 19 | 21.00 |
+| raw_input_risk | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | see metrics | 0.294148 | 10.850219 | **1.011936** | 0.1148 | 0.8282 | 21 | 21.00 |
+| prefix_hk_last | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | see metrics | 0.465618 | 18.814304 | 1.027969 | 0.1178 | 0.8496 | 61 | 21.00 |
+| prefix_hk_raw_attn | final-KL greedy set | BCE | 2000 | 0.25 | 4 | 2 | see metrics | 0.471371 | 19.105898 | 1.048630 | 0.1161 | 0.8376 | 62 | 21.00 |
+| prefix_hk_raw_attn | final-KL greedy set | Exact K-subset CE | 2000 | 0.25 | 4 | 2 | see metrics | 0.477912 | 19.439476 | 1.021019 | **0.1192** | **0.8595** | **257** | 21.00 |
+
+Train-label overlap diagnostic:
+
+| method | loss_type | exact match | overlap@7 | overlap ratio | hamming | pairwise order acc | unique predicted masks | unique label masks |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| raw_input_risk | BCE | 0.0080 | 4.3260 | 0.6180 | 5.3480 | **0.8708** | 17 | 1367 |
+| prefix_hk_raw_attn | BCE | 0.0055 | 4.4630 | 0.6376 | 5.0740 | **0.8810** | 54 | 1367 |
+| raw_input_risk | Exact K-subset CE | 0.0070 | 4.3295 | 0.6185 | 5.3410 | 0.8319 | 21 | 1367 |
+| prefix_hk_last | Exact K-subset CE | 0.0055 | 4.3425 | 0.6204 | 5.3150 | 0.8290 | 51 | 1367 |
+| prefix_hk_raw_attn | Exact K-subset CE | **0.0150** | **4.7165** | **0.6738** | **4.5670** | 0.8412 | **204** | 1367 |
+
+Reading:
+
+```text
+Exact K-subset CE does what it is supposed to do on train labels for
+prefix_hk_raw_attn: exact match, overlap@7, hamming, and mask diversity all
+improve strongly over both raw_input_risk and prefix_hk_last.
+
+Heldout eval is mixed. The best KL is raw_input_risk + Exact K-subset CE
+(1.011936). prefix_hk_raw_attn + Exact K-subset CE improves KL over its BCE
+version (1.048630 -> 1.021019), and has the best NDCG@10, retention, and
+unique mask diversity, but it does not improve Delta_NLL / Delta_PPL.
+
+Therefore this experiment supports the claim that Exact K-subset CE reduces
+the train/inference set-selection mismatch for attention, but it does not yet
+solve the Delta_NLL objective mismatch. If Delta_NLL is the primary paper
+metric, raw_input_risk remains the strongest variant in this setting.
+```
+
+Practical conclusion:
+
+```text
+Do not keep adding complex losses immediately. The next targeted step should be
+either a prefix_hk_last residual anchor for the attention router, or a
+Delta_NLL-aware set label / multi-objective label if Delta_NLL is the metric to
+optimize. The current final-KL greedy teacher naturally helps KL more than
+Delta_NLL.
+```
 
 Server command:
 
@@ -685,6 +723,6 @@ PY
 Result status:
 
 ```text
-Pending server run. Fill heldout eval and overlap tables after the exact-k CE
-experiment produces JSON results.
+Completed for Office_Products, seed 42, skip_rate 0.25, protected_head 4,
+protected_tail 2, final-KL greedy set m2000.
 ```

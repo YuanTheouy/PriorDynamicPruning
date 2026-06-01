@@ -168,7 +168,10 @@ def specs() -> list[AuditSpec]:
             AuditSpec(
                 group="cross_setting_setbce",
                 name=f"{task}:prefix_hk_raw_attn:bce",
-                metric_globs=(f"policy_ckpts/opal_setbce_cross_setting/{run}/prefix_hk_raw_attn_bce/training_metrics.json",),
+                metric_globs=(
+                    f"policy_ckpts/opal_setbce_cross_setting/{run}/prefix_hk_raw_attn_bce/training_metrics.json",
+                    f"policy_ckpts/opal_setattn_v1_smoke/{run}/prefix_hk_raw_attn_bce/training_metrics.json",
+                ),
                 eval_needles=(f"{run}_prefix_hk_raw_attn_bce",),
                 overlap_globs=(f"results/opal_greedy_set_diagnostics/{run}_prefix_hk_raw_attn_bce_train_overlap.summary.json",),
                 required=False,
@@ -208,11 +211,11 @@ def rel(path: Path, base: Path) -> str:
 
 
 def first_existing(patterns: Iterable[str], base: Path) -> Path | None:
-    matches: list[Path] = []
     for pattern in patterns:
-        matches.extend(Path(p) for p in glob.glob(str(base / pattern)))
-    existing = sorted(path for path in matches if path.exists())
-    return existing[0] if existing else None
+        existing = sorted(Path(p) for p in glob.glob(str(base / pattern)) if Path(p).exists())
+        if existing:
+            return existing[0]
+    return None
 
 
 def all_existing(patterns: Iterable[str], base: Path) -> list[Path]:

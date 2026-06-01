@@ -19,7 +19,7 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 export OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/results/planrec_experiments}"
 export LABEL_DIR="${LABEL_DIR:-${REPO_DIR}/results/opal_greedy_set_labels}"
-export CKPT_ROOT="${CKPT_ROOT:-${REPO_DIR}/policy_ckpts/opal_setbce_cross_setting}"
+export CKPT_ROOT="${OPAL_CKPT_ROOT:-${REPO_DIR}/policy_ckpts/opal_setbce_cross_setting}"
 export DIAG_DIR="${DIAG_DIR:-${REPO_DIR}/results/opal_greedy_set_diagnostics}"
 
 export OPAL_TASK="${OPAL_TASK:-industrial25}"

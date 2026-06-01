@@ -41,7 +41,9 @@ ATTENTION_ROUTER_INPUTS = {
     "prefix_hk_raw_attn",
     "prefix_hk_raw_attn_hk_last_resid",
     "prefix_hk_raw_attn_raw_hk_last_resid",
+    "prefix_hk_raw_setattn",
 }
+SETATTN_ROUTER_INPUTS = {"prefix_hk_raw_setattn"}
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -221,6 +223,8 @@ def router_prefix_depth(router_input: str, prefix_depth: int) -> int:
 def router_pooling_metadata(router_input: str, risk_pooling: str) -> str:
     if router_input == "prefix_hk":
         return risk_pooling
+    if router_input in SETATTN_ROUTER_INPUTS:
+        return "layer_query_cross_attention+layer_self_attention"
     if router_input in ATTENTION_ROUTER_INPUTS:
         return "layer_query_cross_attention"
     if router_input == "prefix_hk_raw_fusion":
@@ -233,6 +237,8 @@ def router_pooling_metadata(router_input: str, risk_pooling: str) -> str:
 def router_features_metadata(router_input: str):
     if router_input in ATTENTION_ROUTER_INPUTS:
         features = ["raw_token_sequence", "hk_token_sequence", "attention_mask", "layer_queries"]
+        if router_input in SETATTN_ROUTER_INPUTS:
+            features.extend(["budget_embedding", "layer_token_self_attention"])
         if router_input in {"prefix_hk_raw_attn_hk_last_resid", "prefix_hk_raw_attn_raw_hk_last_resid"}:
             features.append("hk_last_residual")
         if router_input == "prefix_hk_raw_attn_raw_hk_last_resid":
@@ -245,6 +251,13 @@ def router_features_metadata(router_input: str):
     if router_input == "prefix_hk":
         return ["hk_pooled"]
     return ["raw_embedding_mean"]
+
+
+def resolve_budget_condition(router_input: str, budget_condition: str) -> str:
+    budget_condition = str(budget_condition or "auto")
+    if budget_condition == "auto":
+        return "skip_count" if router_input in SETATTN_ROUTER_INPUTS else "none"
+    return budget_condition
 
 
 def collate_batch(batch, pad_token_id: int):
@@ -325,6 +338,7 @@ def main():
             "prefix_hk_raw_attn",
             "prefix_hk_raw_attn_hk_last_resid",
             "prefix_hk_raw_attn_raw_hk_last_resid",
+            "prefix_hk_raw_setattn",
         ],
         default="prefix_hk",
     )
@@ -334,6 +348,12 @@ def main():
     parser.add_argument("--recent_decay", type=float, default=0.85)
     parser.add_argument("--router_dim", type=int, default=256)
     parser.add_argument("--router_heads", type=int, default=4)
+    parser.add_argument(
+        "--router_budget_condition",
+        choices=["auto", "none", "skip_count", "keep_count"],
+        default="auto",
+        help="Budget embedding condition for OPAL-SetAttn; auto uses skip_count for set-attn and none otherwise.",
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -405,6 +425,9 @@ def main():
         allowed_layers = allowed_layers_from_protected(num_layers, protected_head, protected_tail)
     if not allowed_layers:
         allowed_layers = list(range(num_layers))
+    label_skip_count = int(label_metadata.get("skip_count") or skip_count)
+    label_keep_count = int(num_layers) - int(label_skip_count)
+    budget_condition = resolve_budget_condition(args.router_input, args.router_budget_condition)
     if args.router_input in ATTENTION_ROUTER_INPUTS:
         router = LayerQueryCrossAttentionRiskRouter(
             base_hidden_size=hidden_size,
@@ -417,8 +440,11 @@ def main():
                 "prefix_hk_raw_attn_raw_hk_last_resid",
             },
             use_raw_last_residual=args.router_input == "prefix_hk_raw_attn_raw_hk_last_resid",
+            use_layer_self_attention=args.router_input in SETATTN_ROUTER_INPUTS,
+            budget_condition=budget_condition,
+            max_budget=num_layers,
         ).to(device)
-        router_architecture = "layer_query_cross_attention"
+        router_architecture = "opal_setattn_v1" if args.router_input in SETATTN_ROUTER_INPUTS else "layer_query_cross_attention"
     else:
         router = OpalRiskRouter(hidden_size=state_size, num_layers=num_layers, dropout=args.dropout).to(device)
         router_architecture = "pooled_mlp"
@@ -439,6 +465,9 @@ def main():
                     "router_architecture": router_architecture,
                     "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
                     "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+                    "use_layer_self_attention": args.router_input in SETATTN_ROUTER_INPUTS,
+                    "budget_condition": budget_condition if args.router_input in ATTENTION_ROUTER_INPUTS else "none",
+                    "max_budget": int(num_layers) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
                     "use_hk_last_residual": args.router_input in {
                         "prefix_hk_raw_attn_hk_last_resid",
                         "prefix_hk_raw_attn_raw_hk_last_resid",
@@ -447,6 +476,8 @@ def main():
                     "recent_tokens": int(args.recent_tokens),
                     "recent_decay": float(args.recent_decay),
                     "skip_count": skip_count,
+                    "label_skip_count": label_skip_count,
+                    "label_keep_count": label_keep_count,
                     "supervision_type": supervision_type,
                     "set_loss_type": args.set_loss_type if supervision_type == "skip_set" else None,
                     "label_search": label_metadata.get("search"),
@@ -521,7 +552,13 @@ def main():
                     num_layers,
                     args.prefix_depth,
                 )
-                pred = router(raw_hidden, hk_hidden, router_attention_mask)
+                pred = router(
+                    raw_hidden,
+                    hk_hidden,
+                    router_attention_mask,
+                    skip_count=label_skip_count,
+                    keep_count=label_keep_count,
+                )
             else:
                 state = raw_embedding_state(model, router_input_ids, router_attention_mask)
                 pred = router(state)
@@ -534,7 +571,7 @@ def main():
                         pred,
                         target,
                         allowed_layers=allowed_layers,
-                        skip_count=int(label_metadata.get("skip_count") or skip_count),
+                        skip_count=label_skip_count,
                     )
                 else:
                     skip_set = F.binary_cross_entropy_with_logits(-pred.float(), target.float())
@@ -622,6 +659,9 @@ def main():
             "router_architecture": router_architecture,
             "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
             "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+            "use_layer_self_attention": args.router_input in SETATTN_ROUTER_INPUTS,
+            "budget_condition": budget_condition if args.router_input in ATTENTION_ROUTER_INPUTS else "none",
+            "max_budget": int(num_layers) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
             "use_hk_last_residual": args.router_input in {
                 "prefix_hk_raw_attn_hk_last_resid",
                 "prefix_hk_raw_attn_raw_hk_last_resid",
@@ -643,6 +683,8 @@ def main():
             "skip_rate": float(args.skip_rate),
             "top_k_layers": int(args.top_k_layers),
             "skip_count": int(skip_count),
+            "label_skip_count": int(label_skip_count),
+            "label_keep_count": int(label_keep_count),
             "huber_beta": float(args.huber_beta),
             "seed": int(args.seed),
         }

@@ -188,6 +188,8 @@ def main():
                     tokenizer,
                     num_layers,
                     args.prefix_depth,
+                    skip_count=skip_count,
+                    keep_count=keep_count,
                 )
                 allowed_layers = label_row.get("allowed_layers") or router_metadata.get("allowed_layers")
                 if not allowed_layers and (

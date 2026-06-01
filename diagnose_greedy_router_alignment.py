@@ -33,7 +33,9 @@ ATTENTION_ROUTER_INPUTS = {
     "prefix_hk_raw_attn",
     "prefix_hk_raw_attn_hk_last_resid",
     "prefix_hk_raw_attn_raw_hk_last_resid",
+    "prefix_hk_raw_setattn",
 }
+SETATTN_ROUTER_INPUTS = {"prefix_hk_raw_setattn"}
 
 
 class IndexedDataset(torch.utils.data.Dataset):
@@ -196,7 +198,8 @@ def load_router(path: str, hidden_size: int, num_layers: int, device):
     metadata = dict(checkpoint.get("metadata") or {})
     router_input = str(metadata.get("router_input") or "")
     router_architecture = str(metadata.get("router_architecture") or "")
-    if router_input in ATTENTION_ROUTER_INPUTS or router_architecture == "layer_query_cross_attention":
+    is_setattn = router_input in SETATTN_ROUTER_INPUTS or router_architecture == "opal_setattn_v1"
+    if router_input in ATTENTION_ROUTER_INPUTS or router_architecture in {"layer_query_cross_attention", "opal_setattn_v1"}:
         router = LayerQueryCrossAttentionRiskRouter(
             base_hidden_size=int(metadata.get("base_hidden_size") or hidden_size),
             num_layers=num_layers,
@@ -204,6 +207,9 @@ def load_router(path: str, hidden_size: int, num_layers: int, device):
             router_heads=int(metadata.get("router_heads") or 4),
             use_hk_last_residual=bool(metadata.get("use_hk_last_residual")),
             use_raw_last_residual=bool(metadata.get("use_raw_last_residual")),
+            use_layer_self_attention=bool(metadata.get("use_layer_self_attention") or is_setattn),
+            budget_condition=str(metadata.get("budget_condition") or ("skip_count" if is_setattn else "none")),
+            max_budget=int(metadata.get("max_budget") or num_layers),
         )
     else:
         state_size = int(metadata.get("state_size") or metadata.get("hidden_size") or hidden_size)
@@ -213,9 +219,25 @@ def load_router(path: str, hidden_size: int, num_layers: int, device):
     return router, metadata
 
 
-def predict_risk(router, metadata, model, input_ids, attention_mask, labels, tokenizer, num_layers: int, default_prefix_depth: int):
+def predict_risk(
+    router,
+    metadata,
+    model,
+    input_ids,
+    attention_mask,
+    labels,
+    tokenizer,
+    num_layers: int,
+    default_prefix_depth: int,
+    skip_count=None,
+    keep_count=None,
+):
     router_input = str(metadata.get("router_input") or "")
     prefix_depth = int(metadata.get("prefix_depth") or default_prefix_depth)
+    budget_skip_count = skip_count if skip_count is not None else metadata.get("label_skip_count", metadata.get("skip_count"))
+    budget_keep_count = keep_count if keep_count is not None else metadata.get("label_keep_count")
+    if budget_keep_count is None and budget_skip_count is not None:
+        budget_keep_count = int(num_layers) - int(budget_skip_count)
     router_input_ids, router_attention_mask = prompt_only_inputs(
         input_ids,
         attention_mask,
@@ -232,7 +254,13 @@ def predict_risk(router, metadata, model, input_ids, attention_mask, labels, tok
         if router_input in ATTENTION_ROUTER_INPUTS:
             raw_hidden = raw_embedding_hidden_state(model, router_input_ids)
             hk_hidden = teacher_prefix_hidden_state(model, router_input_ids, router_attention_mask, num_layers, prefix_depth)
-            return router(raw_hidden, hk_hidden, router_attention_mask).detach().float()[0]
+            return router(
+                raw_hidden,
+                hk_hidden,
+                router_attention_mask,
+                skip_count=budget_skip_count,
+                keep_count=budget_keep_count,
+            ).detach().float()[0]
     raise ValueError(f"Unsupported router_input for diagnostic: {router_input!r}")
 
 

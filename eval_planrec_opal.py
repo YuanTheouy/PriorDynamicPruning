@@ -84,7 +84,9 @@ ATTENTION_RISK_ROUTER_INPUTS = {
     "prefix_hk_raw_attn",
     "prefix_hk_raw_attn_hk_last_resid",
     "prefix_hk_raw_attn_raw_hk_last_resid",
+    "prefix_hk_raw_setattn",
 }
+SETATTN_RISK_ROUTER_INPUTS = {"prefix_hk_raw_setattn"}
 
 
 class IndexedDataset:
@@ -217,10 +219,27 @@ def load_or_build_masks(args, num_layers: int) -> List[LayerMaskSpec]:
     return masks
 
 
+def load_single_mask(path: str, mask_id: str, expected_budget: int) -> LayerMaskSpec:
+    specs = load_mask_library(path)
+    spec = filter_masks(specs, mask_id=mask_id)[0] if mask_id else filter_masks(specs, budget=expected_budget)[0]
+    if spec.budget != int(expected_budget):
+        raise ValueError(
+            f"Selected mask {spec.mask_id!r} keeps {spec.budget} layers, "
+            f"but evaluator budget is {expected_budget}."
+        )
+    return spec
+
+
 def static_mask_from_args(args, num_layers: int, mask_specs: Sequence[LayerMaskSpec]) -> LayerMaskSpec:
     selected_mask_id = args.mask_id or args.template_id
     if selected_mask_id:
-        return filter_masks(mask_specs, mask_id=selected_mask_id)[0]
+        spec = filter_masks(mask_specs, mask_id=selected_mask_id)[0]
+        if spec.budget != int(args.top_k_layers):
+            raise ValueError(
+                f"Selected static mask {spec.mask_id!r} keeps {spec.budget} layers, "
+                f"but evaluator budget is {args.top_k_layers}. Check --skip_rate/--top_k_layers."
+            )
+        return spec
     if args.static_strategy:
         mask = generate_mask(args.static_strategy, num_layers, args.top_k_layers, seed=args.seed)
         return LayerMaskSpec(
@@ -330,7 +349,8 @@ def load_risk_router(args, hidden_size: int, num_layers: int, device):
     state_size = int(metadata.get("state_size") or metadata.get("hidden_size") or hidden_size)
     router_input = str(metadata.get("router_input") or "")
     router_architecture = str(metadata.get("router_architecture") or "")
-    if router_input in ATTENTION_RISK_ROUTER_INPUTS or router_architecture == "layer_query_cross_attention":
+    is_setattn = router_input in SETATTN_RISK_ROUTER_INPUTS or router_architecture == "opal_setattn_v1"
+    if router_input in ATTENTION_RISK_ROUTER_INPUTS or router_architecture in {"layer_query_cross_attention", "opal_setattn_v1"}:
         router = LayerQueryCrossAttentionRiskRouter(
             base_hidden_size=int(metadata.get("base_hidden_size") or hidden_size),
             num_layers=num_layers,
@@ -338,6 +358,9 @@ def load_risk_router(args, hidden_size: int, num_layers: int, device):
             router_heads=int(metadata.get("router_heads") or 4),
             use_hk_last_residual=bool(metadata.get("use_hk_last_residual")),
             use_raw_last_residual=bool(metadata.get("use_raw_last_residual")),
+            use_layer_self_attention=bool(metadata.get("use_layer_self_attention") or is_setattn),
+            budget_condition=str(metadata.get("budget_condition") or ("skip_count" if is_setattn else "none")),
+            max_budget=int(metadata.get("max_budget") or num_layers),
         )
     else:
         router = OpalRiskRouter(hidden_size=state_size, num_layers=num_layers)
@@ -609,6 +632,40 @@ def raw_embedding_request_state(model, input_ids, attention_mask):
     return ((embeds * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)).float()
 
 
+def minmax_normalize(values: Sequence[float]) -> List[float]:
+    row = [float(v) for v in values]
+    if not row:
+        return row
+    lo = min(row)
+    hi = max(row)
+    scale = hi - lo
+    if scale <= 1e-12:
+        return [0.0 for _ in row]
+    return [(value - lo) / scale for value in row]
+
+
+def apply_static_prior_to_risks(args, risk_rows: Sequence[Sequence[float]]) -> List[List[float]]:
+    prior_mask = getattr(args, "_risk_prior_mask", None)
+    prior_weight = float(getattr(args, "risk_prior_weight", 0.0) or 0.0)
+    if not prior_mask or prior_weight <= 0.0:
+        return [[float(v) for v in row] for row in risk_rows]
+    prior_weight = max(0.0, min(1.0, prior_weight))
+    # Risk convention: lower risk layers are skipped. A static keep mask has
+    # keep=1 and skip=0, so this prior exactly recovers the static mask when
+    # prior_weight=1.
+    prior_risk = [1.0 if int(keep) else 0.0 for keep in prior_mask]
+    fused = []
+    for row in risk_rows:
+        normalized = minmax_normalize(row)
+        fused.append(
+            [
+                (1.0 - prior_weight) * float(value) + prior_weight * float(prior)
+                for value, prior in zip(normalized, prior_risk)
+            ]
+        )
+    return fused
+
+
 def fusion_request_state(model, input_ids, attention_mask, prefix_hidden, recent_tokens: int, recent_decay: float):
     raw_hidden = raw_embedding_hidden_state(model, input_ids)
     features = [
@@ -719,7 +776,9 @@ def risk_router_masks(
             samples=input_ids.size(0),
             metadata={
                 "router_input": router_input,
-                "router_architecture": "layer_query_cross_attention",
+                "router_architecture": risk_router_metadata.get("router_architecture") or "layer_query_cross_attention",
+                "use_layer_self_attention": risk_router_metadata.get("use_layer_self_attention"),
+                "budget_condition": risk_router_metadata.get("budget_condition"),
                 "use_hk_last_residual": risk_router_metadata.get("use_hk_last_residual"),
                 "use_raw_last_residual": risk_router_metadata.get("use_raw_last_residual"),
                 "warmup": bool(is_warmup),
@@ -736,10 +795,13 @@ def risk_router_masks(
     else:
         raise ValueError(f"Unsupported risk router input: {router_input}")
 
+    keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
+    skip_count = int(num_layers) - int(keep_count)
+
     def run_router():
         with torch.no_grad():
             if isinstance(state, tuple):
-                return risk_router(*state).detach().float()
+                return risk_router(*state, skip_count=skip_count, keep_count=keep_count).detach().float()
             return risk_router(state).detach().float()
 
     pred_risk, _ = component_timer.measure(
@@ -748,8 +810,8 @@ def risk_router_masks(
         samples=input_ids.size(0),
         metadata={"router_input": router_input, "warmup": bool(is_warmup), "method": args.method},
     )
-    keep_count = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
-    risk_rows = pred_risk.cpu().tolist()
+    original_risk_rows = pred_risk.cpu().tolist()
+    risk_rows = apply_static_prior_to_risks(args, original_risk_rows)
     allowed_layers = risk_router_metadata.get("allowed_layers")
     if not allowed_layers and (
         risk_router_metadata.get("protected_head") is not None
@@ -766,7 +828,7 @@ def risk_router_masks(
     ]
     mask_ids = [mask_id_from_mask(mask, prefix=args.method) for mask in masks]
     row_metadata = []
-    for risk, mask in zip(risk_rows, masks):
+    for original_risk, risk, mask in zip(original_risk_rows, risk_rows, masks):
         row_metadata.append(
             {
                 "method": args.method,
@@ -776,6 +838,9 @@ def risk_router_masks(
                 "router_architecture": risk_router_metadata.get("router_architecture"),
                 "router_dim": risk_router_metadata.get("router_dim"),
                 "router_heads": risk_router_metadata.get("router_heads"),
+                "use_layer_self_attention": risk_router_metadata.get("use_layer_self_attention"),
+                "budget_condition": risk_router_metadata.get("budget_condition"),
+                "max_budget": risk_router_metadata.get("max_budget"),
                 "use_hk_last_residual": risk_router_metadata.get("use_hk_last_residual"),
                 "use_raw_last_residual": risk_router_metadata.get("use_raw_last_residual"),
                 "recent_tokens": risk_router_metadata.get("recent_tokens"),
@@ -783,6 +848,7 @@ def risk_router_masks(
                 "prefix_depth": int(args.prefix_depth) if router_input in {"prefix_hk", "prefix_hk_raw_fusion", "prefix_hk_raw_last"} or router_input in ATTENTION_RISK_ROUTER_INPUTS else 0,
                 "pred_risk": risk,
                 "skip_risk": risk,
+                "raw_pred_risk": original_risk,
                 "layer_scores": risk,
                 "skipped_layers": [idx for idx, keep in enumerate(mask) if int(keep) == 0],
                 "kept_layer_count": sum(int(v) for v in mask),
@@ -791,6 +857,8 @@ def risk_router_masks(
                 "protected_head": risk_router_metadata.get("protected_head"),
                 "protected_tail": risk_router_metadata.get("protected_tail"),
                 "allowed_layers": allowed_layers,
+                "risk_prior_mask_id": getattr(args, "_risk_prior_mask_id", None),
+                "risk_prior_weight": float(getattr(args, "risk_prior_weight", 0.0) or 0.0),
             }
         )
     return masks, mask_ids, risk_rows, row_metadata
@@ -1933,6 +2001,9 @@ def build_parser():
     parser.add_argument("--student_ckpt", default="")
     parser.add_argument("--policy_ckpt", default="")
     parser.add_argument("--risk_router_ckpt", default="")
+    parser.add_argument("--risk_prior_mask_library", default="")
+    parser.add_argument("--risk_prior_mask_id", default="")
+    parser.add_argument("--risk_prior_weight", type=float, default=0.0)
     parser.add_argument("--candidate_router_ckpt", default="")
     parser.add_argument("--ig_cluster_artifact", default="")
     parser.add_argument("--layerwise_router_ckpt", default="")
@@ -2101,7 +2172,7 @@ def main():
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     num_layers = detect_num_layers(model)
-    if args.method in {"opal_q", "opal_risk", "raw_input_risk", "pudding_prompt_candidate", "ig_cluster_mask", "layerwise_hidden_router"}:
+    if args.method != "full" and args.skip_rate >= 0:
         args.top_k_layers = keep_count_from_skip_rate(num_layers, args.skip_rate, args.top_k_layers)
     effective_top_k_layers = num_layers if args.method == "full" else args.top_k_layers
 
@@ -2110,6 +2181,12 @@ def main():
     sid_token_ids = get_sid_token_ids_from_info(tokenizer, args.info_file)
     mask_specs = load_or_build_masks(args, num_layers)
     args._input_guided_calibrated_map = load_input_guided_calibration(args)
+    args._risk_prior_mask = None
+    args._risk_prior_mask_id = None
+    if args.risk_prior_mask_library:
+        prior_spec = load_single_mask(args.risk_prior_mask_library, args.risk_prior_mask_id, args.top_k_layers)
+        args._risk_prior_mask = prior_spec.mask
+        args._risk_prior_mask_id = prior_spec.mask_id
     static_mask_spec = None
     if args.method == "static":
         static_mask_spec = static_mask_from_args(args, num_layers, mask_specs)
@@ -2950,6 +3027,9 @@ def main():
             "student_ckpt": args.student_ckpt,
             "policy_ckpt": args.policy_ckpt,
             "risk_router_ckpt": args.risk_router_ckpt,
+            "risk_prior_mask_library": args.risk_prior_mask_library,
+            "risk_prior_mask_id": args._risk_prior_mask_id,
+            "risk_prior_weight": float(args.risk_prior_weight),
             "candidate_router_ckpt": args.candidate_router_ckpt,
             "ig_cluster_artifact": args.ig_cluster_artifact,
             "layerwise_router_ckpt": args.layerwise_router_ckpt,

@@ -82,6 +82,9 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
         dropout: float = 0.0,
         use_hk_last_residual: bool = False,
         use_raw_last_residual: bool = False,
+        use_layer_self_attention: bool = False,
+        budget_condition: str = "none",
+        max_budget: int = None,
     ):
         super().__init__()
         self.num_layers = int(num_layers)
@@ -89,10 +92,17 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
         self.router_heads = int(router_heads)
         self.use_hk_last_residual = bool(use_hk_last_residual)
         self.use_raw_last_residual = bool(use_raw_last_residual)
+        self.use_layer_self_attention = bool(use_layer_self_attention)
+        self.budget_condition = str(budget_condition or "none")
+        self.max_budget = int(max_budget or self.num_layers)
         if self.router_dim <= 0:
             raise ValueError("router_dim must be positive")
         if self.router_heads <= 0 or self.router_dim % self.router_heads != 0:
             raise ValueError("router_dim must be divisible by router_heads")
+        if self.budget_condition not in {"none", "skip_count", "keep_count"}:
+            raise ValueError("budget_condition must be one of: none, skip_count, keep_count")
+        if self.max_budget < 0:
+            raise ValueError("max_budget must be non-negative")
 
         input_size = int(base_hidden_size) * 2
         self.token_proj = nn.Sequential(
@@ -109,6 +119,31 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
             dropout=float(dropout),
             batch_first=True,
         )
+        if self.use_layer_self_attention:
+            self.layer_self_attn_norm = nn.LayerNorm(self.router_dim)
+            self.layer_self_attn = nn.MultiheadAttention(
+                embed_dim=self.router_dim,
+                num_heads=self.router_heads,
+                dropout=float(dropout),
+                batch_first=True,
+            )
+            self.layer_self_ffn = nn.Sequential(
+                nn.LayerNorm(self.router_dim),
+                nn.Linear(self.router_dim, self.router_dim * 4),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(self.router_dim * 4, self.router_dim),
+                nn.Dropout(float(dropout)),
+            )
+        else:
+            self.layer_self_attn_norm = None
+            self.layer_self_attn = None
+            self.layer_self_ffn = None
+        if self.budget_condition == "none":
+            self.budget_embedding = None
+        else:
+            self.budget_embedding = nn.Embedding(self.max_budget + 1, self.router_dim)
+            nn.init.normal_(self.budget_embedding.weight, mean=0.0, std=self.router_dim ** -0.5)
         self.risk_head = nn.Sequential(
             nn.LayerNorm(self.router_dim),
             nn.Linear(self.router_dim, self.router_dim),
@@ -141,17 +176,56 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
             rows.append(hidden[active[-1]] if active.numel() > 0 else hidden[-1])
         return torch.stack(rows, dim=0)
 
+    def _budget_values(
+        self,
+        batch_size: int,
+        device: torch.device,
+        skip_count=None,
+        keep_count=None,
+    ):
+        if self.budget_condition == "none":
+            return None
+        value = skip_count if self.budget_condition == "skip_count" else keep_count
+        if value is None:
+            raise ValueError(f"budget_condition={self.budget_condition!r} requires a budget value in forward()")
+        if isinstance(value, torch.Tensor):
+            budget = value.to(device=device, dtype=torch.long).flatten()
+        elif isinstance(value, (list, tuple)):
+            budget = torch.tensor(value, device=device, dtype=torch.long).flatten()
+        else:
+            budget = torch.full((batch_size,), int(value), device=device, dtype=torch.long)
+        if budget.numel() == 1:
+            budget = budget.expand(batch_size)
+        if budget.numel() != batch_size:
+            raise ValueError(f"Budget value must be scalar or batch-sized; got {budget.numel()} for batch={batch_size}")
+        if budget.min().item() < 0 or budget.max().item() > self.max_budget:
+            raise ValueError(
+                f"Budget values must be in [0, {self.max_budget}] for {self.budget_condition}; "
+                f"got min={int(budget.min().item())} max={int(budget.max().item())}"
+            )
+        return budget
+
     def forward(
         self,
         raw_seq: torch.Tensor,
         hk_seq: torch.Tensor,
         attention_mask: torch.Tensor,
+        skip_count=None,
+        keep_count=None,
     ) -> torch.Tensor:
         raw_seq = raw_seq.float()
         hk_seq = hk_seq.float()
         x = torch.cat([raw_seq, hk_seq], dim=-1)
         z = self.token_proj(x)
         query = self.layer_queries.unsqueeze(0).expand(z.size(0), -1, -1)
+        budget_values = self._budget_values(
+            batch_size=z.size(0),
+            device=z.device,
+            skip_count=skip_count,
+            keep_count=keep_count,
+        )
+        if budget_values is not None:
+            query = query + self.budget_embedding(budget_values).unsqueeze(1)
         key_padding_mask = attention_mask.eq(0) if attention_mask is not None else None
         context, _ = self.cross_attn(
             query=query,
@@ -160,6 +234,16 @@ class LayerQueryCrossAttentionRiskRouter(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
+        if self.layer_self_attn is not None:
+            attn_input = self.layer_self_attn_norm(context)
+            delta, _ = self.layer_self_attn(
+                query=attn_input,
+                key=attn_input,
+                value=attn_input,
+                need_weights=False,
+            )
+            context = context + delta
+            context = context + self.layer_self_ffn(context)
         risk = self.risk_head(context).squeeze(-1).float()
         if self.hk_last_head is not None:
             risk = risk + self.hk_last_head(self._last_active_state(hk_seq, attention_mask))

@@ -124,6 +124,20 @@ skip_tag() {
   printf "%s" "$1" | tr "." "p"
 }
 
+objective_tag() {
+  case "$1" in
+    Delta_NLL|delta_nll|DELTA_NLL)
+      printf "delta"
+      ;;
+    KL|kl)
+      printf "kl"
+      ;;
+    *)
+      printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_'
+      ;;
+  esac
+}
+
 configure_dataset() {
   local dataset="$1"
   case "$dataset" in
@@ -152,26 +166,28 @@ configure_dataset() {
 
 configure_task() {
   local task="$1"
+  local obj_tag
+  obj_tag="$(objective_tag "$RISK_OBJECTIVE")"
   case "$task" in
     office25)
       configure_dataset Office_Products
       export SKIP_RATE="0.25"
       export TOP_K_LAYERS="21"
-      export RUN_GROUP="${SUBMISSION_RUN_GROUP:-submission_office25_delta_m${LABEL_MAX_SAMPLES}}"
+      export RUN_GROUP="${SUBMISSION_RUN_GROUP:-submission_office25_${obj_tag}_m${LABEL_MAX_SAMPLES}}"
       export TASK_PROFILE="office_main"
       ;;
     industrial25)
       configure_dataset Industrial_and_Scientific
       export SKIP_RATE="0.25"
       export TOP_K_LAYERS="21"
-      export RUN_GROUP="${SUBMISSION_RUN_GROUP:-submission_industrial25_delta_m${LABEL_MAX_SAMPLES}}"
+      export RUN_GROUP="${SUBMISSION_RUN_GROUP:-submission_industrial25_${obj_tag}_m${LABEL_MAX_SAMPLES}}"
       export TASK_PROFILE="second_dataset"
       ;;
     office36)
       configure_dataset Office_Products
       export SKIP_RATE="${OFFICE36_SKIP_RATE:-0.357}"
       export TOP_K_LAYERS="${OFFICE36_TOP_K_LAYERS:-18}"
-      export RUN_GROUP="${SUBMISSION_RUN_GROUP:-submission_office36_delta_m${LABEL_MAX_SAMPLES}}"
+      export RUN_GROUP="${SUBMISSION_RUN_GROUP:-submission_office36_${obj_tag}_m${LABEL_MAX_SAMPLES}}"
       export TASK_PROFILE="second_skip_rate"
       ;;
     *)

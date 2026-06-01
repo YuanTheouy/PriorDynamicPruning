@@ -936,8 +936,32 @@ Short conclusion:
 - OPAL-PrefixLast has the best dynamic KL by a small margin (`2.489585`), while OPAL-Attn has the best dynamic NDCG/retention at this heavier skip rate.
 - Paper framing: Office 25% remains the main fair table where OPAL-PrefixLast is strongest on likelihood preservation. Office 35.7% should be framed as a stress test showing dynamic routers are competitive, but validation-selected static masks can become very strong when the skip budget is aggressive.
 
-### Public LM Recording Status
+### Priority 4 Not Run: Public LM Sanity Benchmark
 
-| priority | run group | local recording status |
-|---:|---|---|
-| 4 | public LM sanity | not yet present in this local note; if not run, record whether the reason was missing runner, dependency failure, missing model, or time limit |
+Requested condition:
+
+```text
+Run public LM sanity only if ./run_public_lm_sanity_gpu01234567.sh already
+exists and passes smoke; otherwise do not block the PlanRec submission runs.
+```
+
+Observed after the 40h run:
+
+```text
+/workspace/PriorDynamicPruning/results contains no public-LM/lm-sanity output.
+/tmp contains no retained submission_40h/public-LM log file.
+Current repo branch contains no run_public_lm_sanity_gpu01234567.sh runner.
+```
+
+Status:
+
+```text
+Public LM sanity was not completed.
+Most likely reason: runner missing / not executable, so the conditional public-LM
+step was skipped. There is no evidence of dependency failure or model-download
+failure because no public-LM run artifacts or logs were produced.
+```
+
+This means the 40h unattended run completed the PlanRec submission axes
+(`industrial25` and `office36`), but did not add the optional public-LM
+generalization benchmark.

@@ -26,11 +26,12 @@ export BCE_CKPT_ROOT=/workspace/PriorDynamicPruning/policy_ckpts/final_kl_greedy
 export EXACT_CKPT_ROOT=/workspace/PriorDynamicPruning/policy_ckpts/final_kl_greedy_set_exact_k_ce
 export DIAG_DIR=/workspace/PriorDynamicPruning/results/opal_greedy_set_diagnostics
 
-export SEED=42
+export SEED="${OPAL_SEED:-42}"
 export PRECISION=bf16
 export PREFIX_DEPTH=4
 export SKIP_RATE=0.25
 export TOP_K_LAYERS=21
+export GREEDY_OBJECTIVE="${OPAL_GREEDY_OBJECTIVE:-final_KL}"
 export TOP_K_ITEMS=50
 export MAX_NEW_TOKENS=256
 export LABEL_MAX_SAMPLES="${OPAL_LABEL_MAX_SAMPLES:-2000}"
@@ -47,10 +48,12 @@ export PROTECTED_TAIL=2
 export WARMUP_BATCHES=0
 export TIMED_BATCHES=0
 export EVAL_MAX_BATCHES="${OPAL_EVAL_MAX_BATCHES:-500}"
-export BCE_RUN_GROUP="final_kl_greedy_set_m${LABEL_MAX_SAMPLES}_seed${SEED}"
-export RUN_GROUP="final_kl_greedy_set_exact_k_ce_m${LABEL_MAX_SAMPLES}_seed${SEED}"
+export OBJECTIVE_TAG
+OBJECTIVE_TAG="$(printf "%s" "$GREEDY_OBJECTIVE" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')"
+export BCE_RUN_GROUP="${OBJECTIVE_TAG}_greedy_set_m${LABEL_MAX_SAMPLES}_seed${SEED}"
+export RUN_GROUP="${OBJECTIVE_TAG}_greedy_set_exact_k_ce_m${LABEL_MAX_SAMPLES}_seed${SEED}"
 export SUMMARY_TABLE="summary_${RUN_GROUP}.csv"
-export LABEL_FILE="${LABEL_DIR}/${CATEGORY}_final_KL_greedy_set_m${LABEL_MAX_SAMPLES}_seed${SEED}_head${PROTECTED_HEAD}_tail${PROTECTED_TAIL}.jsonl"
+export LABEL_FILE="${LABEL_DIR}/${CATEGORY}_${OBJECTIVE_TAG}_greedy_set_m${LABEL_MAX_SAMPLES}_seed${SEED}_head${PROTECTED_HEAD}_tail${PROTECTED_TAIL}.jsonl"
 
 cd "$REPO_DIR"
 mkdir -p "$LABEL_DIR" "$BCE_CKPT_ROOT" "$EXACT_CKPT_ROOT" "$OUTPUT_DIR" "$DIAG_DIR"
@@ -60,6 +63,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "LABEL_MAX_SAMPLES=${LABEL_MAX_SAMPLES}"
 echo "SEED=${SEED}"
 echo "SKIP_RATE=${SKIP_RATE}"
+echo "GREEDY_OBJECTIVE=${GREEDY_OBJECTIVE}"
 echo "PROTECTED_HEAD=${PROTECTED_HEAD}"
 echo "PROTECTED_TAIL=${PROTECTED_TAIL}"
 echo "RUN_GROUP=${RUN_GROUP}"
@@ -162,6 +166,7 @@ else
     --top_k_layers "$TOP_K_LAYERS" \
     --protected_head "$PROTECTED_HEAD" \
     --protected_tail "$PROTECTED_TAIL" \
+    --objective "$GREEDY_OBJECTIVE" \
     --max_samples "$LABEL_MAX_SAMPLES" \
     --sample_strategy random \
     --sample_seed "$SEED" \

@@ -118,7 +118,19 @@ def keep_mask_from_skipped(num_layers: int, skipped_layers, device):
     return mask
 
 
-def greedy_final_kl_skip_set(
+def quality_objective_key(objective: str) -> str:
+    if objective in {"KL", "final_KL", "KL_full_to_skip"}:
+        return "KL_full_to_skip"
+    if objective in {"Delta_NLL", "delta_nll"}:
+        return "Delta_NLL"
+    raise ValueError(f"Unsupported greedy objective: {objective}")
+
+
+def objective_label(objective: str) -> str:
+    return "final_KL" if quality_objective_key(objective) == "KL_full_to_skip" else "Delta_NLL"
+
+
+def greedy_skip_set(
     model,
     input_ids,
     attention_mask,
@@ -127,7 +139,9 @@ def greedy_final_kl_skip_set(
     num_layers: int,
     allowed_layers,
     skip_count: int,
+    objective: str,
 ):
+    objective_key = quality_objective_key(objective)
     selected = []
     steps = []
     for step_idx in range(int(skip_count)):
@@ -140,14 +154,15 @@ def greedy_final_kl_skip_set(
             mask = keep_mask_from_skipped(num_layers, candidate_skips, input_ids.device)
             skip_logits = forward_with_mask(model, input_ids, attention_mask, mask)
             quality = quality_rows_from_logits(full_logits, skip_logits, labels)[0]
-            candidate_kl = float(quality["KL_full_to_skip"])
+            candidate_loss = float(quality[objective_key])
             candidate_count += 1
-            if best is None or candidate_kl < best["final_KL"] or (
-                candidate_kl == best["final_KL"] and int(layer_idx) < int(best["layer"])
+            if best is None or candidate_loss < best["objective_loss"] or (
+                candidate_loss == best["objective_loss"] and int(layer_idx) < int(best["layer"])
             ):
                 best = {
                     "layer": int(layer_idx),
-                    "final_KL": candidate_kl,
+                    "objective_loss": candidate_loss,
+                    "final_KL": float(quality["KL_full_to_skip"]),
                     "Delta_NLL": float(quality["Delta_NLL"]),
                     "Delta_PPL": float(quality["Delta_PPL"]),
                 }
@@ -159,6 +174,8 @@ def greedy_final_kl_skip_set(
                 "step": step_idx + 1,
                 "selected_layer": int(best["layer"]),
                 "candidate_count": int(candidate_count),
+                "objective": objective_label(objective),
+                "objective_loss": float(best["objective_loss"]),
                 "final_KL": float(best["final_KL"]),
                 "Delta_NLL": float(best["Delta_NLL"]),
                 "Delta_PPL": float(best["Delta_PPL"]),
@@ -170,7 +187,7 @@ def greedy_final_kl_skip_set(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build final-KL forward-greedy skip-set supervision labels.")
+    parser = argparse.ArgumentParser(description="Build forward-greedy skip-set supervision labels.")
     parser.add_argument("--teacher_model", required=True)
     parser.add_argument("--train_file", default="")
     parser.add_argument("--calibration_file", default="")
@@ -180,6 +197,7 @@ def main():
     parser.add_argument("--top_k_layers", type=int, default=21)
     parser.add_argument("--protected_head", type=int, default=4)
     parser.add_argument("--protected_tail", type=int, default=2)
+    parser.add_argument("--objective", choices=["final_KL", "KL", "Delta_NLL"], default="final_KL")
     parser.add_argument("--max_samples", type=int, default=500)
     parser.add_argument("--sample_strategy", choices=["first", "random"], default="random")
     parser.add_argument("--sample_seed", type=int, default=None)
@@ -265,7 +283,7 @@ def main():
                 attention_mask = batch_attention_mask[row_pos : row_pos + 1]
                 labels = batch_labels[row_pos : row_pos + 1]
                 full_logits = forward_with_mask(model, input_ids, attention_mask, None)
-                skipped_layers, skip_mask, keep_mask, steps = greedy_final_kl_skip_set(
+                skipped_layers, skip_mask, keep_mask, steps = greedy_skip_set(
                     model=model,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -274,13 +292,19 @@ def main():
                     num_layers=num_layers,
                     allowed_layers=allowed_layers,
                     skip_count=skip_count,
+                    objective=args.objective,
                 )
-                final_step = steps[-1] if steps else {"final_KL": 0.0, "Delta_NLL": 0.0, "Delta_PPL": 0.0}
+                final_step = steps[-1] if steps else {
+                    "objective_loss": 0.0,
+                    "final_KL": 0.0,
+                    "Delta_NLL": 0.0,
+                    "Delta_PPL": 0.0,
+                }
                 f.write(
                     json.dumps(
                         {
                             "sample_id": int(sample_id),
-                            "objective": "final_KL",
+                            "objective": objective_label(args.objective),
                             "supervision_type": "skip_set",
                             "search": "forward_greedy",
                             "num_layers": int(num_layers),
@@ -293,6 +317,7 @@ def main():
                             "skipped_layers": skipped_layers,
                             "skip_mask": skip_mask,
                             "keep_mask": keep_mask,
+                            "objective_loss": float(final_step["objective_loss"]),
                             "final_KL": float(final_step["final_KL"]),
                             "Delta_NLL": float(final_step["Delta_NLL"]),
                             "Delta_PPL": float(final_step["Delta_PPL"]),
@@ -321,7 +346,7 @@ def main():
                     "data_file": data_file,
                     "category": args.category,
                     "dataset_prompt": "EvalSidDataset",
-                    "objective": "final_KL",
+                    "objective": objective_label(args.objective),
                     "supervision_type": "skip_set",
                     "search": "forward_greedy",
                     "skip_rate": float(args.skip_rate),
@@ -340,7 +365,7 @@ def main():
             ),
             encoding="utf-8",
         )
-        print(f"Wrote {len(rows)} final-KL greedy skip-set rows to {output_path}")
+        print(f"Wrote {len(rows)} {objective_label(args.objective)} greedy skip-set rows to {output_path}")
         print(f"Wrote metadata to {metadata_path}")
 
 

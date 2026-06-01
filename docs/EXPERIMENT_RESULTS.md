@@ -820,6 +820,64 @@ Main conclusions:
 - static best-on-val is a strong fixed-mask baseline and wins mean KL because seed 3407 selects a good `random_diverse_k21_v24` mask on validation. OPAL-PrefixLast still clearly beats it on `Delta_NLL` and `Delta_PPL`.
 - PuDDing-style, IG-style, layerwise-hidden, and random dynamic baselines do not beat OPAL-PrefixLast on the likelihood preservation objective.
 
+### Priority 2 Completed: Industrial_and_Scientific 25% Skip
+
+Server summary:
+
+```text
+dataset = Industrial_and_Scientific
+skip_rate = 0.25
+layers = 28
+skip_count = 7
+kept_layers = 21
+seeds = 42 / 13 / 3407
+label objective = one-layer Delta_NLL
+label samples = random m2000 per seed
+table = /workspace/PriorDynamicPruning/results/planrec_experiments/tables/summary_submission_industrial25_delta_m2000.csv
+rows = 27
+```
+
+Completed methods:
+
+```text
+full
+static uniform
+static ends_heavy
+static best-on-val
+random dynamic hash
+raw_input_risk
+OPAL-PrefixLast
+OPAL-Attn
+IG-style cluster
+```
+
+Three-seed averages, sorted by `Delta_NLL` among skip methods:
+
+| method | mean NDCG@10 | mean retention | mean Delta_NLL ↓ | mean Delta_PPL ↓ | mean KL ↓ | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| static best-on-val | 0.1134 | 0.8356 | **-0.299121** | **-5.042637** | **0.988811** | 1.0 |
+| static ends_heavy | 0.1134 | 0.8356 | **-0.299121** | **-5.042637** | **0.988811** | 1.0 |
+| raw_input_risk | 0.1206 | 0.8882 | -0.002367 | 0.611307 | 1.786387 | 82.7 |
+| OPAL-PrefixLast | 0.1185 | 0.8729 | 0.053427 | 2.859912 | 1.873676 | 155.0 |
+| OPAL-Attn | 0.1188 | 0.8748 | 0.122975 | 2.689344 | 1.955186 | 157.0 |
+| IG-style cluster | 0.1163 | 0.8569 | 0.123106 | 2.558113 | 1.772026 | 7.0 |
+| static uniform | **0.1248** | **0.9194** | 1.029266 | 35.089726 | 1.769962 | 1.0 |
+| random dynamic hash | 0.1153 | 0.8490 | 1.609992 | 83.726653 | 2.409829 | 12.0 |
+
+Full model reference:
+
+| method | mean NDCG@10 | mean retention | mean Delta_NLL | mean Delta_PPL | mean KL | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| full | 0.1358 | 1.0000 | 0.000000 | 0.000000 | 0.000000 | 1.0 |
+
+Short conclusion:
+
+- On Industrial_and_Scientific at 25% skip, `static ends_heavy` is selected as `static best-on-val` for all seeds and is the strongest row on likelihood/distribution metrics (`Delta_NLL`, `Delta_PPL`, KL).
+- `raw_input_risk` is the strongest dynamic method on mean `Delta_NLL` and downstream retention, nearly matching full-model NLL on average.
+- OPAL-PrefixLast is competitive among prompt-only dynamic methods but does not beat `raw_input_risk` or the strong static ends-heavy mask on this dataset.
+- OPAL-Attn has slightly better `Delta_PPL`, NDCG, and retention than OPAL-PrefixLast here, but worse `Delta_NLL` and KL.
+- Paper framing: this second dataset should be reported as a mixed-result generalization check. It strengthens the evaluation story because the method is compared against strong static and related baselines across datasets, but it should not be oversold as an OPAL-PrefixLast win.
+
 ### Priority 3 Completed: Office_Products Second Skip Rate
 
 Server summary:
@@ -878,9 +936,8 @@ Short conclusion:
 - OPAL-PrefixLast has the best dynamic KL by a small margin (`2.489585`), while OPAL-Attn has the best dynamic NDCG/retention at this heavier skip rate.
 - Paper framing: Office 25% remains the main fair table where OPAL-PrefixLast is strongest on likelihood preservation. Office 35.7% should be framed as a stress test showing dynamic routers are competitive, but validation-selected static masks can become very strong when the skip budget is aggressive.
 
-### Priority 2 / Public LM Recording Status
+### Public LM Recording Status
 
 | priority | run group | local recording status |
 |---:|---|---|
-| 2 | `submission_industrial25_delta_m2000` | results not yet present in this local note; paste or sync the summary table to record |
 | 4 | public LM sanity | not yet present in this local note; if not run, record whether the reason was missing runner, dependency failure, missing model, or time limit |

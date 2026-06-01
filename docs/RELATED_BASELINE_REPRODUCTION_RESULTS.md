@@ -81,6 +81,29 @@ Related-baseline conclusion:
 - static best-on-val has the best mean KL, mostly due to seed 3407 selecting a strong validation mask, but it does not preserve likelihood as well as OPAL-PrefixLast.
 - PuDDing-style, IG-style, layerwise hidden router, and random dynamic hash do not outperform OPAL-PrefixLast under the fixed budget.
 
+### Industrial and Scientific 25% Skip Related Baseline Results
+
+Completed on `Industrial_and_Scientific`, seeds `42 / 13 / 3407`, same 7
+skipped / 21 kept budget.
+
+| method | mean Delta_NLL ↓ | mean Delta_PPL ↓ | mean KL ↓ | mean NDCG@10 | mean retention | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| static best-on-val | **-0.299121** | **-5.042637** | **0.988811** | 0.1134 | 0.8356 | 1.0 |
+| static ends_heavy | **-0.299121** | **-5.042637** | **0.988811** | 0.1134 | 0.8356 | 1.0 |
+| raw_input_risk | -0.002367 | 0.611307 | 1.786387 | 0.1206 | 0.8882 | 82.7 |
+| OPAL-PrefixLast | 0.053427 | 2.859912 | 1.873676 | 0.1185 | 0.8729 | 155.0 |
+| OPAL-Attn | 0.122975 | 2.689344 | 1.955186 | 0.1188 | 0.8748 | 157.0 |
+| IG-style cluster | 0.123106 | 2.558113 | 1.772026 | 0.1163 | 0.8569 | 7.0 |
+| static uniform | 1.029266 | 35.089726 | 1.769962 | **0.1248** | **0.9194** | 1.0 |
+| random dynamic hash | 1.609992 | 83.726653 | 2.409829 | 0.1153 | 0.8490 | 12.0 |
+
+Related-baseline second-dataset conclusion:
+
+- Industrial is a mixed result: validation-selected `static best-on-val` collapses to `ends_heavy_k21` and is the strongest likelihood/KL row.
+- `raw_input_risk` is the strongest dynamic row on `Delta_NLL`, while OPAL-PrefixLast and OPAL-Attn remain competitive but do not beat the static ends-heavy mask.
+- static uniform has the best NDCG/retention but poor likelihood preservation, so it is not the primary row under the LLM acceleration objective.
+- This table is useful for paper honesty: OPAL-PrefixLast wins Office25, but the second dataset exposes strong static-mask behavior.
+
 ### Office Products 35.7% Skip Related Baseline Stress Results
 
 Completed on `Office_Products`, seeds `42 / 13 / 3407`, same 10 skipped / 18

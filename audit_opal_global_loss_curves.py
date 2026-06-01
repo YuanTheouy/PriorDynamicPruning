@@ -35,6 +35,7 @@ class AuditSpec:
     name: str
     metric_globs: tuple[str, ...]
     eval_needles: tuple[str, ...] = ()
+    eval_excludes: tuple[str, ...] = ()
     overlap_globs: tuple[str, ...] = ()
     required: bool = True
 
@@ -69,12 +70,11 @@ def specs() -> list[AuditSpec]:
 
     p2_run_groups = (
         "delta_nll_greedy_set_m2000_seed42",
-        "final_kl_greedy_set_m2000_seed42",
     )
     p2_exact_run_groups = (
         "delta_nll_greedy_set_exact_k_ce_m2000_seed42",
-        "final_kl_greedy_set_exact_k_ce_m2000_seed42",
     )
+    p2_eval_excludes = ("opal_setbce_", "opal_setattn_v1_")
     p2_specs = [
         AuditSpec(
             group="p2_delta_nll_greedy_set",
@@ -84,6 +84,7 @@ def specs() -> list[AuditSpec]:
                 for run in p2_run_groups
             ),
             eval_needles=tuple(f"{run}_raw_input_risk" for run in p2_run_groups),
+            eval_excludes=p2_eval_excludes,
             overlap_globs=tuple(
                 f"results/opal_greedy_set_diagnostics/{run}_raw_input_risk*_train_overlap.summary.json"
                 for run in p2_run_groups
@@ -97,6 +98,7 @@ def specs() -> list[AuditSpec]:
                 for run in p2_run_groups
             ),
             eval_needles=tuple(f"{run}_prefix_hk_raw_attn" for run in p2_run_groups),
+            eval_excludes=p2_eval_excludes,
             overlap_globs=tuple(
                 f"results/opal_greedy_set_diagnostics/{run}_prefix_hk_raw_attn*_train_overlap.summary.json"
                 for run in p2_run_groups
@@ -110,6 +112,7 @@ def specs() -> list[AuditSpec]:
                 for run in p2_exact_run_groups
             ),
             eval_needles=tuple(f"{run}_raw_input_risk_exact_k_ce" for run in p2_exact_run_groups),
+            eval_excludes=p2_eval_excludes,
             overlap_globs=tuple(
                 f"results/opal_greedy_set_diagnostics/{run}_raw_input_risk_exact_k_ce_train_overlap.summary.json"
                 for run in p2_exact_run_groups
@@ -123,6 +126,7 @@ def specs() -> list[AuditSpec]:
                 for run in p2_exact_run_groups
             ),
             eval_needles=tuple(f"{run}_prefix_hk_last_exact_k_ce" for run in p2_exact_run_groups),
+            eval_excludes=p2_eval_excludes,
             overlap_globs=tuple(
                 f"results/opal_greedy_set_diagnostics/{run}_prefix_hk_last_exact_k_ce_train_overlap.summary.json"
                 for run in p2_exact_run_groups
@@ -136,6 +140,7 @@ def specs() -> list[AuditSpec]:
                 for run in p2_exact_run_groups
             ),
             eval_needles=tuple(f"{run}_prefix_hk_raw_attn_exact_k_ce" for run in p2_exact_run_groups),
+            eval_excludes=p2_eval_excludes,
             overlap_globs=tuple(
                 f"results/opal_greedy_set_diagnostics/{run}_prefix_hk_raw_attn_exact_k_ce_train_overlap.summary.json"
                 for run in p2_exact_run_groups
@@ -148,14 +153,20 @@ def specs() -> list[AuditSpec]:
         AuditSpec(
             group="setattn_v1",
             name="prefix_hk_raw_setattn:bce",
-            metric_globs=(f"policy_ckpts/opal_setattn_v1/{setattn_run}/prefix_hk_raw_setattn_bce/training_metrics.json",),
+            metric_globs=(
+                f"policy_ckpts/opal_setattn_v1/{setattn_run}/prefix_hk_raw_setattn_bce/training_metrics.json",
+                f"policy_ckpts/opal_setattn_v1_smoke/{setattn_run}/prefix_hk_raw_setattn_bce/training_metrics.json",
+            ),
             eval_needles=(f"{setattn_run}_prefix_hk_raw_setattn_bce",),
             overlap_globs=(f"results/opal_greedy_set_diagnostics/{setattn_run}_prefix_hk_raw_setattn_bce_train_overlap.summary.json",),
         ),
         AuditSpec(
             group="setattn_v1",
             name="prefix_hk_raw_setattn:exact_k_ce",
-            metric_globs=(f"policy_ckpts/opal_setattn_v1/{setattn_run}/prefix_hk_raw_setattn_exact_k_ce/training_metrics.json",),
+            metric_globs=(
+                f"policy_ckpts/opal_setattn_v1/{setattn_run}/prefix_hk_raw_setattn_exact_k_ce/training_metrics.json",
+                f"policy_ckpts/opal_setattn_v1_smoke/{setattn_run}/prefix_hk_raw_setattn_exact_k_ce/training_metrics.json",
+            ),
             eval_needles=(f"{setattn_run}_prefix_hk_raw_setattn_exact_k_ce",),
             overlap_globs=(f"results/opal_greedy_set_diagnostics/{setattn_run}_prefix_hk_raw_setattn_exact_k_ce_train_overlap.summary.json",),
         ),
@@ -271,7 +282,7 @@ def summary_csv_rows(base: Path) -> list[dict]:
     return rows
 
 
-def find_eval_rows(rows: list[dict], needles: tuple[str, ...]) -> list[dict]:
+def find_eval_rows(rows: list[dict], needles: tuple[str, ...], excludes: tuple[str, ...] = ()) -> list[dict]:
     if not needles:
         return []
     selected: list[dict] = []
@@ -279,6 +290,8 @@ def find_eval_rows(rows: list[dict], needles: tuple[str, ...]) -> list[dict]:
     for row in rows:
         run_name = row.get("run_name") or row.get("name") or ""
         text = " ".join(str(row.get(key, "")) for key in ("run_name", "json_path", "result_json", "_summary_path"))
+        if excludes and any(exclude in text or exclude in run_name for exclude in excludes):
+            continue
         if any(needle in text or needle in run_name for needle in needles):
             key = (str(row.get("_summary_path")), run_name)
             if key not in seen:
@@ -348,7 +361,7 @@ def write_reports(base: Path, out_dir: Path, max_digest_sample_rows: int) -> tup
         metrics = load_metrics(metric_path) if metric_path else None
         overlap_paths = all_existing(spec.overlap_globs, base)
         overlap = load_overlap(overlap_paths[0] if overlap_paths else None)
-        eval_matches = find_eval_rows(eval_rows, spec.eval_needles)
+        eval_matches = find_eval_rows(eval_rows, spec.eval_needles, spec.eval_excludes)
         status = "OK" if metric_path else ("PENDING" if not spec.required else "MISSING")
         if metric_path and not eval_matches:
             status += "+EVAL_MISSING"

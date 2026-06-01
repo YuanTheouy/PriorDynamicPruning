@@ -819,3 +819,68 @@ Main conclusions:
 - OPAL-Attn remains a useful ablation: it has the best dynamic-router KL and a compact mask set, but it is weaker than OPAL-PrefixLast on the three-seed likelihood averages and downstream retention.
 - static best-on-val is a strong fixed-mask baseline and wins mean KL because seed 3407 selects a good `random_diverse_k21_v24` mask on validation. OPAL-PrefixLast still clearly beats it on `Delta_NLL` and `Delta_PPL`.
 - PuDDing-style, IG-style, layerwise-hidden, and random dynamic baselines do not beat OPAL-PrefixLast on the likelihood preservation objective.
+
+### Priority 3 Completed: Office_Products Second Skip Rate
+
+Server summary:
+
+```text
+dataset = Office_Products
+skip_rate = 0.3571
+layers = 28
+skip_count = 10
+kept_layers = 18
+seeds = 42 / 13 / 3407
+label objective = one-layer Delta_NLL
+label samples = random m2000 per seed
+table = /workspace/PriorDynamicPruning/results/planrec_experiments/tables/summary_submission_office36_delta_m2000.csv
+rows = 27
+```
+
+Completed methods:
+
+```text
+full
+static uniform
+static ends_heavy
+static best-on-val
+random dynamic hash
+raw_input_risk
+OPAL-PrefixLast
+OPAL-Attn
+IG-style cluster
+```
+
+Three-seed averages, sorted by `Delta_NLL` among skip methods:
+
+| method | mean NDCG@10 | mean retention | mean Delta_NLL ↓ | mean Delta_PPL ↓ | mean KL ↓ | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| static best-on-val | **0.1282** | **0.7066** | **0.328888** | **10.766920** | 2.281277 | 1.0 |
+| raw_input_risk | 0.1174 | 0.6469 | 0.509111 | 16.592211 | 2.503581 | 50.7 |
+| OPAL-PrefixLast | 0.1149 | 0.6338 | 0.512090 | 16.749792 | 2.489585 | 92.7 |
+| OPAL-Attn | 0.1190 | 0.6560 | 0.514535 | 16.959152 | 2.491641 | 133.7 |
+| IG-style cluster | 0.1061 | 0.5847 | 0.648491 | 22.758193 | 2.545443 | 6.7 |
+| static ends_heavy | 0.0924 | 0.5095 | 0.873638 | 34.731965 | **2.270256** | 1.0 |
+| static uniform | 0.0818 | 0.4510 | 2.498949 | 277.975715 | 4.468617 | 1.0 |
+| random dynamic hash | 0.1165 | 0.6420 | 3.302239 | 692.385318 | 4.219182 | 13.3 |
+
+Full model reference:
+
+| method | mean NDCG@10 | mean retention | mean Delta_NLL | mean Delta_PPL | mean KL | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| full | 0.1814 | 1.0000 | 0.000000 | 0.000000 | 0.000000 | 1.0 |
+
+Short conclusion:
+
+- At the heavier 35.7% skip budget, `static best-on-val` is the strongest row on average `Delta_NLL`, `Delta_PPL`, `NDCG@10`, and retention.
+- The dynamic routers remain much stronger than weak static baselines (`uniform`) and random dynamic masks, but they do not beat the validation-selected fixed mask at this skip rate.
+- `raw_input_risk`, OPAL-PrefixLast, and OPAL-Attn are very close on likelihood preservation: mean `Delta_NLL` is 0.509111 / 0.512090 / 0.514535.
+- OPAL-PrefixLast has the best dynamic KL by a small margin (`2.489585`), while OPAL-Attn has the best dynamic NDCG/retention at this heavier skip rate.
+- Paper framing: Office 25% remains the main fair table where OPAL-PrefixLast is strongest on likelihood preservation. Office 35.7% should be framed as a stress test showing dynamic routers are competitive, but validation-selected static masks can become very strong when the skip budget is aggressive.
+
+### Priority 2 / Public LM Recording Status
+
+| priority | run group | local recording status |
+|---:|---|---|
+| 2 | `submission_industrial25_delta_m2000` | results not yet present in this local note; paste or sync the summary table to record |
+| 4 | public LM sanity | not yet present in this local note; if not run, record whether the reason was missing runner, dependency failure, missing model, or time limit |

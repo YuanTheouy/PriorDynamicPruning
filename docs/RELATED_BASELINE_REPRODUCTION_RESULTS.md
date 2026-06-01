@@ -47,10 +47,9 @@ Status:
 
 | item | status |
 |---|---|
-| Office_Products 25% skip seed42 | runner ready; pending server run |
-| Office_Products 25% skip seeds 42/13/3407 | runner ready; pending server run |
-| Industrial_and_Scientific 25% skip seed42 | runner ready; pending server run |
-| Office_Products second skip rate seed42 | runner ready; pending server run |
+| Office_Products 25% skip seeds 42/13/3407 | completed and recorded |
+| Office_Products second skip rate seeds 42/13/3407 | completed and recorded |
+| Industrial_and_Scientific 25% skip seed42 | not yet present in this local note; paste or sync the summary table to record |
 
 Leakage rule:
 
@@ -81,3 +80,26 @@ Related-baseline conclusion:
 - OPAL-PrefixLast beats all implemented related baselines on mean `Delta_NLL` and `Delta_PPL`.
 - static best-on-val has the best mean KL, mostly due to seed 3407 selecting a strong validation mask, but it does not preserve likelihood as well as OPAL-PrefixLast.
 - PuDDing-style, IG-style, layerwise hidden router, and random dynamic hash do not outperform OPAL-PrefixLast under the fixed budget.
+
+### Office Products 35.7% Skip Related Baseline Stress Results
+
+Completed on `Office_Products`, seeds `42 / 13 / 3407`, same 10 skipped / 18
+kept budget. This is the second skip-rate stress test.
+
+| method | mean Delta_NLL ↓ | mean Delta_PPL ↓ | mean KL ↓ | mean NDCG@10 | mean retention | mean unique_masks |
+|---|---:|---:|---:|---:|---:|---:|
+| static best-on-val | **0.328888** | **10.766920** | 2.281277 | **0.1282** | **0.7066** | 1.0 |
+| raw_input_risk | 0.509111 | 16.592211 | 2.503581 | 0.1174 | 0.6469 | 50.7 |
+| OPAL-PrefixLast | 0.512090 | 16.749792 | 2.489585 | 0.1149 | 0.6338 | 92.7 |
+| OPAL-Attn | 0.514535 | 16.959152 | 2.491641 | 0.1190 | 0.6560 | 133.7 |
+| IG-style cluster | 0.648491 | 22.758193 | 2.545443 | 0.1061 | 0.5847 | 6.7 |
+| static ends_heavy | 0.873638 | 34.731965 | **2.270256** | 0.0924 | 0.5095 | 1.0 |
+| static uniform | 2.498949 | 277.975715 | 4.468617 | 0.0818 | 0.4510 | 1.0 |
+| random dynamic hash | 3.302239 | 692.385318 | 4.219182 | 0.1165 | 0.6420 | 13.3 |
+
+Related-baseline stress-test conclusion:
+
+- Validation-selected `static best-on-val` is the strongest average row at this heavier skip rate.
+- OPAL-PrefixLast, OPAL-Attn, and raw_input_risk are closely matched and remain much better than random dynamic, IG-style cluster, and static uniform on likelihood preservation.
+- OPAL-PrefixLast has the best dynamic KL, while OPAL-Attn has the best dynamic NDCG/retention in this stress setting.
+- This should be reported as a stress-test tradeoff rather than as the main evidence table; the 25% Office table remains the cleanest main-result setting for OPAL-PrefixLast.

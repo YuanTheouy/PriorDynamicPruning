@@ -116,18 +116,65 @@ sys.exit(0)
 PY
 }
 
-best_epoch_from_json() {
-  local path="$1"
-  python3 - "$path" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-if not os.path.exists(path):
-    raise SystemExit(f"Missing best checkpoint JSON: {path}")
-payload = json.load(open(path))
-epoch = payload.get("best_epoch")
-if epoch is None:
-    raise SystemExit(f"best_epoch missing from {path}")
-print(f"{int(epoch):03d}")
+best_epoch_from_artifacts() {
+  local best_json="$1"
+  local metric_dir="$2"
+  local prefix="$3"
+  local ckpt_dir="$4"
+  python3 - "$best_json" "$metric_dir" "$prefix" "$ckpt_dir" <<'PY'
+import glob
+import json
+import os
+import re
+import sys
+
+best_json, metric_dir, prefix, ckpt_dir = sys.argv[1:5]
+
+def emit(epoch: int) -> None:
+    print(f"{int(epoch):03d}")
+    raise SystemExit(0)
+
+if os.path.exists(best_json) and os.path.getsize(best_json) > 0:
+    payload = json.load(open(best_json))
+    epoch = payload.get("best_epoch")
+    if epoch is None:
+        epoch = (payload.get("best") or {}).get("epoch")
+    if epoch is None:
+        epoch = payload.get("epoch")
+    if epoch is not None:
+        emit(epoch)
+
+patterns = [
+    os.path.join(metric_dir, f"{prefix}_best_val_epoch*_test.json"),
+    os.path.join(metric_dir, f"{prefix}_best_val*_epoch*_test.json"),
+]
+metric_matches = []
+for pattern in patterns:
+    for path in glob.glob(pattern):
+        m = re.search(r"_epoch(\d+)_test\.json$", os.path.basename(path))
+        if m:
+            metric_matches.append((("minuniq" in os.path.basename(path)), os.path.basename(path), int(m.group(1))))
+if metric_matches:
+    metric_matches.sort()
+    emit(metric_matches[0][2])
+
+ckpt_matches = []
+for path in glob.glob(os.path.join(ckpt_dir, "risk_router_epoch*.pt")):
+    m = re.search(r"risk_router_epoch(\d+)\.pt$", os.path.basename(path))
+    if m:
+        ckpt_matches.append(int(m.group(1)))
+if ckpt_matches:
+    # Last-epoch fallback only: the validation summary/test JSON should normally
+    # exist, but this keeps unattended downstream runs alive on partially written
+    # server artifacts.
+    emit(max(ckpt_matches))
+
+raise SystemExit(
+    "Missing best checkpoint artifacts. Checked:\n"
+    f"  best_json={best_json}\n"
+    f"  metric_dir={metric_dir}\n"
+    f"  ckpt_dir={ckpt_dir}"
+)
 PY
 }
 
@@ -204,10 +251,12 @@ for seed in $LLMEVAL_SEEDS; do
 
   raw_best_json="${val_metric_root}/${label_run_id}_raw_valckpt/best_validation_checkpoint.json"
   opal_best_json="${val_metric_root}/${label_run_id}_valckpt/best_validation_checkpoint.json"
-  raw_epoch="$(best_epoch_from_json "$raw_best_json")"
-  opal_epoch="$(best_epoch_from_json "$opal_best_json")"
-  raw_ckpt="${val_root}/${label_run_id}_raw_valckpt/raw_embedding_bce/epoch_checkpoints/risk_router_epoch${raw_epoch}.pt"
-  opal_ckpt="${val_root}/${label_run_id}_valckpt/prefix_hk_raw_attn_bce/epoch_checkpoints/risk_router_epoch${opal_epoch}.pt"
+  raw_ckpt_dir="${val_root}/${label_run_id}_raw_valckpt/raw_embedding_bce/epoch_checkpoints"
+  opal_ckpt_dir="${val_root}/${label_run_id}_valckpt/prefix_hk_raw_attn_bce/epoch_checkpoints"
+  raw_epoch="$(best_epoch_from_artifacts "$raw_best_json" "${val_metric_root}/${label_run_id}_raw_valckpt" raw "$raw_ckpt_dir")"
+  opal_epoch="$(best_epoch_from_artifacts "$opal_best_json" "${val_metric_root}/${label_run_id}_valckpt" opal "$opal_ckpt_dir")"
+  raw_ckpt="${raw_ckpt_dir}/risk_router_epoch${raw_epoch}.pt"
+  opal_ckpt="${opal_ckpt_dir}/risk_router_epoch${opal_epoch}.pt"
 
   require_file "$pudding_ckpt"
   require_file "$ig_artifact"

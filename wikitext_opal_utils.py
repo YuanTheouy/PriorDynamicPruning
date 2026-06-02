@@ -20,6 +20,24 @@ C6_STATIC_STRATEGIES = (
     "middle_heavy",
     "random_diverse_seed42",
 )
+RELATED_CANDIDATE_STRATEGIES = (
+    "uniform",
+    "ends_heavy",
+    "first_k",
+    "last_k",
+    "middle_heavy",
+    "random_diverse_seed42",
+    "random_diverse_v1",
+    "random_diverse_v2",
+    "random_diverse_v3",
+    "random_diverse_v4",
+    "random_diverse_v5",
+    "random_diverse_v6",
+    "random_diverse_v7",
+    "random_diverse_v8",
+    "random_diverse_v9",
+    "random_diverse_v10",
+)
 
 
 def dtype_from_precision(precision: str):
@@ -151,6 +169,10 @@ def _select_by_strategy(strategy: str, candidates: Sequence[int], count: int, se
     if strategy == "random_diverse_seed42":
         rng = random.Random(42 if seed is None else int(seed))
         return sorted(rng.sample(candidates, count))
+    if strategy.startswith("random_diverse_v"):
+        variant = int(strategy.rsplit("v", 1)[1])
+        rng = random.Random((42 if seed is None else int(seed)) + 1009 * variant)
+        return sorted(rng.sample(candidates, count))
     raise ValueError(f"Unknown static strategy: {strategy}")
 
 
@@ -184,6 +206,40 @@ def static_keep_mask(
     if actual_skip != skip_count:
         raise AssertionError(f"Static mask has {actual_skip} skipped layers, expected {skip_count}")
     return mask
+
+
+def related_candidate_masks(
+    num_layers: int,
+    skip_count: int,
+    protected_head: int,
+    protected_tail: int,
+    seed: int = 42,
+    strategies: Sequence[str] = RELATED_CANDIDATE_STRATEGIES,
+) -> List[Dict[str, object]]:
+    rows = []
+    seen = set()
+    for strategy in strategies:
+        mask = static_keep_mask(
+            strategy,
+            num_layers=num_layers,
+            skip_count=skip_count,
+            protected_head=protected_head,
+            protected_tail=protected_tail,
+            seed=seed,
+        )
+        key = mask_key(mask)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "candidate_id": strategy,
+                "strategy": strategy,
+                "keep_mask": [int(v) for v in mask],
+                "skipped_layers": skipped_layers_from_keep_mask(mask),
+            }
+        )
+    return rows
 
 
 def mask_key(mask: Sequence[int]) -> str:

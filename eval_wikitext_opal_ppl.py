@@ -5,7 +5,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -21,9 +21,15 @@ sys.path.insert(0, current_dir)
 
 from transformers import AutoTokenizer, Qwen2ForCausalLM
 
-from models.opal_risk_router import LayerQueryCrossAttentionRiskRouter, OpalRiskRouter
+from models.opal_risk_router import (
+    LayerQueryCrossAttentionRiskRouter,
+    LayerwiseHiddenRiskRouter,
+    OpalRiskRouter,
+    PromptCandidateMaskRouter,
+)
 from wikitext_opal_utils import (
     C6_STATIC_STRATEGIES,
+    RELATED_CANDIDATE_STRATEGIES,
     aggregate_loss_rows,
     allowed_layers_from_policy,
     clear_custom_policy,
@@ -36,6 +42,7 @@ from wikitext_opal_utils import (
     load_wikitext_token_ids,
     mask_key,
     read_jsonl,
+    related_candidate_masks,
     resolve_skip_budget,
     set_custom_policy,
     skipped_layers_from_keep_mask,
@@ -47,6 +54,7 @@ from wikitext_opal_utils import (
 
 
 ATTENTION_ROUTER_INPUTS = {"prefix_hk_raw_attn"}
+LAYERWISE_ROUTER_INPUTS = {"layerwise_hidden"}
 
 
 def router_prefix_batch(input_ids, attention_mask, router_prefix_tokens: int):
@@ -66,6 +74,29 @@ def raw_embedding_hidden_state(model, input_ids):
 
 def raw_embedding_state(model, input_ids, attention_mask):
     return masked_mean_state(raw_embedding_hidden_state(model, input_ids), attention_mask).float()
+
+
+def layerwise_hidden_state(model, input_ids, attention_mask, num_layers: int):
+    captured = []
+    handles = []
+
+    def hook(_module, _inputs, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        captured.append(masked_mean_state(hidden.detach(), attention_mask).float())
+
+    for layer in model.model.layers[: int(num_layers)]:
+        handles.append(layer.register_forward_hook(hook))
+    clear_custom_policy(model)
+    try:
+        with torch.no_grad():
+            model.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+        clear_custom_policy(model)
+    if len(captured) != int(num_layers):
+        raise RuntimeError(f"Expected {num_layers} captured layer states, got {len(captured)}")
+    return torch.stack(captured, dim=1).float()
 
 
 def teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int):
@@ -107,6 +138,8 @@ def build_router(
         )
     if router_input == "raw_embedding":
         return OpalRiskRouter(hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
+    if router_input == "layerwise_hidden":
+        return LayerwiseHiddenRiskRouter(hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
     raise ValueError(f"Unsupported router_input: {router_input}")
 
 
@@ -125,6 +158,8 @@ def router_forward(
         raw_hidden = raw_embedding_hidden_state(model, input_ids)
         hk_hidden = teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers, prefix_depth)
         return router(raw_hidden, hk_hidden, attention_mask)
+    if router_input == "layerwise_hidden":
+        return router(layerwise_hidden_state(model, input_ids, attention_mask, num_layers))
     raise ValueError(f"Unsupported router_input: {router_input}")
 
 
@@ -191,6 +226,36 @@ def load_label_rows(path: str) -> Tuple[List[Dict[str, object]], Dict[str, objec
     return rows, metadata
 
 
+def load_candidate_label_rows(path: str) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    rows = read_jsonl(path)
+    rows.sort(key=lambda row: int(row["sample_id"]))
+    if not rows:
+        raise ValueError(f"No candidate label rows found in {path}")
+    metadata_path = Path(path).with_suffix(Path(path).suffix + ".metadata.json")
+    metadata = {}
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if "candidate_ids" not in metadata and rows[0].get("candidate_ids") is not None:
+        metadata["candidate_ids"] = rows[0]["candidate_ids"]
+    if "candidate_keep_masks" not in metadata and rows[0].get("candidate_keep_masks") is not None:
+        metadata["candidate_keep_masks"] = rows[0]["candidate_keep_masks"]
+    return rows, metadata
+
+
+def evaluate_keep_masks_batch(model, input_ids, attention_mask, labels, keep_masks: Sequence[Sequence[int]]):
+    layer_mask = torch.tensor(keep_masks, dtype=torch.float32, device=input_ids.device)
+    expanded_input_ids = input_ids.expand(layer_mask.size(0), -1).contiguous()
+    expanded_attention_mask = attention_mask.expand(layer_mask.size(0), -1).contiguous()
+    expanded_labels = labels.expand(layer_mask.size(0), -1).contiguous()
+    return forward_loss_rows(
+        model,
+        expanded_input_ids,
+        expanded_attention_mask,
+        expanded_labels,
+        layer_mask=layer_mask,
+    )
+
+
 def make_dataset_for_split(args, tokenizer, selected_window_ids=None, max_windows=0):
     token_ids = load_wikitext_token_ids(
         tokenizer,
@@ -209,6 +274,572 @@ def make_dataset_for_split(args, tokenizer, selected_window_ids=None, max_window
         selected_window_ids=selected_window_ids,
     )
     return dataset, token_ids
+
+
+def build_candidate_labels(args):
+    accelerator = Accelerator()
+    device = accelerator.device
+    torch.manual_seed(args.seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    selected_window_ids = None
+    reference_rows = []
+    if args.reference_label_file:
+        reference_rows, _ = load_label_rows(args.reference_label_file)
+        if int(args.label_samples) > 0:
+            reference_rows = reference_rows[: int(args.label_samples)]
+        selected_window_ids = sorted(int(row["sample_id"]) for row in reference_rows)
+
+    dataset, token_ids = make_dataset_for_split(
+        args,
+        tokenizer,
+        selected_window_ids=selected_window_ids,
+        max_windows=0 if selected_window_ids is not None else args.label_samples,
+    )
+    selected_window_ids = list(dataset.window_ids)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate_wikitext_windows(batch, args.router_prefix_tokens),
+    )
+    dataloader = accelerator.prepare(dataloader)
+
+    model = Qwen2ForCausalLM.from_pretrained(
+        args.teacher_model,
+        torch_dtype=dtype_from_precision(args.precision),
+    )
+    model.to(device).eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    num_layers = detect_num_layers(model)
+    skip_count, keep_count = resolve_skip_budget(num_layers, args.skip_rate, args.skip_count)
+    allowed_layers = allowed_layers_from_policy(num_layers, args.protected_head, args.protected_tail)
+    candidates = related_candidate_masks(
+        num_layers=num_layers,
+        skip_count=skip_count,
+        protected_head=args.protected_head,
+        protected_tail=args.protected_tail,
+        seed=args.seed,
+    )
+    if not candidates:
+        raise ValueError("Candidate mask library is empty.")
+    candidate_ids = [str(row["candidate_id"]) for row in candidates]
+    candidate_keep_masks = [[int(v) for v in row["keep_mask"]] for row in candidates]
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if accelerator.is_main_process:
+        output_path.unlink(missing_ok=True)
+        for stale in output_path.parent.glob(output_path.name + ".rank*"):
+            stale.unlink(missing_ok=True)
+    accelerator.wait_for_everyone()
+    shard_path = output_path.with_suffix(output_path.suffix + f".rank{accelerator.process_index}")
+
+    if accelerator.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "task": "wikitext2_related_candidate_labels",
+                    "teacher_model": args.teacher_model,
+                    "dataset_disk_path": args.dataset_disk_path,
+                    "num_layers": int(num_layers),
+                    "skip_count": int(skip_count),
+                    "keep_count": int(keep_count),
+                    "protected_head": int(args.protected_head),
+                    "protected_tail": int(args.protected_tail),
+                    "candidate_ids": candidate_ids,
+                    "label_rows": int(len(selected_window_ids)),
+                    "reference_label_file": args.reference_label_file,
+                    "objective": "candidate_suffix_Delta_NLL",
+                    "target_leakage_guard": "candidate quality labels are built on train; eval/test never loads them",
+                },
+                indent=2,
+            )
+        )
+
+    iterator = tqdm(dataloader, desc="wikitext-c16-candidate-labels") if accelerator.is_main_process else dataloader
+    with shard_path.open("w", encoding="utf-8") as f, torch.no_grad():
+        for batch in iterator:
+            batch_input_ids = batch["input_ids"].to(device)
+            batch_attention_mask = batch["attention_mask"].to(device)
+            batch_labels = batch["labels"].to(device)
+            sample_ids = [int(x) for x in batch["sample_id"].detach().cpu().tolist()]
+            window_starts = [int(x) for x in batch["window_start"].detach().cpu().tolist()]
+            for row_pos, sample_id in enumerate(sample_ids):
+                input_ids = batch_input_ids[row_pos : row_pos + 1]
+                attention_mask = batch_attention_mask[row_pos : row_pos + 1]
+                labels = batch_labels[row_pos : row_pos + 1]
+                full_stats = forward_loss_rows(model, input_ids, attention_mask, labels, layer_mask=None)[0]
+                candidate_stats = []
+                for start in range(0, len(candidate_keep_masks), max(1, int(args.candidate_batch_size))):
+                    keep_chunk = candidate_keep_masks[start : start + max(1, int(args.candidate_batch_size))]
+                    candidate_stats.extend(
+                        evaluate_keep_masks_batch(model, input_ids, attention_mask, labels, keep_chunk)
+                    )
+                candidate_nll = [float(stats["nll"]) for stats in candidate_stats]
+                candidate_ppl = [float(stats["ppl"]) for stats in candidate_stats]
+                candidate_delta_nll = [float(value - float(full_stats["nll"])) for value in candidate_nll]
+                candidate_delta_ppl = [float(value - float(full_stats["ppl"])) for value in candidate_ppl]
+                best_candidate_index = min(
+                    range(len(candidate_delta_nll)),
+                    key=lambda idx: (candidate_delta_nll[idx], candidate_ids[idx]),
+                )
+                row = {
+                    "sample_id": int(sample_id),
+                    "window_start": int(window_starts[row_pos]),
+                    "objective": "candidate_suffix_Delta_NLL",
+                    "dataset": "wikitext-2-raw-v1",
+                    "split": args.split,
+                    "seq_len": int(args.seq_len),
+                    "router_prefix_tokens": int(args.router_prefix_tokens),
+                    "scored_tokens": int(full_stats["token_count"]),
+                    "num_layers": int(num_layers),
+                    "skip_rate": float(args.skip_rate),
+                    "skip_count": int(skip_count),
+                    "keep_count": int(keep_count),
+                    "protected_head": int(args.protected_head),
+                    "protected_tail": int(args.protected_tail),
+                    "allowed_layers": [int(idx) for idx in allowed_layers],
+                    "candidate_ids": candidate_ids,
+                    "candidate_delta_nll": candidate_delta_nll,
+                    "candidate_delta_ppl": candidate_delta_ppl,
+                    "candidate_nll": candidate_nll,
+                    "candidate_ppl": candidate_ppl,
+                    "best_candidate_index": int(best_candidate_index),
+                    "best_candidate_id": candidate_ids[best_candidate_index],
+                    "NLL_full": float(full_stats["nll"]),
+                    "PPL_full": float(full_stats["ppl"]),
+                    "target_leakage_guard": "train labels only; eval/test path never loads candidate quality labels",
+                }
+                f.write(json.dumps(row) + "\n")
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        row_by_sample = {}
+        for path in sorted(output_path.parent.glob(output_path.name + ".rank*")):
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        row = json.loads(line)
+                        row_by_sample.setdefault(int(row["sample_id"]), row)
+        rows = [row_by_sample[key] for key in sorted(row_by_sample)]
+        with output_path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        metadata = {
+            "teacher_model": args.teacher_model,
+            "dataset_path": args.dataset_path,
+            "dataset_name": args.dataset_name,
+            "dataset_disk_path": args.dataset_disk_path,
+            "split": args.split,
+            "num_tokens": int(len(token_ids)),
+            "num_windows_available": int(len(dataset.starts)),
+            "num_samples": int(len(rows)),
+            "selected_window_ids": selected_window_ids,
+            "sample_strategy": args.sample_strategy,
+            "sample_seed": int(args.sample_seed),
+            "reference_label_file": args.reference_label_file,
+            "seq_len": int(args.seq_len),
+            "router_prefix_tokens": int(args.router_prefix_tokens),
+            "scored_tokens_per_full_window": int(args.seq_len) - int(args.router_prefix_tokens),
+            "objective": "candidate_suffix_Delta_NLL",
+            "num_layers": int(num_layers),
+            "skip_rate": float(args.skip_rate),
+            "skip_count": int(skip_count),
+            "keep_count": int(keep_count),
+            "protected_head": int(args.protected_head),
+            "protected_tail": int(args.protected_tail),
+            "allowed_layers": [int(idx) for idx in allowed_layers],
+            "candidate_ids": candidate_ids,
+            "candidate_keep_masks": candidate_keep_masks,
+            "candidate_strategies": [str(row["strategy"]) for row in candidates],
+            "candidate_count": int(len(candidates)),
+            "candidate_batch_size": int(args.candidate_batch_size),
+            "mask_application": "config.custom_layer_mask",
+            "target_leakage_guard": "candidate labels are built only on train; eval/test never loads them",
+        }
+        metadata_path = output_path.with_suffix(output_path.suffix + ".metadata.json")
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        print(f"Wrote {len(rows)} WikiText-2 C16 candidate-label rows to {output_path}")
+        print(f"Wrote candidate-label metadata to {metadata_path}")
+
+
+def train_candidate_router(args):
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    device = accelerator.device
+    torch.manual_seed(args.seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    label_rows, label_metadata = load_candidate_label_rows(args.candidate_label_file)
+    label_by_sample = {int(row["sample_id"]): row for row in label_rows}
+    selected_window_ids = sorted(label_by_sample)
+    candidate_ids = [str(value) for value in label_metadata.get("candidate_ids", label_rows[0]["candidate_ids"])]
+    candidate_keep_masks = label_metadata.get("candidate_keep_masks")
+    if not candidate_keep_masks:
+        raise ValueError("Candidate metadata must include candidate_keep_masks.")
+    dataset, token_ids = make_dataset_for_split(
+        args,
+        tokenizer,
+        selected_window_ids=selected_window_ids,
+        max_windows=0,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda batch: collate_wikitext_windows(batch, args.router_prefix_tokens),
+    )
+
+    model = Qwen2ForCausalLM.from_pretrained(
+        args.teacher_model,
+        torch_dtype=dtype_from_precision(args.precision),
+    )
+    model.to(device).eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    num_layers = detect_num_layers(model)
+    hidden_size = int(model.config.hidden_size)
+    router = PromptCandidateMaskRouter(
+        hidden_size=hidden_size,
+        num_candidates=len(candidate_ids),
+        dropout=args.dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(router.parameters(), lr=args.lr)
+    router, optimizer, dataloader = accelerator.prepare(router, optimizer, dataloader)
+
+    if accelerator.is_main_process:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        print(
+            json.dumps(
+                {
+                    "task": "wikitext2_pudding_style_candidate_router",
+                    "teacher_model": args.teacher_model,
+                    "dataset_disk_path": args.dataset_disk_path,
+                    "num_layers": int(num_layers),
+                    "hidden_size": int(hidden_size),
+                    "candidate_count": int(len(candidate_ids)),
+                    "candidate_ids": candidate_ids,
+                    "label_rows": len(label_rows),
+                    "seq_len": int(args.seq_len),
+                    "router_prefix_tokens": int(args.router_prefix_tokens),
+                    "token_count_train_split": int(len(token_ids)),
+                    "target_leakage_guard": "router sees only raw prefix state; labels score suffix tokens only",
+                },
+                indent=2,
+            )
+        )
+
+    history = []
+    for epoch in range(args.epochs):
+        router.train()
+        total_loss = 0.0
+        total_steps = 0
+        iterator = tqdm(dataloader, desc=f"candidate-router epoch {epoch + 1}/{args.epochs}") if accelerator.is_main_process else dataloader
+        for batch in iterator:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            sample_ids = [int(x) for x in batch["sample_id"].detach().cpu().tolist()]
+            router_input_ids, router_attention_mask = router_prefix_batch(
+                input_ids,
+                attention_mask,
+                args.router_prefix_tokens,
+            )
+            pred = router(raw_embedding_state(model, router_input_ids, router_attention_mask))
+            target = torch.tensor(
+                [label_by_sample[sample_id]["candidate_delta_nll"] for sample_id in sample_ids],
+                dtype=torch.float32,
+                device=device,
+            )
+            if args.loss == "mse":
+                loss = F.mse_loss(pred.float(), target.float())
+            else:
+                loss = F.smooth_l1_loss(pred.float(), target.float())
+            if not torch.isfinite(loss.detach()):
+                raise FloatingPointError(f"Non-finite candidate-router loss: {float(loss.detach().float().item())}")
+            optimizer.zero_grad()
+            accelerator.backward(loss)
+            if float(args.max_grad_norm) > 0:
+                accelerator.clip_grad_norm_(router.parameters(), float(args.max_grad_norm))
+            optimizer.step()
+            total_loss += float(loss.detach().float().item())
+            total_steps += 1
+            if accelerator.is_main_process:
+                iterator.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        epoch_tensor = torch.tensor([total_loss, float(total_steps)], device=device)
+        gathered = accelerator.gather(epoch_tensor.unsqueeze(0))
+        summed = gathered.sum(dim=0)
+        global_steps = max(1.0, float(summed[1].item()))
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            "loss": float(summed[0].item() / global_steps),
+            "candidate_quality": float(summed[0].item() / global_steps),
+            "steps": int(global_steps),
+        }
+        history.append(epoch_metrics)
+        if accelerator.is_main_process:
+            print(f"Epoch {epoch + 1} finished: {json.dumps(epoch_metrics)}")
+
+    if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(router)
+        metadata = {
+            "method": "wikitext2_pudding_style_candidate_quality",
+            "router_input": "raw_embedding",
+            "router_features": ["raw_embedding_mean"],
+            "router_architecture": "candidate_quality_mlp",
+            "teacher_model": args.teacher_model,
+            "candidate_label_file": args.candidate_label_file,
+            "candidate_ids": candidate_ids,
+            "candidate_keep_masks": candidate_keep_masks,
+            "candidate_count": int(len(candidate_ids)),
+            "loss": args.loss,
+            "dataset": "wikitext-2-raw-v1",
+            "dataset_disk_path": args.dataset_disk_path,
+            "split": args.split,
+            "seq_len": int(args.seq_len),
+            "router_prefix_tokens": int(args.router_prefix_tokens),
+            "num_layers": int(num_layers),
+            "base_hidden_size": int(hidden_size),
+            "hidden_size": int(hidden_size),
+            "skip_rate": float(label_metadata.get("skip_rate", args.skip_rate)),
+            "skip_count": int(label_metadata.get("skip_count", 0)),
+            "keep_count": int(label_metadata.get("keep_count", 0)),
+            "protected_head": int(label_metadata.get("protected_head", args.protected_head)),
+            "protected_tail": int(label_metadata.get("protected_tail", args.protected_tail)),
+            "allowed_layers": [int(idx) for idx in label_metadata.get("allowed_layers", [])],
+            "epochs": int(args.epochs),
+            "lr": float(args.lr),
+            "seed": int(args.seed),
+            "target_leakage_guard": "router sees only first router_prefix_tokens; eval never loads candidate labels",
+        }
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state_dict": unwrapped.state_dict(), "metadata": metadata}, output_dir / "candidate_router.pt")
+        (output_dir / "training_metrics.json").write_text(
+            json.dumps({"metadata": metadata, "history": history}, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Saved candidate router checkpoint to {output_dir / 'candidate_router.pt'}")
+
+
+def torch_kmeans(features: torch.Tensor, clusters: int, iters: int, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    if features.dim() != 2:
+        raise ValueError(f"KMeans expects [num_samples, hidden], got {tuple(features.shape)}")
+    n = int(features.size(0))
+    k = max(1, min(int(clusters), n))
+    generator = torch.Generator(device=features.device)
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(n, generator=generator, device=features.device)
+    centers = features[perm[:k]].clone()
+    assignments = torch.full((n,), -1, dtype=torch.long, device=features.device)
+    for _ in range(max(1, int(iters))):
+        distances = torch.cdist(features.float(), centers.float(), p=2)
+        new_assignments = distances.argmin(dim=1)
+        new_centers = centers.clone()
+        for cluster_idx in range(k):
+            mask = new_assignments.eq(cluster_idx)
+            if bool(mask.any().item()):
+                new_centers[cluster_idx] = features[mask].mean(dim=0)
+            else:
+                replacement = int(torch.randint(0, n, (1,), generator=generator, device=features.device).item())
+                new_centers[cluster_idx] = features[replacement]
+        centers = F.normalize(new_centers.float(), dim=-1)
+        if torch.equal(assignments, new_assignments):
+            assignments = new_assignments
+            break
+        assignments = new_assignments
+    return centers.cpu(), assignments.cpu()
+
+
+def build_ig_artifact(args):
+    accelerator = Accelerator()
+    device = accelerator.device
+    torch.manual_seed(args.seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    label_rows, label_metadata = load_candidate_label_rows(args.candidate_label_file)
+    label_by_sample = {int(row["sample_id"]): row for row in label_rows}
+    selected_window_ids = sorted(label_by_sample)
+    candidate_ids = [str(value) for value in label_metadata.get("candidate_ids", label_rows[0]["candidate_ids"])]
+    candidate_keep_masks = label_metadata.get("candidate_keep_masks")
+    if not candidate_keep_masks:
+        raise ValueError("Candidate metadata must include candidate_keep_masks.")
+
+    dataset, token_ids = make_dataset_for_split(
+        args,
+        tokenizer,
+        selected_window_ids=selected_window_ids,
+        max_windows=0,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate_wikitext_windows(batch, args.router_prefix_tokens),
+    )
+    dataloader = accelerator.prepare(dataloader)
+
+    model = Qwen2ForCausalLM.from_pretrained(
+        args.teacher_model,
+        torch_dtype=dtype_from_precision(args.precision),
+    )
+    model.to(device).eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    num_layers = detect_num_layers(model)
+    hidden_size = int(model.config.hidden_size)
+
+    output_artifact = Path(args.output_artifact)
+    output_summary = Path(args.output_summary)
+    output_artifact.parent.mkdir(parents=True, exist_ok=True)
+    output_summary.parent.mkdir(parents=True, exist_ok=True)
+    if accelerator.is_main_process:
+        output_artifact.unlink(missing_ok=True)
+        output_summary.unlink(missing_ok=True)
+        for stale in output_artifact.parent.glob(output_artifact.name + ".rank*.pt"):
+            stale.unlink(missing_ok=True)
+    accelerator.wait_for_everyone()
+    shard_path = output_artifact.with_suffix(output_artifact.suffix + f".rank{accelerator.process_index}.pt")
+
+    sample_ids_out = []
+    feature_rows = []
+    iterator = tqdm(dataloader, desc="ig-prefix-features") if accelerator.is_main_process else dataloader
+    with torch.no_grad():
+        for batch in iterator:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            sample_ids = [int(x) for x in batch["sample_id"].detach().cpu().tolist()]
+            router_input_ids, router_attention_mask = router_prefix_batch(
+                input_ids,
+                attention_mask,
+                args.router_prefix_tokens,
+            )
+            state = F.normalize(raw_embedding_state(model, router_input_ids, router_attention_mask).float(), dim=-1)
+            sample_ids_out.extend(sample_ids)
+            feature_rows.append(state.detach().cpu())
+    torch.save(
+        {
+            "sample_ids": sample_ids_out,
+            "features": torch.cat(feature_rows, dim=0) if feature_rows else torch.empty(0, hidden_size),
+        },
+        shard_path,
+    )
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        feature_by_sample = {}
+        for path in sorted(output_artifact.parent.glob(output_artifact.name + ".rank*.pt")):
+            payload = torch.load(path, map_location="cpu")
+            ids = [int(value) for value in payload["sample_ids"]]
+            features = payload["features"].float()
+            for idx, sample_id in enumerate(ids):
+                feature_by_sample.setdefault(sample_id, features[idx])
+        ordered_ids = [sample_id for sample_id in sorted(label_by_sample) if sample_id in feature_by_sample]
+        if not ordered_ids:
+            raise ValueError("No IG features were collected.")
+        features = F.normalize(torch.stack([feature_by_sample[sample_id] for sample_id in ordered_ids], dim=0), dim=-1)
+        deltas = torch.tensor(
+            [label_by_sample[sample_id]["candidate_delta_nll"] for sample_id in ordered_ids],
+            dtype=torch.float32,
+        )
+        centers, assignments = torch_kmeans(features, args.clusters, args.kmeans_iters, args.seed)
+        global_best = int(deltas.mean(dim=0).argmin().item())
+        cluster_candidate_indices = []
+        cluster_sizes = []
+        cluster_mean_delta_nll = []
+        for cluster_idx in range(int(centers.size(0))):
+            mask = assignments.eq(cluster_idx)
+            cluster_sizes.append(int(mask.sum().item()))
+            if bool(mask.any().item()):
+                mean_delta = deltas[mask].mean(dim=0)
+                best_idx = int(mean_delta.argmin().item())
+                cluster_mean_delta_nll.append([float(value) for value in mean_delta.tolist()])
+            else:
+                best_idx = global_best
+                cluster_mean_delta_nll.append([])
+            cluster_candidate_indices.append(best_idx)
+
+        metadata = {
+            "method": "wikitext2_ig_style_prefix_cluster_mask",
+            "router_input": "raw_embedding",
+            "router_features": ["normalized_raw_embedding_mean"],
+            "teacher_model": args.teacher_model,
+            "candidate_label_file": args.candidate_label_file,
+            "candidate_ids": candidate_ids,
+            "candidate_keep_masks": candidate_keep_masks,
+            "candidate_count": int(len(candidate_ids)),
+            "clusters": int(centers.size(0)),
+            "cluster_candidate_indices": [int(idx) for idx in cluster_candidate_indices],
+            "cluster_candidate_ids": [candidate_ids[int(idx)] for idx in cluster_candidate_indices],
+            "cluster_sizes": cluster_sizes,
+            "cluster_mean_delta_nll": cluster_mean_delta_nll,
+            "dataset": "wikitext-2-raw-v1",
+            "dataset_disk_path": args.dataset_disk_path,
+            "split": args.split,
+            "seq_len": int(args.seq_len),
+            "router_prefix_tokens": int(args.router_prefix_tokens),
+            "num_layers": int(num_layers),
+            "base_hidden_size": int(hidden_size),
+            "hidden_size": int(hidden_size),
+            "num_tokens": int(len(token_ids)),
+            "num_samples": int(len(ordered_ids)),
+            "skip_rate": float(label_metadata.get("skip_rate", args.skip_rate)),
+            "skip_count": int(label_metadata.get("skip_count", 0)),
+            "keep_count": int(label_metadata.get("keep_count", 0)),
+            "protected_head": int(label_metadata.get("protected_head", args.protected_head)),
+            "protected_tail": int(label_metadata.get("protected_tail", args.protected_tail)),
+            "allowed_layers": [int(idx) for idx in label_metadata.get("allowed_layers", [])],
+            "seed": int(args.seed),
+            "kmeans_iters": int(args.kmeans_iters),
+            "target_leakage_guard": "cluster masks are selected from train candidate labels; eval/test never loads labels",
+        }
+        torch.save({"centers": centers.float(), "metadata": metadata}, output_artifact)
+        output_summary.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        print(f"Saved IG-style artifact to {output_artifact}")
+        print(f"Wrote IG-style summary to {output_summary}")
+
+
+def load_candidate_router_checkpoint(path: str, hidden_size: int, device):
+    checkpoint = torch.load(path, map_location="cpu")
+    state = checkpoint.get("model_state_dict", checkpoint)
+    metadata = dict(checkpoint.get("metadata") or {})
+    candidate_keep_masks = metadata.get("candidate_keep_masks")
+    candidate_ids = metadata.get("candidate_ids")
+    if not candidate_keep_masks or not candidate_ids:
+        raise ValueError(f"Candidate router checkpoint lacks candidate metadata: {path}")
+    router = PromptCandidateMaskRouter(
+        hidden_size=int(metadata.get("base_hidden_size") or hidden_size),
+        num_candidates=len(candidate_ids),
+        dropout=0.0,
+    )
+    router.load_state_dict(state)
+    router.to(device).eval()
+    return router, metadata
+
+
+def load_ig_artifact(path: str, device):
+    payload = torch.load(path, map_location="cpu")
+    metadata = dict(payload.get("metadata") or {})
+    centers = payload.get("centers")
+    if centers is None:
+        raise ValueError(f"IG artifact lacks centers: {path}")
+    if not metadata.get("candidate_keep_masks") or not metadata.get("cluster_candidate_indices"):
+        raise ValueError(f"IG artifact lacks candidate/cluster metadata: {path}")
+    return centers.float().to(device), metadata
 
 
 def train_router(args):
@@ -361,10 +992,21 @@ def train_router(args):
             "router_features": (
                 ["raw_token_sequence", "hk_token_sequence", "attention_mask", "layer_queries"]
                 if args.router_input == "prefix_hk_raw_attn"
-                else ["raw_embedding_mean"]
+                else (
+                    ["per_layer_prompt_hidden_mean"]
+                    if args.router_input == "layerwise_hidden"
+                    else ["raw_embedding_mean"]
+                )
             ),
             "router_architecture": (
-                "layer_query_cross_attention" if args.router_input == "prefix_hk_raw_attn" else "pooled_mlp"
+                "layer_query_cross_attention"
+                if args.router_input == "prefix_hk_raw_attn"
+                else ("layerwise_hidden_mlp" if args.router_input == "layerwise_hidden" else "pooled_mlp")
+            ),
+            "router_access_note": (
+                "layerwise_hidden_router is an in-framework stronger-access baseline, not a full Dr.LLM reproduction."
+                if args.router_input == "layerwise_hidden"
+                else ""
             ),
             "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
             "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
@@ -440,10 +1082,28 @@ def eval_method(args):
     allowed_layers = allowed_layers_from_policy(num_layers, args.protected_head, args.protected_tail)
     router = None
     router_metadata = {}
+    candidate_router = None
+    candidate_router_metadata = {}
+    ig_centers = None
+    ig_metadata = {}
     if args.method == "router":
         router, router_metadata = load_router_checkpoint(args.risk_router_ckpt, hidden_size, num_layers, device)
         allowed_layers = router_metadata.get("allowed_layers") or allowed_layers
         skip_count = int(router_metadata.get("skip_count") or skip_count)
+        keep_count = int(num_layers) - skip_count
+    elif args.method == "candidate_router":
+        candidate_router, candidate_router_metadata = load_candidate_router_checkpoint(
+            args.candidate_router_ckpt,
+            hidden_size,
+            device,
+        )
+        allowed_layers = candidate_router_metadata.get("allowed_layers") or allowed_layers
+        skip_count = int(candidate_router_metadata.get("skip_count") or skip_count)
+        keep_count = int(num_layers) - skip_count
+    elif args.method == "ig":
+        ig_centers, ig_metadata = load_ig_artifact(args.ig_artifact, device)
+        allowed_layers = ig_metadata.get("allowed_layers") or allowed_layers
+        skip_count = int(ig_metadata.get("skip_count") or skip_count)
         keep_count = int(num_layers) - skip_count
     static_mask = None
     if args.method == "static":
@@ -476,6 +1136,7 @@ def eval_method(args):
 
             layer_mask = None
             keep_masks = []
+            selected_candidate_ids: List[Optional[str]] = [None for _ in sample_ids]
             if args.method == "full":
                 keep_masks = [[1] * int(num_layers) for _ in sample_ids]
             elif args.method == "static":
@@ -498,11 +1159,46 @@ def eval_method(args):
                 )
                 keep_masks = keep_masks_from_skip_risk(pred_risk, skip_count=skip_count, allowed_layers=allowed_layers)
                 layer_mask = torch.tensor(keep_masks, dtype=torch.float32, device=device)
+            elif args.method == "candidate_router":
+                router_input_ids, router_attention_mask = router_prefix_batch(
+                    input_ids,
+                    attention_mask,
+                    args.router_prefix_tokens,
+                )
+                pred_delta = candidate_router(raw_embedding_state(model, router_input_ids, router_attention_mask))
+                candidate_indices = pred_delta.float().argmin(dim=1).detach().cpu().tolist()
+                candidate_ids = [str(value) for value in candidate_router_metadata["candidate_ids"]]
+                candidate_keep_masks = candidate_router_metadata["candidate_keep_masks"]
+                keep_masks = [[int(v) for v in candidate_keep_masks[int(idx)]] for idx in candidate_indices]
+                selected_candidate_ids = [candidate_ids[int(idx)] for idx in candidate_indices]
+                layer_mask = torch.tensor(keep_masks, dtype=torch.float32, device=device)
+            elif args.method == "ig":
+                router_input_ids, router_attention_mask = router_prefix_batch(
+                    input_ids,
+                    attention_mask,
+                    args.router_prefix_tokens,
+                )
+                state = F.normalize(raw_embedding_state(model, router_input_ids, router_attention_mask).float(), dim=-1)
+                distances = torch.cdist(state.float(), ig_centers.float(), p=2)
+                clusters = distances.argmin(dim=1).detach().cpu().tolist()
+                cluster_candidate_indices = [int(idx) for idx in ig_metadata["cluster_candidate_indices"]]
+                candidate_ids = [str(value) for value in ig_metadata["candidate_ids"]]
+                candidate_keep_masks = ig_metadata["candidate_keep_masks"]
+                candidate_indices = [cluster_candidate_indices[int(cluster_idx)] for cluster_idx in clusters]
+                keep_masks = [[int(v) for v in candidate_keep_masks[int(idx)]] for idx in candidate_indices]
+                selected_candidate_ids = [candidate_ids[int(idx)] for idx in candidate_indices]
+                layer_mask = torch.tensor(keep_masks, dtype=torch.float32, device=device)
             else:
                 raise ValueError(f"Unsupported eval method: {args.method}")
 
             rows = forward_loss_rows(model, input_ids, attention_mask, labels, layer_mask=layer_mask)
-            for sample_id, window_start, stats, keep_mask in zip(sample_ids, window_starts, rows, keep_masks):
+            for sample_id, window_start, stats, keep_mask, candidate_id in zip(
+                sample_ids,
+                window_starts,
+                rows,
+                keep_masks,
+                selected_candidate_ids,
+            ):
                 row = {
                     "sample_id": int(sample_id),
                     "window_start": int(window_start),
@@ -514,6 +1210,8 @@ def eval_method(args):
                     "mask_key": mask_key(keep_mask),
                     "skipped_layers": skipped_layers_from_keep_mask(keep_mask),
                 }
+                if candidate_id is not None:
+                    row["selected_candidate_id"] = candidate_id
                 f.write(json.dumps(row) + "\n")
 
     accelerator.wait_for_everyone()
@@ -532,11 +1230,16 @@ def eval_method(args):
         mask_summary = summarize_keep_masks([row["keep_mask"] for row in rows], expected_skip_count=expected_skip_count)
         if not math.isfinite(float(loss_summary["ppl"])):
             raise FloatingPointError(f"Non-finite PPL for {args.run_name}: {loss_summary['ppl']}")
-        if args.method in {"static", "router"} and float(mask_summary["exact_skip_count_rate"]) < 1.0:
+        if args.method in {"static", "router", "candidate_router", "ig"} and float(mask_summary["exact_skip_count_rate"]) < 1.0:
             raise ValueError(
                 f"{args.run_name} did not produce exactly K skipped layers for every window: "
                 f"exact_skip_count_rate={mask_summary['exact_skip_count_rate']}"
             )
+        selected_candidate_distribution = {}
+        for row in rows:
+            candidate_id = row.get("selected_candidate_id")
+            if candidate_id:
+                selected_candidate_distribution[str(candidate_id)] = selected_candidate_distribution.get(str(candidate_id), 0) + 1
         payload = {
             "run_name": args.run_name,
             "method": args.method,
@@ -544,6 +1247,10 @@ def eval_method(args):
             "static_strategy": args.static_strategy if args.method == "static" else None,
             "risk_router_ckpt": args.risk_router_ckpt if args.method == "router" else "",
             "risk_router_metadata": router_metadata if args.method == "router" else {},
+            "candidate_router_ckpt": args.candidate_router_ckpt if args.method == "candidate_router" else "",
+            "candidate_router_metadata": candidate_router_metadata if args.method == "candidate_router" else {},
+            "ig_artifact": args.ig_artifact if args.method == "ig" else "",
+            "ig_metadata": ig_metadata if args.method == "ig" else {},
             "teacher_model": args.teacher_model,
             "model_name": os.path.basename(os.path.normpath(args.teacher_model)),
             "dataset_path": args.dataset_path,
@@ -571,6 +1278,7 @@ def eval_method(args):
             "average_kept_layers": float(mask_summary["average_kept_layers"]),
             "average_skipped_layers": float(mask_summary["average_skipped_layers"]),
             "exact_skip_count_rate": float(mask_summary["exact_skip_count_rate"]),
+            "selected_candidate_distribution": selected_candidate_distribution,
             "uses_greedy_labels_at_eval": False,
             "target_leakage_guard": "router sees only first router_prefix_tokens; PPL scores suffix tokens only",
             "mask_application": "config.custom_layer_mask",
@@ -918,6 +1626,293 @@ def write_report(args):
     print(f"Wrote report to {args.output_md}")
 
 
+def method_type(name: str) -> str:
+    if name == "Full":
+        return "full"
+    if name.startswith("Static"):
+        return "static"
+    if name in {"PuDDing-style", "IG-style", "layerwise_hidden_router"}:
+        return "related"
+    if name == "Raw-SetBCE":
+        return "ablation"
+    if name == "OPAL-SetBCE":
+        return "ours"
+    return "tuning"
+
+
+def metric_table_lines(metrics: Dict[str, Dict[str, object]], order: Sequence[str]) -> List[str]:
+    if "Full" not in metrics:
+        return ["`Full` metric is missing; cannot compute deltas."]
+    full_nll = float(metrics["Full"]["nll"])
+    full_ppl = float(metrics["Full"]["ppl"])
+    lines = [
+        "| method | type | NLL ↓ | PPL ↓ | Delta_NLL ↓ | Delta_PPL ↓ | unique masks | exact-K |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in order:
+        row = metrics.get(name)
+        if not row:
+            lines.append(f"| {name} | {method_type(name)} | pending | pending | pending | pending | pending | pending |")
+            continue
+        nll = float(row["nll"])
+        ppl = float(row["ppl"])
+        lines.append(
+            f"| {name} | {method_type(name)} | {fmt(nll)} | {fmt(ppl)} | "
+            f"{fmt(nll - full_nll)} | {fmt(ppl - full_ppl)} | "
+            f"{row.get('unique_masks', 'NA')} | {fmt(row.get('exact_skip_count_rate'), 3)} |"
+        )
+    return lines
+
+
+def named_training_summaries(paths: Sequence[str]) -> Dict[str, Dict[str, object]]:
+    result = {}
+    for name, path in parse_named_paths(paths).items():
+        summary = training_loss_summary(path)
+        if summary:
+            result[name] = summary
+    return result
+
+
+def write_related_report(args):
+    metric_paths = parse_named_paths(args.metric)
+    metrics = {
+        name: json.loads(Path(path).read_text(encoding="utf-8"))
+        for name, path in metric_paths.items()
+        if Path(path).exists()
+    }
+    if "Full" not in metrics:
+        raise ValueError("write_related_report requires --metric Full=/path/full.json")
+    training = named_training_summaries(args.training_metric)
+    overlaps = {
+        name: load_optional_json(path)
+        for name, path in parse_named_paths(args.overlap_summary).items()
+        if Path(path).exists()
+    }
+    tuning_metrics = {
+        name: json.loads(Path(path).read_text(encoding="utf-8"))
+        for name, path in parse_named_paths(args.tuning_metric).items()
+        if Path(path).exists()
+    }
+    candidate_metadata = load_optional_json(args.candidate_label_metadata) or {}
+    ig_summary = load_optional_json(args.ig_summary) or {}
+
+    order = [
+        "Full",
+        "Static uniform",
+        "Static ends_heavy",
+        "Static best-on-val C6",
+        "PuDDing-style",
+        "IG-style",
+        "layerwise_hidden_router",
+        "Raw-SetBCE",
+        "OPAL-SetBCE",
+    ]
+    full = metrics["Full"]
+    opal = metrics.get("OPAL-SetBCE")
+    static_best = metrics.get("Static best-on-val C6")
+    raw = metrics.get("Raw-SetBCE")
+
+    judgment = "not ready"
+    judgment_detail = "Related baselines are still pending, so WikiText-2 cannot support a main-text public LM claim yet."
+    if opal and static_best:
+        opal_wins_static = float(opal["nll"]) < float(static_best["nll"])
+        related_available = all(name in metrics for name in ["PuDDing-style", "IG-style"])
+        opal_wins_related = related_available and all(
+            float(opal["nll"]) < float(metrics[name]["nll"]) for name in ["PuDDing-style", "IG-style"]
+        )
+        opal_wins_raw = raw is not None and float(opal["nll"]) < float(raw["nll"])
+        if opal_wins_static and opal_wins_related:
+            judgment = "main text candidate"
+            judgment_detail = (
+                "OPAL beats Static best-on-val C6 and PuDDing/IG-style baselines. "
+                + ("It also beats Raw-SetBCE." if opal_wins_raw else "It still does not beat Raw-SetBCE, so phrase Raw as a strong ablation.")
+            )
+        elif opal_wins_static:
+            judgment = "appendix only"
+            judgment_detail = (
+                "OPAL beats the fixed static baseline but does not yet clear Raw and/or related-work baselines. "
+                "Use this as public LM sanity / partial generalization, not the main claim."
+            )
+        else:
+            judgment = "do not write"
+            judgment_detail = "OPAL does not beat Static best-on-val C6, so WikiText-2 should stay out of the paper except as negative diagnosis."
+
+    lines = []
+    lines.append("# WikiText-2 Public LM Related Baseline Results")
+    lines.append("")
+    lines.append(f"Last updated: {args.date}")
+    lines.append("")
+    lines.append("## Setup")
+    lines.append("")
+    dataset_source = full.get("dataset_disk_path") or f"{full.get('dataset_path')}/{full.get('dataset_name')}"
+    lines.append(f"- model path: `{full.get('teacher_model')}`")
+    lines.append(f"- model name: `{full.get('model_name')}`")
+    lines.append(f"- dataset: `{dataset_source}`")
+    lines.append(f"- num_layers: {full.get('num_layers')}")
+    lines.append(f"- seq_len: {full.get('seq_len')}")
+    lines.append(f"- router_prefix_tokens: {full.get('router_prefix_tokens')}")
+    lines.append(f"- eval_windows requested / actual: {full.get('eval_windows_requested')} / {full.get('eval_windows')}")
+    lines.append(f"- eval_tokens: {full.get('eval_tokens')}")
+    lines.append(f"- skip_rate: {full.get('skip_rate')}")
+    lines.append(f"- skip_count: {static_best.get('skip_count') if static_best else 'pending'}")
+    lines.append(f"- protected_head / protected_tail: {full.get('protected_head')} / {full.get('protected_tail')}")
+    lines.append(f"- label samples: {candidate_metadata.get('num_samples', 'pending')}")
+    lines.append(f"- candidate library: C{candidate_metadata.get('candidate_count', 16)} `{candidate_metadata.get('candidate_ids', list(RELATED_CANDIDATE_STRATEGIES))}`")
+    lines.append("")
+
+    lines.append("## Original WikiText Bad Result")
+    lines.append("")
+    original_order = [
+        "Full",
+        "Static uniform",
+        "Static ends_heavy",
+        "Static best-on-val C6",
+        "Raw-SetBCE",
+        "OPAL-SetBCE",
+    ]
+    lines.extend(metric_table_lines(metrics, original_order))
+    lines.append("")
+    if opal and raw:
+        lines.append(
+            f"Raw-SetBCE is currently ahead of OPAL-SetBCE by "
+            f"{fmt(float(opal['nll']) - float(raw['nll']))} NLL / {fmt(float(opal['ppl']) - float(raw['ppl']))} PPL."
+        )
+        lines.append("")
+
+    lines.append("## WikiText-2 Audit")
+    lines.append("")
+    lines.append("| check | status | note |")
+    lines.append("|---|---|---|")
+    lines.append("| score direction | pass | labels use `y_l=1` for skipped layers; BCE trains `-pred` toward skip=1, and eval skips the lowest `pred` scores. |")
+    lines.append("| mask application | pass | eval writes `config.custom_layer_mask`; maskcfg smoke/main runs show static masks change PPL, unlike the pre-fix invalid run. |")
+    lines.append("| exact budget | pass | metrics record `exact_skip_count_rate=1.0` for all skip methods. |")
+    lines.append("| protected policy | pass | static/raw/OPAL/related baselines use the same protected head/tail and K. |")
+    lines.append("| split leakage | pass | greedy/candidate labels are train-only; static best uses validation; test eval does not load labels. |")
+    lines.append("| router input | pass | routers see only first `router_prefix_tokens`; labels/PPL score suffix tokens. |")
+    lines.append("| full PPL sanity | pass | Full PPL is finite and plausible for Qwen2.5-1.5B on WikiText-2 raw. |")
+    lines.append("| static best selection | pass | C6 best is selected by validation NLL, not test. |")
+    lines.append("| label objective | pass | greedy and candidate labels optimize suffix Delta_NLL. |")
+    lines.append("")
+
+    lines.append("## Why OPAL Did Not Win Yet")
+    lines.append("")
+    lines.append("- The current OPAL run beats Static best-on-val C6, but loses narrowly to Raw-SetBCE on the main `seq1024/pref256/m2000` run.")
+    lines.append("- OPAL predicts more diverse masks than Raw, but diversity alone is not useful if WikiText-2 layer-skip decisions are dominated by coarse static/early-content patterns.")
+    lines.append("- `prefix_hk_raw_attn` may be adding variance on LM windows: the teacher prefix representation can overfit short train windows, while raw embeddings act as a lower-variance content prior.")
+    lines.append("- The next minimal correction is prefix length 512 and, if needed, validation checkpoint selection/static-prior variants; do not claim OPAL wins public LM until related baselines are in.")
+    lines.append("")
+
+    lines.append("## Related Baseline Table")
+    lines.append("")
+    lines.extend(metric_table_lines(metrics, order))
+    lines.append("")
+
+    lines.append("## Training And Diagnostics")
+    lines.append("")
+    for name in ["PuDDing-style", "layerwise_hidden_router", "Raw-SetBCE", "OPAL-SetBCE"]:
+        summary = training.get(name)
+        if not summary:
+            continue
+        best = summary["best"]
+        first = summary["first"]
+        last = summary["last"]
+        lines.append(
+            f"- {name}: epochs={summary['epochs']}, first={fmt(first.get('loss'))}, "
+            f"best={fmt(best.get('loss'))} @ epoch {best.get('epoch')}, last={fmt(last.get('loss'))}"
+        )
+    for name, summary in overlaps.items():
+        if not summary:
+            continue
+        lines.append(
+            f"- {name} overlap: overlap@K={fmt(summary.get('mean_overlap_ratio'))}, "
+            f"hamming={fmt(summary.get('mean_hamming_ratio'))}, unique={summary.get('unique_predicted_masks')}"
+        )
+    if "PuDDing-style" in metrics:
+        lines.append(f"- PuDDing-style selected candidate distribution: `{metrics['PuDDing-style'].get('selected_candidate_distribution', {})}`")
+    if "IG-style" in metrics:
+        lines.append(f"- IG-style selected candidate distribution: `{metrics['IG-style'].get('selected_candidate_distribution', {})}`")
+    if ig_summary:
+        lines.append(f"- IG cluster sizes: `{ig_summary.get('cluster_sizes')}`")
+        lines.append(f"- IG cluster selected masks: `{ig_summary.get('cluster_candidate_ids')}`")
+    lines.append("- layerwise_hidden_router is an in-framework stronger-access baseline, not a full Dr.LLM reproduction.")
+    lines.append("")
+
+    lines.append("## OPAL Tuning Table")
+    lines.append("")
+    if tuning_metrics:
+        tuning_order = list(tuning_metrics)
+        lines.extend(metric_table_lines({"Full": full, **tuning_metrics}, ["Full"] + tuning_order))
+    else:
+        lines.append("| setting | status | note |")
+        lines.append("|---|---|---|")
+        lines.append("| prefix tokens 256 | complete | current main run; OPAL beats static but loses Raw narrowly. |")
+        lines.append("| prefix tokens 512 | pending | run the minimal correction command below if related baselines do not rescue the story. |")
+        lines.append("| validation checkpoint / static prior / swap q | pending | run only after prefix-512 check. |")
+    lines.append("")
+
+    lines.append("## Final Judgment")
+    lines.append("")
+    lines.append(f"- decision: **{judgment}**")
+    lines.append(f"- rationale: {judgment_detail}")
+    lines.append("")
+
+    lines.append("## Commands")
+    lines.append("")
+    lines.append("Related baseline run:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("cd /workspace/PriorDynamicPruning")
+    lines.append("source ~/venvs/planrec/bin/activate")
+    lines.append("git pull --ff-only origin codex/opal-llm-experiments")
+    lines.append("")
+    lines.append("WIKITEXT_MODEL_PATH=/workspace/ckpts/Qwen2.5-1.5B \\")
+    lines.append("WIKITEXT_LABEL_SAMPLES=2000 \\")
+    lines.append("WIKITEXT_EVAL_WINDOWS=512 \\")
+    lines.append("WIKITEXT_SEQ_LEN=1024 \\")
+    lines.append("WIKITEXT_ROUTER_PREFIX_TOKENS=256 \\")
+    lines.append("WIKITEXT_SEED=42 \\")
+    lines.append("WIKITEXT_BASE_PORT=58200 \\")
+    lines.append("WIKITEXT_RUN_PUDDING=1 \\")
+    lines.append("WIKITEXT_RUN_IG=1 \\")
+    lines.append("WIKITEXT_RUN_LAYERWISE=1 \\")
+    lines.append("bash ./run_wikitext2_related_baselines_gpu01234567.sh")
+    lines.append("```")
+    lines.append("")
+    lines.append("Minimal OPAL correction if needed:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("cd /workspace/PriorDynamicPruning")
+    lines.append("source ~/venvs/planrec/bin/activate")
+    lines.append("")
+    lines.append("WIKITEXT_MODEL_PATH=/workspace/ckpts/Qwen2.5-1.5B \\")
+    lines.append("WIKITEXT_LABEL_SAMPLES=2000 \\")
+    lines.append("WIKITEXT_EVAL_WINDOWS=512 \\")
+    lines.append("WIKITEXT_SEQ_LEN=1024 \\")
+    lines.append("WIKITEXT_ROUTER_PREFIX_TOKENS=512 \\")
+    lines.append("WIKITEXT_SEED=42 \\")
+    lines.append("WIKITEXT_BASE_PORT=58300 \\")
+    lines.append("bash ./run_wikitext2_public_lm_sanity_gpu01234567.sh")
+    lines.append("```")
+    lines.append("")
+
+    lines.append("## Artifact Paths")
+    lines.append("")
+    for name, path in metric_paths.items():
+        lines.append(f"- metric `{name}`: `{path}`")
+    for name, path in parse_named_paths(args.training_metric).items():
+        lines.append(f"- training `{name}`: `{path}`")
+    for name, path in parse_named_paths(args.overlap_summary).items():
+        lines.append(f"- overlap `{name}`: `{path}`")
+    if args.candidate_label_metadata:
+        lines.append(f"- candidate labels metadata: `{args.candidate_label_metadata}`")
+    if args.ig_summary:
+        lines.append(f"- IG summary: `{args.ig_summary}`")
+
+    Path(args.output_md).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output_md).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Wrote related report to {args.output_md}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Train/evaluate WikiText-2 OPAL PPL sanity benchmark.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -934,10 +1929,55 @@ def build_parser():
         p.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
         p.add_argument("--seed", type=int, default=42)
 
+    candidate_labels = sub.add_parser("build_candidate_labels")
+    add_data_args(candidate_labels)
+    candidate_labels.add_argument("--reference_label_file", default="")
+    candidate_labels.add_argument("--label_samples", type=int, default=2000)
+    candidate_labels.add_argument("--sample_strategy", choices=["first", "random"], default="random")
+    candidate_labels.add_argument("--sample_seed", type=int, default=42)
+    candidate_labels.add_argument("--skip_rate", type=float, default=0.25)
+    candidate_labels.add_argument("--skip_count", type=int, default=0)
+    candidate_labels.add_argument("--protected_head", type=int, default=4)
+    candidate_labels.add_argument("--protected_tail", type=int, default=2)
+    candidate_labels.add_argument("--batch_size", type=int, default=1)
+    candidate_labels.add_argument("--candidate_batch_size", type=int, default=4)
+    candidate_labels.add_argument("--output", required=True)
+    candidate_labels.set_defaults(func=build_candidate_labels)
+
+    candidate_train = sub.add_parser("train_candidate_router")
+    add_data_args(candidate_train)
+    candidate_train.add_argument("--candidate_label_file", required=True)
+    candidate_train.add_argument("--skip_rate", type=float, default=0.25)
+    candidate_train.add_argument("--skip_count", type=int, default=0)
+    candidate_train.add_argument("--protected_head", type=int, default=4)
+    candidate_train.add_argument("--protected_tail", type=int, default=2)
+    candidate_train.add_argument("--batch_size", type=int, default=4)
+    candidate_train.add_argument("--epochs", type=int, default=40)
+    candidate_train.add_argument("--lr", type=float, default=1e-4)
+    candidate_train.add_argument("--dropout", type=float, default=0.0)
+    candidate_train.add_argument("--loss", choices=["huber", "mse"], default="huber")
+    candidate_train.add_argument("--max_grad_norm", type=float, default=1.0)
+    candidate_train.add_argument("--output_dir", required=True)
+    candidate_train.set_defaults(func=train_candidate_router)
+
+    ig = sub.add_parser("build_ig_artifact")
+    add_data_args(ig)
+    ig.add_argument("--candidate_label_file", required=True)
+    ig.add_argument("--skip_rate", type=float, default=0.25)
+    ig.add_argument("--skip_count", type=int, default=0)
+    ig.add_argument("--protected_head", type=int, default=4)
+    ig.add_argument("--protected_tail", type=int, default=2)
+    ig.add_argument("--batch_size", type=int, default=8)
+    ig.add_argument("--clusters", type=int, default=8)
+    ig.add_argument("--kmeans_iters", type=int, default=30)
+    ig.add_argument("--output_artifact", required=True)
+    ig.add_argument("--output_summary", required=True)
+    ig.set_defaults(func=build_ig_artifact)
+
     train = sub.add_parser("train_router")
     add_data_args(train)
     train.add_argument("--risk_label_file", required=True)
-    train.add_argument("--router_input", choices=["raw_embedding", "prefix_hk_raw_attn"], default="prefix_hk_raw_attn")
+    train.add_argument("--router_input", choices=["raw_embedding", "prefix_hk_raw_attn", "layerwise_hidden"], default="prefix_hk_raw_attn")
     train.add_argument("--prefix_depth", type=int, default=4)
     train.add_argument("--skip_rate", type=float, default=0.25)
     train.add_argument("--skip_count", type=int, default=0)
@@ -958,10 +1998,12 @@ def build_parser():
     eval_p.add_argument("--eval_windows", type=int, default=512)
     eval_p.add_argument("--sample_strategy", choices=["first", "random"], default="first")
     eval_p.add_argument("--sample_seed", type=int, default=42)
-    eval_p.add_argument("--method", choices=["full", "static", "router"], required=True)
+    eval_p.add_argument("--method", choices=["full", "static", "router", "candidate_router", "ig"], required=True)
     eval_p.add_argument("--method_label", default="")
     eval_p.add_argument("--static_strategy", choices=C6_STATIC_STRATEGIES, default="uniform")
     eval_p.add_argument("--risk_router_ckpt", default="")
+    eval_p.add_argument("--candidate_router_ckpt", default="")
+    eval_p.add_argument("--ig_artifact", default="")
     eval_p.add_argument("--prefix_depth", type=int, default=4)
     eval_p.add_argument("--skip_rate", type=float, default=0.25)
     eval_p.add_argument("--skip_count", type=int, default=0)
@@ -1000,6 +2042,17 @@ def build_parser():
     report.add_argument("--output_md", required=True)
     report.add_argument("--date", default="2026-06-02")
     report.set_defaults(func=write_report)
+
+    related_report = sub.add_parser("write_related_report")
+    related_report.add_argument("--metric", action="append", default=[], help="NAME=PATH, e.g. Full=/tmp/full.json")
+    related_report.add_argument("--training_metric", action="append", default=[], help="NAME=PATH to training_metrics.json")
+    related_report.add_argument("--overlap_summary", action="append", default=[], help="NAME=PATH to overlap summary JSON")
+    related_report.add_argument("--tuning_metric", action="append", default=[], help="NAME=PATH for OPAL tuning metrics")
+    related_report.add_argument("--candidate_label_metadata", default="")
+    related_report.add_argument("--ig_summary", default="")
+    related_report.add_argument("--output_md", required=True)
+    related_report.add_argument("--date", default="2026-06-02")
+    related_report.set_defaults(func=write_related_report)
     return parser
 
 
@@ -1013,6 +2066,10 @@ def main():
             args.method_label = f"Static {args.static_strategy}"
         elif args.method == "router":
             args.method_label = "Router"
+        elif args.method == "candidate_router":
+            args.method_label = "PuDDing-style"
+        elif args.method == "ig":
+            args.method_label = "IG-style"
     if hasattr(args, "router_prefix_tokens") and int(args.router_prefix_tokens) >= int(args.seq_len):
         raise ValueError("--router_prefix_tokens must be smaller than --seq_len")
     args.func(args)

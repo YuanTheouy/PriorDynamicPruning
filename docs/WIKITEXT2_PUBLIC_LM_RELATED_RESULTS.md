@@ -211,12 +211,14 @@ PY
 
 ## OPAL Tuning Table
 
-| setting | status | note |
-|---|---|---|
-| prefix tokens 256 | complete | Current main run; OPAL beats static but loses Raw narrowly. |
-| prefix tokens 512 | pending | Run only if related baselines do not rescue the story. |
-| validation checkpoint selection | pending | Next priority after prefix 512. |
-| static prior / swap q=1/2 | pending | Use only after the simpler checks. |
+| setting | status | Full NLL/PPL | Raw-SetBCE NLL/PPL | OPAL-SetBCE NLL/PPL | conclusion |
+|---|---|---:|---:|---:|---|
+| prefix tokens 256 | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7672 / 15.9138 | OPAL beats static/PuDDing/IG but loses Raw by 0.0054 NLL. |
+| prefix tokens 512 | complete | 2.1834 / 8.8763 | 2.7443 / 15.5530 | 2.7586 / 15.7777 | OPAL still loses Raw by 0.0143 NLL; do not expand SetBCE to 3 seeds. |
+| validation checkpoint selection | pending | NA | NA | NA | Only worthwhile if an OPAL variant first beats Raw on seed42. |
+| static prior / swap q=1/2 | pending | NA | NA | NA | Defer unless old OPAL baselines or prefix variants show a path to beat Raw. |
+
+Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 suffix tokens per window, while `prefix512` scores 512 suffix tokens per window. Compare methods within the same prefix setting using Delta_NLL/Delta_PPL.
 
 ## Gap Table
 
@@ -227,7 +229,7 @@ PY
 | OPAL-Attn old one-layer | missing on WikiText-2 | P0 | old one-layer attention OPAL ablation; needed for continuity with prior tables | run seed42 first |
 | static best-on-val C16 | optional missing | P2 | PuDDing/IG use C16; static best currently C6, so C16 static can check whether candidate library itself contains a stronger static mask | optional after P0 |
 | 3 seeds | missing | P2 | needed only if a seed42 setting becomes paper-worthy | do not run until prefix512 or old OPAL wins Raw |
-| prefix length sensitivity | missing | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | run prefix_tokens=512 seed42 next if trying to rescue SetBCE |
+| prefix length sensitivity | seed42 prefix512 complete | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | did not rescue SetBCE; OPAL still loses Raw |
 | validation checkpoint selection | missing | P1 | current training may not choose best validation-PPL checkpoint | add only if prefix512 still looks promising |
 
 ## Next Minimal Experiments
@@ -235,10 +237,10 @@ PY
 Priority order:
 
 1. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
-2. If the goal is to rescue OPAL-SetBCE specifically, run `router_prefix_tokens=512` seed42 using the existing public sanity runner.
-3. Expand to three seeds only if prefix512 beats Raw-SetBCE on seed42.
+2. Do not expand OPAL-SetBCE prefix512 to three seeds: seed42 still loses Raw-SetBCE.
+3. Expand to three seeds only if an old OPAL baseline, static-prior variant, or another clearly specified OPAL variant beats Raw-SetBCE on seed42.
 
-Prefix512 rescue command:
+Prefix512 rescue command already run:
 
 ```bash
 cd /workspace/PriorDynamicPruning
@@ -260,7 +262,7 @@ Old OPAL baselines are not wired into the current WikiText-2 runner yet. Do not 
 ## Final Judgment
 
 - current decision: **appendix only**
-- reason: OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router.
+- reason: OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. The prefix512 seed42 rescue also loses Raw-SetBCE.
 - recommended wording: WikiText-2 is a public LM sanity / partial generalization result, not a main OPAL superiority claim.
 - do not write: "OPAL is best on WikiText-2." The table does not support that.
 - safe write: "On WikiText-2, OPAL improves over fixed/candidate-library skipping baselines but remains slightly behind a raw-prefix set router and a stronger-access layerwise hidden router."

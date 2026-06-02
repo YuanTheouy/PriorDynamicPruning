@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unattended no-comp downstream multiple-choice evaluation for OPAL layer skipping.
-# This script only consumes existing WikiText-trained routers/artifacts and does
-# not rerun WikiText PPL, label building, or router training.
+# Unattended no-comp downstream evaluation for OPAL layer skipping via
+# lm-evaluation-harness. This consumes existing WikiText-trained routers/artifacts
+# and does not rerun WikiText PPL, label building, or router training.
 
 export REPO_DIR="${REPO_DIR:-/workspace/PriorDynamicPruning}"
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
@@ -22,7 +22,7 @@ export LLMEVAL_SEEDS="${LLMEVAL_SEEDS:-42 13 3407}"
 export LLMEVAL_MAX_LENGTH="${LLMEVAL_MAX_LENGTH:-1024}"
 export LLMEVAL_ROUTER_PREFIX_TOKENS="${LLMEVAL_ROUTER_PREFIX_TOKENS:-256}"
 export LLMEVAL_BATCH_SIZE="${LLMEVAL_BATCH_SIZE:-8}"
-export LLMEVAL_PRECISION="${LLMEVAL_PRECISION:-bf16}"
+export LLMEVAL_DTYPE="${LLMEVAL_DTYPE:-bfloat16}"
 export LLMEVAL_SKIP_RATE="${LLMEVAL_SKIP_RATE:-0.25}"
 export LLMEVAL_SKIP_COUNT="${LLMEVAL_SKIP_COUNT:-7}"
 export LLMEVAL_PROTECTED_HEAD="${LLMEVAL_PROTECTED_HEAD:-4}"
@@ -42,6 +42,11 @@ export LLMEVAL_RUN_ID="${LLMEVAL_RUN_ID:-llmeval_${model_tag}_${LLMEVAL_MASK_IMP
 export LLMEVAL_METRIC_ROOT="${LLMEVAL_OUTPUT_ROOT}/metrics"
 export LLMEVAL_LOG_ROOT="${LLMEVAL_OUTPUT_ROOT}/logs/${LLMEVAL_RUN_ID}"
 mkdir -p "$LLMEVAL_METRIC_ROOT" "$LLMEVAL_LOG_ROOT" "$(dirname "$LLMEVAL_REPORT_MD")"
+
+if ! python3 -c 'import lm_eval' >/dev/null 2>&1; then
+  echo "=== Install lm-evaluation-harness into current venv ==="
+  python3 -m pip install -U "lm_eval[hf]"
+fi
 
 run_accelerate() {
   local port="$NEXT_PORT"
@@ -69,7 +74,7 @@ finally:
       --num_processes "$NUM_GPUS" \
       --num_machines 1 \
       --main_process_port "$port" \
-      --mixed_precision "$LLMEVAL_PRECISION" \
+      --mixed_precision bf16 \
       --dynamo_backend no \
       "$@" 2>&1 | tee "$port_log"
     local status="${PIPESTATUS[0]}"
@@ -148,10 +153,9 @@ eval_method() {
     return 0
   fi
   local run_name="${LLMEVAL_RUN_ID}_seed${seed}_${slug}"
-  run_accelerate ./eval_llm_downstream_opal.py eval \
+  run_accelerate ./eval_lm_eval_harness_opal.py eval \
     --model "$LLMEVAL_MODEL_PATH" \
     --tasks "$LLMEVAL_TASKS" \
-    --split validation \
     --method "$method" \
     --method_label "$label" \
     --skip_rate "$LLMEVAL_SKIP_RATE" \
@@ -161,7 +165,7 @@ eval_method() {
     --router_prefix_tokens "$LLMEVAL_ROUTER_PREFIX_TOKENS" \
     --max_length "$LLMEVAL_MAX_LENGTH" \
     --batch_size "$LLMEVAL_BATCH_SIZE" \
-    --precision "$LLMEVAL_PRECISION" \
+    --dtype "$LLMEVAL_DTYPE" \
     --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
     --seed "$seed" \
     --limit "$LLMEVAL_LIMIT" \
@@ -179,9 +183,11 @@ echo "LLMEVAL_SEEDS=${LLMEVAL_SEEDS}"
 echo "LLMEVAL_MAX_LENGTH=${LLMEVAL_MAX_LENGTH}"
 echo "LLMEVAL_ROUTER_PREFIX_TOKENS=${LLMEVAL_ROUTER_PREFIX_TOKENS}"
 echo "LLMEVAL_BATCH_SIZE=${LLMEVAL_BATCH_SIZE}"
+echo "LLMEVAL_DTYPE=${LLMEVAL_DTYPE}"
 echo "LLMEVAL_SKIP_COUNT=${LLMEVAL_SKIP_COUNT}"
 echo "LLMEVAL_OUTPUT_ROOT=${LLMEVAL_OUTPUT_ROOT}"
 echo "LLMEVAL_REPORT_MD=${LLMEVAL_REPORT_MD}"
+echo "Evaluator=lm-evaluation-harness simple_evaluate"
 echo "This script consumes existing WikiText routers/artifacts only; it does not rerun WikiText PPL."
 
 for seed in $LLMEVAL_SEEDS; do
@@ -221,7 +227,7 @@ for seed in $LLMEVAL_SEEDS; do
 done
 
 echo "=== Summarize downstream results ==="
-python3 ./eval_llm_downstream_opal.py summarize \
+python3 ./eval_lm_eval_harness_opal.py summarize \
   --output_root "$LLMEVAL_OUTPUT_ROOT" \
   --output_md "$LLMEVAL_REPORT_MD" \
   --model "$LLMEVAL_MODEL_PATH" \

@@ -13,11 +13,12 @@ git pull --ff-only origin codex/opal-llm-experiments
 bash ./run_llmeval_downstream_gpu01234567.sh
 ```
 
-This is a no-compensation main table. It consumes existing WikiText-trained routers/artifacts and does not rerun WikiText PPL, label construction, or router training.
+This is a no-compensation main table run through `lm-evaluation-harness` (`simple_evaluate`). It consumes existing WikiText-trained routers/artifacts and does not rerun WikiText PPL, label construction, or router training.
 
 ## Fixed Setup
 
 - model: `/workspace/ckpts/Qwen2.5-1.5B`
+- evaluator: `lm-evaluation-harness`
 - tasks: `piqa,openbookqa,winogrande,hellaswag,arc_easy,arc_challenge`
 - seeds: `42,13,3407`
 - max_length: `1024`

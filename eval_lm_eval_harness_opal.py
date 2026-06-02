@@ -31,8 +31,11 @@ from eval_wikitext_opal_ppl import (
     router_forward,
 )
 from wikitext_opal_utils import (
+    action_payload_from_keep_mask,
     allowed_layers_from_policy,
     clear_custom_policy,
+    compensation_config,
+    compensation_runtime_stats,
     keep_masks_from_skip_risk,
     mask_key,
     resolve_skip_budget,
@@ -121,6 +124,9 @@ class OpalHarnessLM(HFLM):
         protected_tail: int = 2,
         router_prefix_tokens: int = 256,
         prefix_depth: int = 4,
+        compensation_mode: str = "none",
+        compensation_rank: int = 0,
+        compensation_static_gate: float = 1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -129,6 +135,9 @@ class OpalHarnessLM(HFLM):
         self.static_strategy = str(static_strategy)
         self.router_prefix_tokens = int(router_prefix_tokens)
         self.prefix_depth = int(prefix_depth)
+        self.compensation_config = compensation_config(compensation_mode, compensation_rank, compensation_static_gate)
+        if self.opal_method == "full":
+            self.compensation_config = {"mode": "none", "rank": 0}
         self.skip_count, self.keep_count = resolve_skip_budget(
             len(self.model.model.layers),
             float(skip_rate),
@@ -288,7 +297,17 @@ class OpalHarnessLM(HFLM):
         if layer_mask is None:
             clear_custom_policy(self.model)
         else:
-            set_custom_policy(self.model, layer_mask)
+            action_payload = (
+                action_payload_from_keep_mask(layer_mask)
+                if self.compensation_config.get("mode") != "none"
+                else None
+            )
+            set_custom_policy(
+                self.model,
+                layer_mask,
+                action_payload=action_payload,
+                compensation_config_payload=self.compensation_config,
+            )
         try:
             with torch.no_grad(), torch.autocast(
                 device_type=self.device.type,
@@ -447,6 +466,9 @@ def run_eval(args):
         protected_tail=args.protected_tail,
         router_prefix_tokens=args.router_prefix_tokens,
         prefix_depth=args.prefix_depth,
+        compensation_mode=args.compensation_mode,
+        compensation_rank=args.compensation_rank,
+        compensation_static_gate=args.compensation_static_gate,
         batch_size=args.batch_size,
         max_length=args.max_length,
         dtype=args.dtype,
@@ -534,7 +556,8 @@ def run_eval(args):
         "lm_eval_n_samples": results.get("n-samples", {}),
         "lm_eval_versions": results.get("versions", {}),
         "mask_application": "config.custom_layer_mask",
-        "compensation": "none",
+        "compensation": lm.compensation_config,
+        **compensation_runtime_stats(lm.model),
         "target_leakage_guard": "lm-eval-harness builds prompts; router masks use context tokens only, never continuation tokens",
     }
     write_json(args.output_json, payload)
@@ -612,7 +635,7 @@ def summarize(args):
         f"- router_prefix_tokens: `{args.router_prefix_tokens}`",
         f"- skip_rate / skip_count: `{args.skip_rate}` / `{args.skip_count}`",
         f"- protected_head / protected_tail: `{args.protected_head}` / `{args.protected_tail}`",
-        "- compensation: `none`",
+        f"- compensation: `{args.compensation_mode}` rank `{args.compensation_rank}` gate `{args.compensation_static_gate}`",
         "- mask leakage guard: harness builds context/continuation; router masks use context tokens only",
         "",
         "## Per-Seed Task Results",
@@ -775,6 +798,9 @@ def build_parser():
     eval_p.add_argument("--batch_size", default="8")
     eval_p.add_argument("--dtype", default="bfloat16")
     eval_p.add_argument("--device", default="cuda")
+    eval_p.add_argument("--compensation_mode", default="none")
+    eval_p.add_argument("--compensation_rank", type=int, default=0)
+    eval_p.add_argument("--compensation_static_gate", type=float, default=1.0)
     eval_p.add_argument("--num_fewshot", type=int, default=0)
     eval_p.add_argument("--limit", type=float, default=0)
     eval_p.add_argument("--seed", type=int, default=42)
@@ -796,6 +822,9 @@ def build_parser():
     report.add_argument("--skip_count", type=int, default=7)
     report.add_argument("--protected_head", type=int, default=4)
     report.add_argument("--protected_tail", type=int, default=2)
+    report.add_argument("--compensation_mode", default="none")
+    report.add_argument("--compensation_rank", type=int, default=0)
+    report.add_argument("--compensation_static_gate", type=float, default=1.0)
     report.add_argument("--date", default="2026-06-02")
     report.set_defaults(func=summarize)
     return parser

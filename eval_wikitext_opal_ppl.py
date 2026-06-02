@@ -31,9 +31,12 @@ from wikitext_opal_utils import (
     C6_STATIC_STRATEGIES,
     RELATED_CANDIDATE_STRATEGIES,
     aggregate_loss_rows,
+    action_payload_from_keep_mask,
     allowed_layers_from_policy,
     clear_custom_policy,
     collate_wikitext_windows,
+    compensation_config,
+    compensation_runtime_stats,
     detect_num_layers,
     dtype_from_precision,
     finite_exp,
@@ -181,11 +184,22 @@ def load_router_checkpoint(path: str, hidden_size: int, num_layers: int, device)
     return router, metadata
 
 
-def forward_loss_rows(model, input_ids, attention_mask, labels, layer_mask=None):
+def forward_loss_rows(
+    model,
+    input_ids,
+    attention_mask,
+    labels,
+    layer_mask=None,
+    compensation_mode: str = "none",
+    compensation_rank: int = 0,
+    compensation_static_gate: float = 1.0,
+):
     if layer_mask is None:
         clear_custom_policy(model)
     else:
-        set_custom_policy(model, layer_mask)
+        comp = compensation_config(compensation_mode, compensation_rank, compensation_static_gate)
+        action_payload = action_payload_from_keep_mask(layer_mask) if comp.get("mode") != "none" else None
+        set_custom_policy(model, layer_mask, action_payload=action_payload, compensation_config_payload=comp)
     try:
         outputs = model(
             input_ids=input_ids,
@@ -194,6 +208,8 @@ def forward_loss_rows(model, input_ids, attention_mask, labels, layer_mask=None)
         )
         rows = lm_loss_stats_from_logits(outputs.logits, labels)
         del outputs
+        for row in rows:
+            row.update(compensation_runtime_stats(model))
         return rows
     finally:
         clear_custom_policy(model)
@@ -1284,7 +1300,16 @@ def eval_method(args):
             else:
                 raise ValueError(f"Unsupported eval method: {args.method}")
 
-            rows = forward_loss_rows(model, input_ids, attention_mask, labels, layer_mask=layer_mask)
+            rows = forward_loss_rows(
+                model,
+                input_ids,
+                attention_mask,
+                labels,
+                layer_mask=layer_mask,
+                compensation_mode=args.compensation_mode,
+                compensation_rank=args.compensation_rank,
+                compensation_static_gate=args.compensation_static_gate,
+            )
             for sample_id, window_start, stats, keep_mask, candidate_id in zip(
                 sample_ids,
                 window_starts,
@@ -1375,6 +1400,13 @@ def eval_method(args):
             "uses_greedy_labels_at_eval": False,
             "target_leakage_guard": "router sees only first router_prefix_tokens; PPL scores suffix tokens only",
             "mask_application": "config.custom_layer_mask",
+            "compensation": compensation_config(
+                args.compensation_mode,
+                args.compensation_rank if args.method != "full" else 0,
+                args.compensation_static_gate,
+            ),
+            "compensation_runtime_calls": int(max([int(row.get("compensation_runtime_calls", 0)) for row in rows] or [0])),
+            "compensation_runtime_total_sec": float(max([float(row.get("compensation_runtime_total_sec", 0.0)) for row in rows] or [0.0])),
             "rows": rows if args.save_rows_in_json else [],
         }
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -2105,6 +2137,9 @@ def build_parser():
     eval_p.add_argument("--protected_head", type=int, default=4)
     eval_p.add_argument("--protected_tail", type=int, default=2)
     eval_p.add_argument("--batch_size", type=int, default=1)
+    eval_p.add_argument("--compensation_mode", default="none")
+    eval_p.add_argument("--compensation_rank", type=int, default=0)
+    eval_p.add_argument("--compensation_static_gate", type=float, default=1.0)
     eval_p.add_argument("--run_name", required=True)
     eval_p.add_argument("--output_json", required=True)
     eval_p.add_argument("--save_rows_in_json", action="store_true")

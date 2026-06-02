@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unattended no-comp downstream evaluation for OPAL layer skipping via
+# Unattended downstream evaluation for OPAL layer skipping via
 # lm-evaluation-harness. This consumes existing WikiText-trained routers/artifacts
 # and does not rerun WikiText PPL, label building, or router training.
 
@@ -43,6 +43,9 @@ export LLMEVAL_REPORT_MD="${LLMEVAL_REPORT_MD:-${REPO_DIR}/docs/LLMEVAL_DOWNSTRE
 export LLMEVAL_LIMIT="${LLMEVAL_LIMIT:-0}"
 export LLMEVAL_RUNNER_BACKEND="${LLMEVAL_RUNNER_BACKEND:-single_gpu_pool}"
 export LLMEVAL_PREFETCH_LIMIT="${LLMEVAL_PREFETCH_LIMIT:-1}"
+export LLMEVAL_COMPENSATION_MODE="${LLMEVAL_COMPENSATION_MODE:-none}"
+export LLMEVAL_COMPENSATION_RANK="${LLMEVAL_COMPENSATION_RANK:-0}"
+export LLMEVAL_COMPENSATION_STATIC_GATE="${LLMEVAL_COMPENSATION_STATIC_GATE:-1.0}"
 
 cd "$REPO_DIR"
 
@@ -251,6 +254,9 @@ eval_method() {
     --max_length "$LLMEVAL_MAX_LENGTH" \
     --batch_size "$LLMEVAL_BATCH_SIZE" \
     --dtype "$LLMEVAL_DTYPE" \
+    --compensation_mode "$LLMEVAL_COMPENSATION_MODE" \
+    --compensation_rank "$LLMEVAL_COMPENSATION_RANK" \
+    --compensation_static_gate "$LLMEVAL_COMPENSATION_STATIC_GATE" \
     --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
     --seed "$seed" \
     --limit "$LLMEVAL_LIMIT" \
@@ -296,6 +302,9 @@ run_direct_eval_on_gpu() {
     --max_length "$LLMEVAL_MAX_LENGTH" \
     --batch_size "$LLMEVAL_BATCH_SIZE" \
     --dtype "$LLMEVAL_DTYPE" \
+    --compensation_mode "$LLMEVAL_COMPENSATION_MODE" \
+    --compensation_rank "$LLMEVAL_COMPENSATION_RANK" \
+    --compensation_static_gate "$LLMEVAL_COMPENSATION_STATIC_GATE" \
     --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
     --seed "$seed" \
     --limit "$limit_override" \
@@ -415,7 +424,7 @@ run_single_gpu_pool() {
   fi
 }
 
-echo "=== OPAL downstream lm-eval-style no-comp run ==="
+echo "=== OPAL downstream lm-eval-style run ==="
 echo "REPO_DIR=${REPO_DIR}"
 echo "LLMEVAL_MODEL_PATH=${LLMEVAL_MODEL_PATH}"
 echo "LLMEVAL_TASKS=${LLMEVAL_TASKS}"
@@ -429,6 +438,9 @@ echo "LLMEVAL_OUTPUT_ROOT=${LLMEVAL_OUTPUT_ROOT}"
 echo "LLMEVAL_REPORT_MD=${LLMEVAL_REPORT_MD}"
 echo "LLMEVAL_RUNNER_BACKEND=${LLMEVAL_RUNNER_BACKEND}"
 echo "LLMEVAL_PREFETCH_LIMIT=${LLMEVAL_PREFETCH_LIMIT}"
+echo "LLMEVAL_COMPENSATION_MODE=${LLMEVAL_COMPENSATION_MODE}"
+echo "LLMEVAL_COMPENSATION_RANK=${LLMEVAL_COMPENSATION_RANK}"
+echo "LLMEVAL_COMPENSATION_STATIC_GATE=${LLMEVAL_COMPENSATION_STATIC_GATE}"
 echo "HF_ENDPOINT=${HF_ENDPOINT}"
 echo "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}"
 echo "Evaluator=lm-evaluation-harness simple_evaluate"
@@ -489,7 +501,10 @@ python3 ./eval_lm_eval_harness_opal.py summarize \
   --skip_count "$LLMEVAL_SKIP_COUNT" \
   --protected_head "$LLMEVAL_PROTECTED_HEAD" \
   --protected_tail "$LLMEVAL_PROTECTED_TAIL" \
+  --compensation_mode "$LLMEVAL_COMPENSATION_MODE" \
+  --compensation_rank "$LLMEVAL_COMPENSATION_RANK" \
+  --compensation_static_gate "$LLMEVAL_COMPENSATION_STATIC_GATE" \
   --date "$(date +%F)"
 
-echo "=== Done: downstream no-comp run ==="
+echo "=== Done: downstream lm-eval-style run ==="
 echo "Report: ${LLMEVAL_REPORT_MD}"

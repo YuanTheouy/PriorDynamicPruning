@@ -64,23 +64,68 @@ def detect_num_layers(model) -> int:
     raise ValueError("Could not detect decoder layer count.")
 
 
-def set_custom_policy(model, mask_payload) -> None:
+def compensation_config(mode: str = "none", rank: int = 0, static_gate: float = 1.0) -> Dict[str, object]:
+    mode = str(mode or "none")
+    rank = max(0, int(rank or 0))
+    if mode == "none" or rank <= 0:
+        return {"mode": "none", "rank": 0}
+    return {
+        "mode": mode,
+        "rank": rank,
+        "static_gate": float(static_gate),
+    }
+
+
+def action_payload_from_keep_mask(mask_payload):
+    """Map keep masks to Qwen2 layer actions: 1=compute, 2=compensate skipped."""
+    if mask_payload is None:
+        return None
+    if isinstance(mask_payload, torch.Tensor):
+        return torch.where(
+            mask_payload.to(dtype=torch.float32) >= 0.5,
+            torch.ones_like(mask_payload, dtype=torch.long),
+            torch.full_like(mask_payload, 2, dtype=torch.long),
+        )
+    if isinstance(mask_payload, list):
+        if mask_payload and isinstance(mask_payload[0], list):
+            return [[1 if float(v) >= 0.5 else 2 for v in row] for row in mask_payload]
+        return [1 if float(v) >= 0.5 else 2 for v in mask_payload]
+    return None
+
+
+def compensation_runtime_stats(model) -> Dict[str, float]:
+    stats = getattr(model.config, "custom_compensation_runtime_stats", {}) or {}
+    return {
+        "compensation_runtime_calls": int(stats.get("calls", 0)),
+        "compensation_runtime_total_sec": float(stats.get("total_sec", 0.0)),
+    }
+
+
+def set_custom_policy(model, mask_payload, action_payload=None, compensation_config_payload=None) -> None:
+    config = compensation_config_payload or {"mode": "none", "rank": 0}
+    stats = getattr(model.config, "custom_compensation_runtime_stats", None)
+    if not isinstance(stats, dict):
+        stats = {"calls": 0, "total_sec": 0.0}
     model.config.custom_layer_mask = mask_payload
-    model.config.custom_layer_actions = None
-    model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    model.config.custom_layer_actions = action_payload
+    model.config.custom_compensation_config = config
+    model.config.custom_compensation_runtime_stats = stats
     layer_owner = getattr(model, "model", model)
     if hasattr(layer_owner, "layers"):
         for layer in layer_owner.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
                 layer.self_attn.config.custom_layer_mask = mask_payload
-                layer.self_attn.config.custom_layer_actions = None
-                layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+                layer.self_attn.config.custom_layer_actions = action_payload
+                layer.self_attn.config.custom_compensation_config = config
+                layer.self_attn.config.custom_compensation_runtime_stats = model.config.custom_compensation_runtime_stats
 
 
 def clear_custom_policy(model) -> None:
+    stats = getattr(model.config, "custom_compensation_runtime_stats", {"calls": 0, "total_sec": 0.0})
     model.config.custom_layer_mask = None
     model.config.custom_layer_actions = None
     model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    model.config.custom_compensation_runtime_stats = stats
     layer_owner = getattr(model, "model", model)
     if hasattr(layer_owner, "layers"):
         for layer in layer_owner.layers:
@@ -88,6 +133,7 @@ def clear_custom_policy(model) -> None:
                 layer.self_attn.config.custom_layer_mask = None
                 layer.self_attn.config.custom_layer_actions = None
                 layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+                layer.self_attn.config.custom_compensation_runtime_stats = stats
 
 
 def resolve_skip_budget(

@@ -24,6 +24,8 @@ export COMPENSATION_RANK="${COMPENSATION_RANK:-64}"
 export COMPENSATION_STATIC_GATE="${COMPENSATION_STATIC_GATE:-1.0}"
 export COMP_TAG="${COMP_TAG:-${COMPENSATION_MODE}_r${COMPENSATION_RANK}_g${COMPENSATION_STATIC_GATE}}"
 export COMP_TAG="${COMP_TAG//./p}"
+export COMP_FORCE_OUTPUT_ROOTS="${COMP_FORCE_OUTPUT_ROOTS:-1}"
+export COMP_REQUIRE_FINAL_ROUTERS="${COMP_REQUIRE_FINAL_ROUTERS:-0}"
 
 export WIKITEXT_MODEL_PATH="${WIKITEXT_MODEL_PATH:-/workspace/ckpts/Qwen2.5-1.5B}"
 export WIKITEXT_DATASET_DISK_PATH="${WIKITEXT_DATASET_DISK_PATH:-/workspace/datasets/wikitext/wikitext-2-raw-v1}"
@@ -41,10 +43,17 @@ export WIKITEXT_PRECISION="${WIKITEXT_PRECISION:-bf16}"
 export WIKITEXT_EVAL_BATCH_SIZE="${WIKITEXT_EVAL_BATCH_SIZE:-1}"
 export WIKITEXT_DATASET_CACHE_DIR="${WIKITEXT_DATASET_CACHE_DIR:-}"
 export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
-export WIKITEXT_COMP_OUTPUT_ROOT="${WIKITEXT_COMP_OUTPUT_ROOT:-${REPO_DIR}/results/wikitext2_compensated_ppl/${COMP_TAG}}"
+default_wikitext_comp_output_root="${REPO_DIR}/results/wikitext2_compensated_ppl/${COMP_TAG}"
+default_wikitext_comp_report_md="${REPO_DIR}/docs/WIKITEXT2_COMPENSATED_PPL_RESULTS.md"
+if [ "$COMP_FORCE_OUTPUT_ROOTS" = "1" ]; then
+  export WIKITEXT_COMP_OUTPUT_ROOT="$default_wikitext_comp_output_root"
+  export WIKITEXT_COMP_REPORT_MD="$default_wikitext_comp_report_md"
+else
+  export WIKITEXT_COMP_OUTPUT_ROOT="${WIKITEXT_COMP_OUTPUT_ROOT:-$default_wikitext_comp_output_root}"
+  export WIKITEXT_COMP_REPORT_MD="${WIKITEXT_COMP_REPORT_MD:-$default_wikitext_comp_report_md}"
+fi
 export WIKITEXT_COMP_METRIC_ROOT="${WIKITEXT_COMP_OUTPUT_ROOT}/metrics"
 export WIKITEXT_COMP_LOG_ROOT="${WIKITEXT_COMP_OUTPUT_ROOT}/logs"
-export WIKITEXT_COMP_REPORT_MD="${WIKITEXT_COMP_REPORT_MD:-${REPO_DIR}/docs/WIKITEXT2_COMPENSATED_PPL_RESULTS.md}"
 
 export LLMEVAL_MODEL_PATH="${LLMEVAL_MODEL_PATH:-$WIKITEXT_MODEL_PATH}"
 export LLMEVAL_TASKS="${LLMEVAL_TASKS:-piqa,openbookqa,winogrande,hellaswag,arc_easy,arc_challenge}"
@@ -65,8 +74,15 @@ export LLMEVAL_PREFETCH_LIMIT="${LLMEVAL_PREFETCH_LIMIT:-1}"
 export LLMEVAL_COMPENSATION_MODE="${LLMEVAL_COMPENSATION_MODE:-$COMPENSATION_MODE}"
 export LLMEVAL_COMPENSATION_RANK="${LLMEVAL_COMPENSATION_RANK:-$COMPENSATION_RANK}"
 export LLMEVAL_COMPENSATION_STATIC_GATE="${LLMEVAL_COMPENSATION_STATIC_GATE:-$COMPENSATION_STATIC_GATE}"
-export LLMEVAL_OUTPUT_ROOT="${LLMEVAL_OUTPUT_ROOT:-${REPO_DIR}/results/llmeval_downstream_compensated/${COMP_TAG}}"
-export LLMEVAL_REPORT_MD="${LLMEVAL_REPORT_MD:-${REPO_DIR}/docs/LLMEVAL_COMPENSATED_DOWNSTREAM_RESULTS.md}"
+default_llmeval_output_root="${REPO_DIR}/results/llmeval_downstream_compensated/${COMP_TAG}"
+default_llmeval_report_md="${REPO_DIR}/docs/LLMEVAL_COMPENSATED_DOWNSTREAM_RESULTS.md"
+if [ "$COMP_FORCE_OUTPUT_ROOTS" = "1" ]; then
+  export LLMEVAL_OUTPUT_ROOT="$default_llmeval_output_root"
+  export LLMEVAL_REPORT_MD="$default_llmeval_report_md"
+else
+  export LLMEVAL_OUTPUT_ROOT="${LLMEVAL_OUTPUT_ROOT:-$default_llmeval_output_root}"
+  export LLMEVAL_REPORT_MD="${LLMEVAL_REPORT_MD:-$default_llmeval_report_md}"
+fi
 
 cd "$REPO_DIR"
 
@@ -237,6 +253,8 @@ echo "WIKITEXT_COMP_OUTPUT_ROOT=${WIKITEXT_COMP_OUTPUT_ROOT}"
 echo "WIKITEXT_COMP_REPORT_MD=${WIKITEXT_COMP_REPORT_MD}"
 echo "LLMEVAL_OUTPUT_ROOT=${LLMEVAL_OUTPUT_ROOT}"
 echo "LLMEVAL_REPORT_MD=${LLMEVAL_REPORT_MD}"
+echo "COMP_FORCE_OUTPUT_ROOTS=${COMP_FORCE_OUTPUT_ROOTS}"
+echo "COMP_REQUIRE_FINAL_ROUTERS=${COMP_REQUIRE_FINAL_ROUTERS}"
 
 for seed in $WIKITEXT_SEEDS; do
   echo "=== WikiText compensated PPL seed ${seed}: resolve existing artifacts ==="
@@ -261,13 +279,15 @@ for seed in $WIKITEXT_SEEDS; do
   raw_best_ckpt="${raw_ckpt_dir}/risk_router_epoch${raw_epoch}.pt"
   opal_best_ckpt="${opal_ckpt_dir}/risk_router_epoch${opal_epoch}.pt"
 
-  require_file "$raw_final_ckpt"
-  require_file "$opal_final_ckpt"
   require_file "$pudding_ckpt"
   require_file "$ig_artifact"
   require_file "$layerwise_ckpt"
   require_file "$raw_best_ckpt"
   require_file "$opal_best_ckpt"
+  if [ "$COMP_REQUIRE_FINAL_ROUTERS" = "1" ]; then
+    require_file "$raw_final_ckpt"
+    require_file "$opal_final_ckpt"
+  fi
   echo "Seed ${seed}: Raw best epoch ${raw_epoch}; OPAL best epoch ${opal_epoch}"
 
   eval_ppl_method "$seed" "full" "full" "Full"
@@ -276,9 +296,17 @@ for seed in $WIKITEXT_SEEDS; do
   eval_ppl_method "$seed" "pudding" "candidate_router" "PuDDing-style" --candidate_router_ckpt "$pudding_ckpt"
   eval_ppl_method "$seed" "ig" "ig" "IG-style" --ig_artifact "$ig_artifact"
   eval_ppl_method "$seed" "layerwise" "router" "layerwise_hidden_router" --risk_router_ckpt "$layerwise_ckpt"
-  eval_ppl_method "$seed" "raw_final" "router" "Raw-SetBCE final epoch" --risk_router_ckpt "$raw_final_ckpt" --prefix_depth 0
+  if [ -s "$raw_final_ckpt" ]; then
+    eval_ppl_method "$seed" "raw_final" "router" "Raw-SetBCE final epoch" --risk_router_ckpt "$raw_final_ckpt" --prefix_depth 0
+  else
+    echo "=== Skip optional Raw final PPL; missing ${raw_final_ckpt} ==="
+  fi
   eval_ppl_method "$seed" "raw_best_val" "router" "Raw-SetBCE best-on-val" --risk_router_ckpt "$raw_best_ckpt" --prefix_depth 0
-  eval_ppl_method "$seed" "opal_final" "router" "OPAL-SetBCE final epoch" --risk_router_ckpt "$opal_final_ckpt" --prefix_depth "$WIKITEXT_PREFIX_DEPTH"
+  if [ -s "$opal_final_ckpt" ]; then
+    eval_ppl_method "$seed" "opal_final" "router" "OPAL-SetBCE final epoch" --risk_router_ckpt "$opal_final_ckpt" --prefix_depth "$WIKITEXT_PREFIX_DEPTH"
+  else
+    echo "=== Skip optional OPAL final PPL; missing ${opal_final_ckpt} ==="
+  fi
   eval_ppl_method "$seed" "opal_best_val" "router" "OPAL-SetBCE best-on-val" --risk_router_ckpt "$opal_best_ckpt" --prefix_depth "$WIKITEXT_PREFIX_DEPTH"
 done
 

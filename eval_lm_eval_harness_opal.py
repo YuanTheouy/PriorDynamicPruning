@@ -415,6 +415,8 @@ def metric_from_result(task_result: Dict[str, object], metric: str) -> Optional[
 
 def run_eval(args):
     tasks = parse_csv(args.tasks)
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     lm = OpalHarnessLM(
         pretrained=args.model,
         method=args.method,
@@ -758,6 +760,7 @@ def build_parser():
     eval_p.add_argument("--limit", type=float, default=0)
     eval_p.add_argument("--seed", type=int, default=42)
     eval_p.add_argument("--run_name", required=True)
+    eval_p.add_argument("--output_dir", default="")
     eval_p.add_argument("--output_json", required=True)
     eval_p.set_defaults(func=run_eval)
 

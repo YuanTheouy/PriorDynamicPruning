@@ -323,34 +323,39 @@ run_prefetch_if_needed() {
     echo "=== Reuse downstream dataset prefetch: ${prefetch_json} ==="
     return 0
   fi
-  echo "=== Prefetch lm-eval datasets with a single GPU limit=${LLMEVAL_PREFETCH_LIMIT} ==="
+  echo "=== Prefetch lm-eval datasets with dummy model limit=${LLMEVAL_PREFETCH_LIMIT} ==="
   set +e
-  CUDA_VISIBLE_DEVICES="$(printf "%s" "$CUDA_VISIBLE_DEVICES" | cut -d, -f1)" NUM_GPUS=1 \
-    python3 ./eval_lm_eval_harness_opal.py eval \
-      --model "$LLMEVAL_MODEL_PATH" \
-      --tasks "$LLMEVAL_TASKS" \
-      --method full \
-      --method_label "Full prefetch" \
-      --skip_rate "$LLMEVAL_SKIP_RATE" \
-      --skip_count "$LLMEVAL_SKIP_COUNT" \
-      --protected_head "$LLMEVAL_PROTECTED_HEAD" \
-      --protected_tail "$LLMEVAL_PROTECTED_TAIL" \
-      --router_prefix_tokens "$LLMEVAL_ROUTER_PREFIX_TOKENS" \
-      --max_length "$LLMEVAL_MAX_LENGTH" \
-      --batch_size "$LLMEVAL_BATCH_SIZE" \
-      --dtype "$LLMEVAL_DTYPE" \
-      --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
-      --seed 42 \
-      --limit "$LLMEVAL_PREFETCH_LIMIT" \
-      --run_name "${LLMEVAL_RUN_ID}_prefetch_full_limit${LLMEVAL_PREFETCH_LIMIT}" \
-      --output_dir "${LLMEVAL_OUTPUT_ROOT}/rows/${LLMEVAL_RUN_ID}_prefetch_full_limit${LLMEVAL_PREFETCH_LIMIT}" \
-      --output_json "$prefetch_json" 2>&1 | tee "$prefetch_log"
+  CUDA_VISIBLE_DEVICES="" python3 -m lm_eval \
+    --model dummy \
+    --tasks "$LLMEVAL_TASKS" \
+    --num_fewshot 0 \
+    --batch_size 1 \
+    --limit "$LLMEVAL_PREFETCH_LIMIT" \
+    --output_path "${prefetch_dir}/dummy_prefetch_limit${LLMEVAL_PREFETCH_LIMIT}" \
+    2>&1 | tee "$prefetch_log"
   local status="${PIPESTATUS[0]}"
   set -e
   if [ "$status" -ne 0 ]; then
     echo "=== Prefetch failed; log ${prefetch_log} ===" >&2
     return "$status"
   fi
+  python3 - "$prefetch_json" "$LLMEVAL_TASKS" "$LLMEVAL_PREFETCH_LIMIT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, task_csv, limit = sys.argv[1:4]
+tasks = [x.strip() for x in task_csv.split(",") if x.strip()]
+Path(out).parent.mkdir(parents=True, exist_ok=True)
+Path(out).write_text(json.dumps({
+    "prefetch": "lm_eval_dummy",
+    "tasks": tasks,
+    "task_metrics": [{"task": task, "acc": 0.0, "acc_norm": 0.0} for task in tasks],
+    "average_acc": 0.0,
+    "average_acc_norm": 0.0,
+    "limit": limit,
+}, indent=2) + "\n")
+PY
 }
 
 run_single_gpu_pool() {

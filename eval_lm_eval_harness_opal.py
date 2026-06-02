@@ -417,6 +417,22 @@ def run_eval(args):
     tasks = parse_csv(args.tasks)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    print(
+        json.dumps(
+            {
+                "stage": "start_eval",
+                "run_name": args.run_name,
+                "method": args.method,
+                "method_label": args.method_label,
+                "tasks": tasks,
+                "limit": args.limit,
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    print(f"[{args.run_name}] constructing OpalHarnessLM", flush=True)
     lm = OpalHarnessLM(
         pretrained=args.model,
         method=args.method,
@@ -438,6 +454,7 @@ def run_eval(args):
         trust_remote_code=True,
         logits_cache=False,
     )
+    print(f"[{args.run_name}] OpalHarnessLM ready; entering simple_evaluate", flush=True)
     results = simple_evaluate(
         model=lm,
         tasks=tasks,
@@ -451,6 +468,7 @@ def run_eval(args):
         fewshot_random_seed=args.seed,
         bootstrap_iters=0,
     )
+    print(f"[{args.run_name}] simple_evaluate complete; gathering mask records", flush=True)
     gathered_mask_records = lm.gather_object(lm.mask_records, dst=0)
     gathered_candidate_dists = lm.gather_object(lm.selected_candidate_distribution, dst=0)
     if lm.rank != 0 or results is None:
@@ -520,6 +538,7 @@ def run_eval(args):
         "target_leakage_guard": "lm-eval-harness builds prompts; router masks use context tokens only, never continuation tokens",
     }
     write_json(args.output_json, payload)
+    print(f"[{args.run_name}] wrote {args.output_json}", flush=True)
     print(json.dumps({k: payload[k] for k in ("run_name", "method_label", "seed", "average_acc", "average_acc_norm", "unique_masks_mean")}, indent=2))
 
 

@@ -82,6 +82,26 @@ Selected candidate distributions:
 - PuDDing-style: `{"ends_heavy": 289}`
 - IG-style: `{"ends_heavy": 289}`
 
+## Skip Distribution Diagnosis
+
+All learned routers obey the protected-head policy: 0-based layers `0,1,2,3` are never skipped. The actual skipped layers concentrate in the middle block, especially `10..17`.
+
+| method | windows | unique masks | dominant skipped set | dominant rate | key pattern |
+|---|---:|---:|---|---:|---|
+| Raw-SetBCE | 289 | 8 | `[11, 12, 13, 14, 15, 16, 17]` | 0.606 | mostly shifted middle-block masks |
+| OPAL-SetBCE | 289 | 15 | `[10, 11, 12, 13, 14, 15, 16]` | 0.453 | more diverse but slightly worse PPL |
+| layerwise_hidden_router | 289 | 8 | `[11, 12, 13, 14, 15, 16, 17]` | 0.678 | closest to a strong shifted middle-block selector |
+
+Pairwise agreement:
+
+| pair | mean overlap@7 | mean hamming/28 | exact same mask |
+|---|---:|---:|---:|
+| Raw-SetBCE vs OPAL-SetBCE | 0.8942 | 0.0529 | 0.3875 |
+| Raw-SetBCE vs layerwise_hidden_router | 0.9402 | 0.0299 | 0.6125 |
+| OPAL-SetBCE vs layerwise_hidden_router | 0.9046 | 0.0477 | 0.4291 |
+
+Interpretation: WikiText-2 is not asking the router to skip early layers. It mostly asks for a shifted middle-block skip policy. OPAL's extra mask diversity does not currently translate into lower PPL; layerwise_hidden_router wins because it more reliably chooses the same high-quality middle-block masks. This also suggests the original `prefix_depth=4` OPAL feature may be too shallow. Since layers `0..8` are almost never skipped, a more informative OPAL variant is to route from a teacher prefix hidden state after the first 9 layers.
+
 ## Training Diagnostics
 
 Exact train-loss and train-label overlap diagnostics were produced as server-side artifacts, but the scalar values are not present in the compact metric log pasted into this local thread. Do not invent these values. Extract them from `/workspace/PriorDynamicPruning` with the command below and then replace the `pending artifact extract` cells.
@@ -215,6 +235,7 @@ PY
 |---|---|---:|---:|---:|---|
 | prefix tokens 256 | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7672 / 15.9138 | OPAL beats static/PuDDing/IG but loses Raw by 0.0054 NLL. |
 | prefix tokens 512 | complete | 2.1834 / 8.8763 | 2.7443 / 15.5530 | 2.7586 / 15.7777 | OPAL still loses Raw by 0.0143 NLL; do not expand SetBCE to 3 seeds. |
+| OPAL-H9 (`prefix_depth=9`) | pending | NA | use prefix256 Raw reference | pending | Tests whether routing from a deeper non-skipped prefix hidden state beats raw input. |
 | validation checkpoint selection | pending | NA | NA | NA | Only worthwhile if an OPAL variant first beats Raw on seed42. |
 | static prior / swap q=1/2 | pending | NA | NA | NA | Defer unless old OPAL baselines or prefix variants show a path to beat Raw. |
 
@@ -230,6 +251,7 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 | static best-on-val C16 | optional missing | P2 | PuDDing/IG use C16; static best currently C6, so C16 static can check whether candidate library itself contains a stronger static mask | optional after P0 |
 | 3 seeds | missing | P2 | needed only if a seed42 setting becomes paper-worthy | do not run until prefix512 or old OPAL wins Raw |
 | prefix length sensitivity | seed42 prefix512 complete | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | did not rescue SetBCE; OPAL still loses Raw |
+| OPAL-H9 / deeper H^k feature | missing | P0 | skip distribution shows layers 0..8 are effectively never skipped; H9 may carry much better routing information than raw input or H4 | run seed42 now |
 | validation checkpoint selection | missing | P1 | current training may not choose best validation-PPL checkpoint | add only if prefix512 still looks promising |
 
 ## Next Minimal Experiments
@@ -237,8 +259,30 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 Priority order:
 
 1. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
-2. Do not expand OPAL-SetBCE prefix512 to three seeds: seed42 still loses Raw-SetBCE.
-3. Expand to three seeds only if an old OPAL baseline, static-prior variant, or another clearly specified OPAL variant beats Raw-SetBCE on seed42.
+2. Run OPAL-H9 (`WIKITEXT_PREFIX_DEPTH=9`) seed42 now. The skip distribution says early layers are not skipped, so routing from a deeper non-skipped hidden state is the most plausible SetBCE rescue.
+3. Do not expand OPAL-SetBCE prefix512 to three seeds: seed42 still loses Raw-SetBCE.
+4. Expand to three seeds only if OPAL-H9, an old OPAL baseline, static-prior variant, or another clearly specified OPAL variant beats Raw-SetBCE on seed42.
+
+OPAL-H9 command:
+
+```bash
+cd /workspace/PriorDynamicPruning
+source ~/venvs/planrec/bin/activate
+git pull --ff-only origin codex/opal-llm-experiments
+
+WIKITEXT_MODEL_PATH=/workspace/ckpts/Qwen2.5-1.5B \
+WIKITEXT_LABEL_SAMPLES=2000 \
+WIKITEXT_EVAL_WINDOWS=512 \
+WIKITEXT_SEQ_LEN=1024 \
+WIKITEXT_ROUTER_PREFIX_TOKENS=256 \
+WIKITEXT_PREFIX_DEPTH=9 \
+WIKITEXT_RUN_RAW=0 \
+WIKITEXT_SEED=42 \
+WIKITEXT_BASE_PORT=58500 \
+bash ./run_wikitext2_public_lm_sanity_gpu01234567.sh
+```
+
+If "第 9 层输出" means 0-based layer index 9 after running layers `0..9`, use `WIKITEXT_PREFIX_DEPTH=10`; if it means the 9th layer in paper/1-based numbering, use `WIKITEXT_PREFIX_DEPTH=9`.
 
 Prefix512 rescue command already run:
 

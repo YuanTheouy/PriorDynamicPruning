@@ -51,6 +51,7 @@ Raw-SetBCE is ahead of OPAL-SetBCE by 0.0054 NLL / 0.0855 PPL. OPAL is not curre
 - OPAL produces more unique masks than Raw, but WikiText-2 PPL rewards mask quality, not mask diversity.
 - The raw embedding baseline may be a lower-variance content prior for contiguous LM windows, while H^k may add noisy teacher-prefix features when the training set is only m=2000 windows.
 - PuDDing-style and IG-style both collapse to the static `ends_heavy` candidate on all 289 test windows, so OPAL beating them mostly says OPAL beats candidate-library selection, not that it beats all adaptive related-work styles.
+- The H9 deeper-prefix test did not rescue SetBCE: OPAL-H9 is worse than Raw-SetBCE and slightly worse than the original H4 OPAL run.
 
 ## Related Baseline Table
 
@@ -235,7 +236,7 @@ PY
 |---|---|---:|---:|---:|---|
 | prefix tokens 256 | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7672 / 15.9138 | OPAL beats static/PuDDing/IG but loses Raw by 0.0054 NLL. |
 | prefix tokens 512 | complete | 2.1834 / 8.8763 | 2.7443 / 15.5530 | 2.7586 / 15.7777 | OPAL still loses Raw by 0.0143 NLL; do not expand SetBCE to 3 seeds. |
-| OPAL-H9 (`prefix_depth=9`) | pending | NA | use prefix256 Raw reference | pending | Tests whether routing from a deeper non-skipped prefix hidden state beats raw input. |
+| OPAL-H9 (`prefix_depth=9`) | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7729 / 16.0055 | H9 still loses Raw by 0.0111 NLL and is worse than H4 OPAL by 0.0057 NLL. |
 | validation checkpoint selection | pending | NA | NA | NA | Only worthwhile if an OPAL variant first beats Raw on seed42. |
 | static prior / swap q=1/2 | pending | NA | NA | NA | Defer unless old OPAL baselines or prefix variants show a path to beat Raw. |
 
@@ -251,7 +252,7 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 | static best-on-val C16 | optional missing | P2 | PuDDing/IG use C16; static best currently C6, so C16 static can check whether candidate library itself contains a stronger static mask | optional after P0 |
 | 3 seeds | missing | P2 | needed only if a seed42 setting becomes paper-worthy | do not run until prefix512 or old OPAL wins Raw |
 | prefix length sensitivity | seed42 prefix512 complete | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | did not rescue SetBCE; OPAL still loses Raw |
-| OPAL-H9 / deeper H^k feature | missing | P0 | skip distribution shows layers 0..8 are effectively never skipped; H9 may carry much better routing information than raw input or H4 | run seed42 now |
+| OPAL-H9 / deeper H^k feature | complete | P0 | skip distribution shows layers 0..8 are effectively never skipped; H9 tested whether a deeper prefix hidden state helps | did not rescue SetBCE; OPAL-H9 still loses Raw |
 | validation checkpoint selection | missing | P1 | current training may not choose best validation-PPL checkpoint | add only if prefix512 still looks promising |
 
 ## Next Minimal Experiments
@@ -259,11 +260,10 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 Priority order:
 
 1. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
-2. Run OPAL-H9 (`WIKITEXT_PREFIX_DEPTH=9`) seed42 now. The skip distribution says early layers are not skipped, so routing from a deeper non-skipped hidden state is the most plausible SetBCE rescue.
-3. Do not expand OPAL-SetBCE prefix512 to three seeds: seed42 still loses Raw-SetBCE.
-4. Expand to three seeds only if OPAL-H9, an old OPAL baseline, static-prior variant, or another clearly specified OPAL variant beats Raw-SetBCE on seed42.
+2. Do not expand OPAL-SetBCE H4, H9, or prefix512 to three seeds: all seed42 variants still lose Raw-SetBCE.
+3. Expand to three seeds only if an old OPAL baseline, static-prior variant, or another clearly specified OPAL variant beats Raw-SetBCE on seed42.
 
-OPAL-H9 command:
+OPAL-H9 command already run:
 
 ```bash
 cd /workspace/PriorDynamicPruning
@@ -306,7 +306,7 @@ Old OPAL baselines are not wired into the current WikiText-2 runner yet. Do not 
 ## Final Judgment
 
 - current decision: **appendix only**
-- reason: OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. The prefix512 seed42 rescue also loses Raw-SetBCE.
+- reason: OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. The prefix512 and H9 seed42 rescue runs also lose Raw-SetBCE.
 - recommended wording: WikiText-2 is a public LM sanity / partial generalization result, not a main OPAL superiority claim.
 - do not write: "OPAL is best on WikiText-2." The table does not support that.
 - safe write: "On WikiText-2, OPAL improves over fixed/candidate-library skipping baselines but remains slightly behind a raw-prefix set router and a stronger-access layerwise hidden router."

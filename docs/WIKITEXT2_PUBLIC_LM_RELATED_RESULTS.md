@@ -32,6 +32,28 @@ All entries below use Qwen2.5-1.5B, WikiText-2 raw, `skip_rate=0.25`, `skip_coun
 | OPAL-H4 best-on-val minuniq8 | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 final | 15.8695 | 13 | dynamic checkpoint improves final OPAL but loses current Raw/layerwise |
 | Raw best-on-val | 1024 | 256 | 0 | 2000 | 221,952 | 9.1649 | 15.6894 | NA | 7 | epoch24 improves Raw final but remains behind OPAL epoch2 |
 
+## Three-Seed Supplement Status
+
+New fixed three-seed result document:
+
+- `docs/WIKITEXT2_3SEED_PUBLIC_LM_RESULTS.md`
+
+Seed status:
+
+| seed | status | note |
+|---:|---|---|
+| 42 | complete | do not rerun; all required methods including Raw/OPAL best-on-val are present |
+| 13 | pending | run fixed three-seed supplement commands only |
+| 3407 | pending | run fixed three-seed supplement commands only |
+
+After seeds `13` and `3407` finish, regenerate the three-seed document from server artifacts:
+
+```bash
+cd /workspace/PriorDynamicPruning
+source ~/venvs/planrec/bin/activate
+python3 ./summarize_wikitext2_3seed_public_lm_results.py
+```
+
 ## Original WikiText Bad Result
 
 | method | type | NLL ↓ | PPL ↓ | Delta_NLL ↓ | Delta_PPL ↓ | unique masks |

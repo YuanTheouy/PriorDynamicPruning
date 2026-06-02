@@ -41,6 +41,8 @@ export LLMEVAL_MASK_IMPL_TAG="${LLMEVAL_MASK_IMPL_TAG:-maskcfg}"
 export LLMEVAL_OUTPUT_ROOT="${LLMEVAL_OUTPUT_ROOT:-${REPO_DIR}/results/llmeval_downstream}"
 export LLMEVAL_REPORT_MD="${LLMEVAL_REPORT_MD:-${REPO_DIR}/docs/LLMEVAL_DOWNSTREAM_RESULTS.md}"
 export LLMEVAL_LIMIT="${LLMEVAL_LIMIT:-0}"
+export LLMEVAL_RUNNER_BACKEND="${LLMEVAL_RUNNER_BACKEND:-single_gpu_pool}"
+export LLMEVAL_PREFETCH_LIMIT="${LLMEVAL_PREFETCH_LIMIT:-1}"
 
 cd "$REPO_DIR"
 
@@ -194,6 +196,29 @@ require_file() {
   fi
 }
 
+declare -a JOB_SEEDS=()
+declare -a JOB_SLUGS=()
+declare -a JOB_METHODS=()
+declare -a JOB_LABELS=()
+declare -a JOB_EXTRAS=()
+
+append_eval_job() {
+  local seed="$1"
+  local slug="$2"
+  local method="$3"
+  local label="$4"
+  shift 4
+  local extra_args=""
+  if [ "$#" -gt 0 ]; then
+    printf -v extra_args '%q ' "$@"
+  fi
+  JOB_SEEDS+=("$seed")
+  JOB_SLUGS+=("$slug")
+  JOB_METHODS+=("$method")
+  JOB_LABELS+=("$label")
+  JOB_EXTRAS+=("$extra_args")
+}
+
 eval_method() {
   local seed="$1"
   local slug="$2"
@@ -205,6 +230,11 @@ eval_method() {
   mkdir -p "$seed_dir"
   if json_has_tasks "$out" "$LLMEVAL_TASKS"; then
     echo "=== Reuse downstream metric: ${out} ==="
+    return 0
+  fi
+  if [ "$LLMEVAL_RUNNER_BACKEND" = "single_gpu_pool" ]; then
+    append_eval_job "$seed" "$slug" "$method" "$label" "$@"
+    echo "=== Queue downstream metric: seed=${seed} slug=${slug} ==="
     return 0
   fi
   local run_name="${LLMEVAL_RUN_ID}_seed${seed}_${slug}"
@@ -230,6 +260,156 @@ eval_method() {
     "$@"
 }
 
+run_direct_eval_on_gpu() {
+  local gpu="$1"
+  local seed="$2"
+  local slug="$3"
+  local method="$4"
+  local label="$5"
+  local extra_args="$6"
+  local limit_override="${7:-$LLMEVAL_LIMIT}"
+  local seed_dir="${LLMEVAL_METRIC_ROOT}/seed${seed}"
+  local out="${seed_dir}/${slug}.json"
+  local run_name="${LLMEVAL_RUN_ID}_seed${seed}_${slug}"
+  local log_path="${LLMEVAL_LOG_ROOT}/gpu${gpu}_seed${seed}_${slug}.log"
+  mkdir -p "$seed_dir"
+  if json_has_tasks "$out" "$LLMEVAL_TASKS"; then
+    echo "=== GPU ${gpu}: reuse downstream metric ${out} ==="
+    return 0
+  fi
+  set --
+  if [ -n "$extra_args" ]; then
+    eval "set -- ${extra_args}"
+  fi
+  echo "=== GPU ${gpu}: run seed=${seed} slug=${slug} method=${method} ==="
+  set +e
+  CUDA_VISIBLE_DEVICES="$gpu" NUM_GPUS=1 python3 ./eval_lm_eval_harness_opal.py eval \
+    --model "$LLMEVAL_MODEL_PATH" \
+    --tasks "$LLMEVAL_TASKS" \
+    --method "$method" \
+    --method_label "$label" \
+    --skip_rate "$LLMEVAL_SKIP_RATE" \
+    --skip_count "$LLMEVAL_SKIP_COUNT" \
+    --protected_head "$LLMEVAL_PROTECTED_HEAD" \
+    --protected_tail "$LLMEVAL_PROTECTED_TAIL" \
+    --router_prefix_tokens "$LLMEVAL_ROUTER_PREFIX_TOKENS" \
+    --max_length "$LLMEVAL_MAX_LENGTH" \
+    --batch_size "$LLMEVAL_BATCH_SIZE" \
+    --dtype "$LLMEVAL_DTYPE" \
+    --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
+    --seed "$seed" \
+    --limit "$limit_override" \
+    --run_name "$run_name" \
+    --output_dir "${LLMEVAL_OUTPUT_ROOT}/rows/${run_name}" \
+    --output_json "$out" \
+    "$@" 2>&1 | tee "$log_path"
+  local status="${PIPESTATUS[0]}"
+  set -e
+  if [ "$status" -ne 0 ]; then
+    echo "=== GPU ${gpu}: failed seed=${seed} slug=${slug}; log ${log_path} ===" >&2
+    return "$status"
+  fi
+}
+
+run_prefetch_if_needed() {
+  if [ "$LLMEVAL_PREFETCH_LIMIT" = "0" ]; then
+    return 0
+  fi
+  local prefetch_dir="${LLMEVAL_OUTPUT_ROOT}/prefetch"
+  local prefetch_json="${prefetch_dir}/${LLMEVAL_RUN_ID}_full_limit${LLMEVAL_PREFETCH_LIMIT}.json"
+  local prefetch_log="${LLMEVAL_LOG_ROOT}/prefetch_gpu0_limit${LLMEVAL_PREFETCH_LIMIT}.log"
+  mkdir -p "$prefetch_dir"
+  if json_has_tasks "$prefetch_json" "$LLMEVAL_TASKS"; then
+    echo "=== Reuse downstream dataset prefetch: ${prefetch_json} ==="
+    return 0
+  fi
+  echo "=== Prefetch lm-eval datasets with a single GPU limit=${LLMEVAL_PREFETCH_LIMIT} ==="
+  set +e
+  CUDA_VISIBLE_DEVICES="$(printf "%s" "$CUDA_VISIBLE_DEVICES" | cut -d, -f1)" NUM_GPUS=1 \
+    python3 ./eval_lm_eval_harness_opal.py eval \
+      --model "$LLMEVAL_MODEL_PATH" \
+      --tasks "$LLMEVAL_TASKS" \
+      --method full \
+      --method_label "Full prefetch" \
+      --skip_rate "$LLMEVAL_SKIP_RATE" \
+      --skip_count "$LLMEVAL_SKIP_COUNT" \
+      --protected_head "$LLMEVAL_PROTECTED_HEAD" \
+      --protected_tail "$LLMEVAL_PROTECTED_TAIL" \
+      --router_prefix_tokens "$LLMEVAL_ROUTER_PREFIX_TOKENS" \
+      --max_length "$LLMEVAL_MAX_LENGTH" \
+      --batch_size "$LLMEVAL_BATCH_SIZE" \
+      --dtype "$LLMEVAL_DTYPE" \
+      --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
+      --seed 42 \
+      --limit "$LLMEVAL_PREFETCH_LIMIT" \
+      --run_name "${LLMEVAL_RUN_ID}_prefetch_full_limit${LLMEVAL_PREFETCH_LIMIT}" \
+      --output_dir "${LLMEVAL_OUTPUT_ROOT}/rows/${LLMEVAL_RUN_ID}_prefetch_full_limit${LLMEVAL_PREFETCH_LIMIT}" \
+      --output_json "$prefetch_json" 2>&1 | tee "$prefetch_log"
+  local status="${PIPESTATUS[0]}"
+  set -e
+  if [ "$status" -ne 0 ]; then
+    echo "=== Prefetch failed; log ${prefetch_log} ===" >&2
+    return "$status"
+  fi
+}
+
+run_single_gpu_pool() {
+  local visible_csv="$CUDA_VISIBLE_DEVICES"
+  local old_ifs="$IFS"
+  IFS=','
+  read -r -a gpu_list <<< "$visible_csv"
+  IFS="$old_ifs"
+  local worker_count="$NUM_GPUS"
+  if [ "$worker_count" -gt "${#gpu_list[@]}" ]; then
+    worker_count="${#gpu_list[@]}"
+  fi
+  if [ "$worker_count" -lt 1 ]; then
+    echo "No GPUs available in CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" >&2
+    return 2
+  fi
+  local job_count="${#JOB_SEEDS[@]}"
+  if [ "$job_count" -eq 0 ]; then
+    echo "=== No downstream jobs queued ==="
+    return 0
+  fi
+  echo "=== Run ${job_count} downstream jobs with ${worker_count} single-GPU workers ==="
+  run_prefetch_if_needed
+
+  worker() {
+    local worker_idx="$1"
+    local gpu="$2"
+    local stride="$3"
+    local idx
+    for ((idx=worker_idx; idx<job_count; idx+=stride)); do
+      run_direct_eval_on_gpu \
+        "$gpu" \
+        "${JOB_SEEDS[$idx]}" \
+        "${JOB_SLUGS[$idx]}" \
+        "${JOB_METHODS[$idx]}" \
+        "${JOB_LABELS[$idx]}" \
+        "${JOB_EXTRAS[$idx]}"
+    done
+  }
+
+  local pids=()
+  local worker_idx
+  for ((worker_idx=0; worker_idx<worker_count; worker_idx++)); do
+    worker "$worker_idx" "${gpu_list[$worker_idx]}" "$worker_count" &
+    pids+=("$!")
+  done
+  local failed=0
+  local pid
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    echo "=== At least one downstream worker failed; see ${LLMEVAL_LOG_ROOT}/gpu*_seed*.log ===" >&2
+    return 1
+  fi
+}
+
 echo "=== OPAL downstream lm-eval-style no-comp run ==="
 echo "REPO_DIR=${REPO_DIR}"
 echo "LLMEVAL_MODEL_PATH=${LLMEVAL_MODEL_PATH}"
@@ -242,6 +422,8 @@ echo "LLMEVAL_DTYPE=${LLMEVAL_DTYPE}"
 echo "LLMEVAL_SKIP_COUNT=${LLMEVAL_SKIP_COUNT}"
 echo "LLMEVAL_OUTPUT_ROOT=${LLMEVAL_OUTPUT_ROOT}"
 echo "LLMEVAL_REPORT_MD=${LLMEVAL_REPORT_MD}"
+echo "LLMEVAL_RUNNER_BACKEND=${LLMEVAL_RUNNER_BACKEND}"
+echo "LLMEVAL_PREFETCH_LIMIT=${LLMEVAL_PREFETCH_LIMIT}"
 echo "HF_ENDPOINT=${HF_ENDPOINT}"
 echo "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}"
 echo "Evaluator=lm-evaluation-harness simple_evaluate"
@@ -284,6 +466,10 @@ for seed in $LLMEVAL_SEEDS; do
   eval_method "$seed" "raw_best_val" "router" "Raw-SetBCE best-on-val" --risk_router_ckpt "$raw_ckpt" --prefix_depth 0
   eval_method "$seed" "opal_best_val" "router" "OPAL-SetBCE best-on-val" --risk_router_ckpt "$opal_ckpt" --prefix_depth "$LLMEVAL_PREFIX_DEPTH"
 done
+
+if [ "$LLMEVAL_RUNNER_BACKEND" = "single_gpu_pool" ]; then
+  run_single_gpu_pool
+fi
 
 echo "=== Summarize downstream results ==="
 python3 ./eval_lm_eval_harness_opal.py summarize \

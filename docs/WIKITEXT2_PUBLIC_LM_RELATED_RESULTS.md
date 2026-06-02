@@ -82,6 +82,133 @@ Selected candidate distributions:
 - PuDDing-style: `{"ends_heavy": 289}`
 - IG-style: `{"ends_heavy": 289}`
 
+## Training Diagnostics
+
+Exact train-loss and train-label overlap diagnostics were produced as server-side artifacts, but the scalar values are not present in the compact metric log pasted into this local thread. Do not invent these values. Extract them from `/workspace/PriorDynamicPruning` with the command below and then replace the `pending artifact extract` cells.
+
+| method | loss first ↓ | loss best ↓ | loss last ↓ | overlap@7 ↑ | hamming ↓ | pairwise predicted hamming | exact match ↑ | unique teacher masks | unique predicted masks |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Raw-SetBCE | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract |
+| OPAL-SetBCE | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract |
+| layerwise_hidden_router | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract |
+
+Server artifact extraction command:
+
+```bash
+cd /workspace/PriorDynamicPruning
+source ~/venvs/planrec/bin/activate
+
+RUN=wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25
+ROOT=results/wikitext2_public_lm_sanity
+CKPT_BASE=policy_ckpts/wikitext2_public_lm_sanity/${RUN}
+RELATED_CKPT=policy_ckpts/wikitext2_public_lm_related/${RUN}
+DIAG=${ROOT}/diagnostics/${RUN}
+LABEL=${ROOT}/labels/${RUN}_delta_nll_greedy_set_labels.jsonl
+MODEL=/workspace/ckpts/Qwen2.5-1.5B
+DATA=/workspace/datasets/wikitext/wikitext-2-raw-v1
+
+mkdir -p "$DIAG"
+
+# Layerwise overlap was not part of the base sanity run; generate it if missing.
+if [ -s "${RELATED_CKPT}/layerwise_hidden_bce/risk_router.pt" ] && [ ! -s "${DIAG}/layerwise_hidden_router_train_overlap.jsonl" ]; then
+  accelerate launch \
+    --num_processes 8 \
+    --num_machines 1 \
+    --main_process_port 58400 \
+    --mixed_precision bf16 \
+    --dynamo_backend no \
+    ./eval_wikitext_opal_ppl.py diagnose_overlap \
+      --teacher_model "$MODEL" \
+      --split train \
+      --dataset_disk_path "$DATA" \
+      --seq_len 1024 \
+      --router_prefix_tokens 256 \
+      --risk_label_file "$LABEL" \
+      --risk_router_ckpt "${RELATED_CKPT}/layerwise_hidden_bce/risk_router.pt" \
+      --protected_head 4 \
+      --protected_tail 2 \
+      --batch_size 1 \
+      --output_jsonl "${DIAG}/layerwise_hidden_router_train_overlap.jsonl" \
+      --summary_json "${DIAG}/layerwise_hidden_router_train_overlap.summary.json" \
+      --precision bf16 \
+      --seed 42
+fi
+
+python3 - <<'PY'
+import itertools, json, math, os
+
+run = "wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25"
+root = "results/wikitext2_public_lm_sanity"
+diag = f"{root}/diagnostics/{run}"
+paths = {
+    "Raw-SetBCE": {
+        "train": f"policy_ckpts/wikitext2_public_lm_sanity/{run}/raw_embedding_bce/training_metrics.json",
+        "overlap": f"{diag}/raw_setbce_train_overlap.jsonl",
+    },
+    "OPAL-SetBCE": {
+        "train": f"policy_ckpts/wikitext2_public_lm_sanity/{run}/prefix_hk_raw_attn_bce/training_metrics.json",
+        "overlap": f"{diag}/opal_setbce_train_overlap.jsonl",
+    },
+    "layerwise_hidden_router": {
+        "train": f"policy_ckpts/wikitext2_public_lm_related/{run}/layerwise_hidden_bce/training_metrics.json",
+        "overlap": f"{diag}/layerwise_hidden_router_train_overlap.jsonl",
+    },
+}
+
+def fmt(x):
+    if x is None:
+        return "NA"
+    try:
+        x = float(x)
+    except Exception:
+        return str(x)
+    return "NA" if not math.isfinite(x) else f"{x:.6f}"
+
+def loss_summary(path):
+    if not os.path.exists(path):
+        return None, None, None
+    hist = (json.load(open(path)).get("history") or [])
+    if not hist:
+        return None, None, None
+    first = hist[0]
+    best = min(hist, key=lambda r: float(r.get("loss", "inf")))
+    last = hist[-1]
+    return first.get("loss"), best.get("loss"), last.get("loss")
+
+def mask_tuple(layers):
+    return tuple(sorted(int(x) for x in layers))
+
+def pairwise_hamming(keys, n_layers=28):
+    keys = [set(k) for k in keys]
+    if len(keys) < 2:
+        return 0.0
+    vals = []
+    for a, b in itertools.combinations(keys, 2):
+        vals.append(len(a ^ b) / n_layers)
+    return sum(vals) / len(vals)
+
+def overlap_summary(path):
+    if not os.path.exists(path):
+        return (None,) * 6
+    rows = [json.loads(line) for line in open(path) if line.strip()]
+    if not rows:
+        return (None,) * 6
+    overlap = sum(float(r["overlap_ratio"]) for r in rows) / len(rows)
+    hamming = sum(float(r["hamming_ratio"]) for r in rows) / len(rows)
+    exact = sum(float(r["exact_match"]) for r in rows) / len(rows)
+    teacher = [mask_tuple(r["label_skipped_layers"]) for r in rows]
+    pred = [mask_tuple(r["predicted_skipped_layers"]) for r in rows]
+    return overlap, hamming, pairwise_hamming(pred), exact, len(set(teacher)), len(set(pred))
+
+print("| method | loss first | loss best | loss last | overlap@7 | hamming | pairwise predicted hamming | exact match | unique teacher masks | unique predicted masks |")
+print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+for name, p in paths.items():
+    first, best, last = loss_summary(p["train"])
+    overlap, hamming, pairwise, exact, uniq_teacher, uniq_pred = overlap_summary(p["overlap"])
+    print(f"| {name} | {fmt(first)} | {fmt(best)} | {fmt(last)} | {fmt(overlap)} | {fmt(hamming)} | {fmt(pairwise)} | {fmt(exact)} | {uniq_teacher or 'NA'} | {uniq_pred or 'NA'} |")
+PY
+```
+
 ## OPAL Tuning Table
 
 | setting | status | note |
@@ -90,6 +217,45 @@ Selected candidate distributions:
 | prefix tokens 512 | pending | Run only if related baselines do not rescue the story. |
 | validation checkpoint selection | pending | Next priority after prefix 512. |
 | static prior / swap q=1/2 | pending | Use only after the simpler checks. |
+
+## Gap Table
+
+| missing item | status | priority | why it matters | action |
+|---|---|---:|---|---|
+| random_dynamic_hash | missing | P2 | sanity lower-bound for prompt-conditioned dynamic mask diversity | add/run only after old OPAL baselines are in |
+| OPAL-PrefixLast old | missing on WikiText-2 | P0 | old submission-style OPAL reference; needed to know whether SetBCE is worse than previous OPAL formulation | run seed42 first |
+| OPAL-Attn old one-layer | missing on WikiText-2 | P0 | old one-layer attention OPAL ablation; needed for continuity with prior tables | run seed42 first |
+| static best-on-val C16 | optional missing | P2 | PuDDing/IG use C16; static best currently C6, so C16 static can check whether candidate library itself contains a stronger static mask | optional after P0 |
+| 3 seeds | missing | P2 | needed only if a seed42 setting becomes paper-worthy | do not run until prefix512 or old OPAL wins Raw |
+| prefix length sensitivity | missing | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | run prefix_tokens=512 seed42 next if trying to rescue SetBCE |
+| validation checkpoint selection | missing | P1 | current training may not choose best validation-PPL checkpoint | add only if prefix512 still looks promising |
+
+## Next Minimal Experiments
+
+Priority order:
+
+1. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
+2. If the goal is to rescue OPAL-SetBCE specifically, run `router_prefix_tokens=512` seed42 using the existing public sanity runner.
+3. Expand to three seeds only if prefix512 beats Raw-SetBCE on seed42.
+
+Prefix512 rescue command:
+
+```bash
+cd /workspace/PriorDynamicPruning
+source ~/venvs/planrec/bin/activate
+git pull --ff-only origin codex/opal-llm-experiments
+
+WIKITEXT_MODEL_PATH=/workspace/ckpts/Qwen2.5-1.5B \
+WIKITEXT_LABEL_SAMPLES=2000 \
+WIKITEXT_EVAL_WINDOWS=512 \
+WIKITEXT_SEQ_LEN=1024 \
+WIKITEXT_ROUTER_PREFIX_TOKENS=512 \
+WIKITEXT_SEED=42 \
+WIKITEXT_BASE_PORT=58300 \
+bash ./run_wikitext2_public_lm_sanity_gpu01234567.sh
+```
+
+Old OPAL baselines are not wired into the current WikiText-2 runner yet. Do not claim they were run until a WikiText-specific old-baseline harness reports `OPAL-PrefixLast old` and `OPAL-Attn old one-layer` with the same model, split, K, protected policy, and suffix-PPL evaluator.
 
 ## Final Judgment
 

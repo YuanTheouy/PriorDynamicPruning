@@ -6,7 +6,7 @@ Last updated: 2026-06-02
 
 This file records the real server result pasted from `/workspace/PriorDynamicPruning` after the `maskcfg` layer-mask fix. The earlier pre-fix smoke run where Full/static/Raw/OPAL all had identical NLL was invalid because the custom layer mask was not being applied through the Qwen2 forward path.
 
-Current verdict: OPAL-SetBCE is better than the static baselines, but it is not better than Raw-SetBCE on the main WikiText-2 run. This is not strong enough for a main-text public LM claim without related baselines.
+Current verdict: the final 40-epoch OPAL-SetBCE checkpoint is better than the static baselines, but it is not better than Raw-SetBCE on the main WikiText-2 run. A validation-selected OPAL checkpoint at epoch 2 does beat Raw-SetBCE and the layerwise hidden router on seed42 test PPL, but it collapses to one test mask; cite this as checkpoint-selection rescue evidence, not as a broad dynamic-routing win.
 
 ## Setup
 
@@ -41,6 +41,16 @@ WikiText-2 raw has thousands of original text rows, but this benchmark operates 
 | Static best-on-val C6 | 7 | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 221,952 | 1 | 21.0 | 1.000 |
 | Raw-SetBCE | 7 | 2.7618 | 15.8283 | 0.5464 | 6.6634 | 221,952 | 8 | 21.0 | 1.000 |
 | OPAL-SetBCE | 7 | 2.7672 | 15.9138 | 0.5518 | 6.7489 | 221,952 | 15 | 21.0 | 1.000 |
+
+## Validation-Selected OPAL Checkpoint
+
+The OPAL-H4 40-epoch run was later evaluated checkpoint-by-checkpoint on validation. Epoch 2 has the best validation PPL and gives the following test result:
+
+| method | selected by | K skipped | NLL ↓ | PPL ↓ | Delta_NLL ↓ | Delta_PPL ↓ | eval_tokens | unique masks | exact-K |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| OPAL-SetBCE best-on-val epoch2 | validation NLL | 7 | 2.7486 | 15.6204 | 0.5332 | 6.4555 | 221,952 | 1 | 1.000 |
+
+This is better than the final OPAL checkpoint, Raw-SetBCE, and the related `layerwise_hidden_router` seed42 result. The caveat is `unique_masks=1`, so the best validation checkpoint behaves like a single high-quality OPAL-selected skip mask on test.
 
 ## Smoke Result
 
@@ -77,4 +87,4 @@ The related-baseline runner will read these JSON files and regenerate this repor
 
 ## Interpretation
 
-OPAL-SetBCE beats Static best-on-val C6 by 0.0867 NLL and 1.4408 PPL, but Raw-SetBCE beats OPAL-SetBCE by 0.0054 NLL and 0.0855 PPL. The completed related-baseline rescue run also shows OPAL beating PuDDing-style/IG-style candidate-library baselines while losing to the stronger-access layerwise hidden router. WikiText-2 should therefore be treated as appendix-level public LM sanity / partial generalization, not a main OPAL superiority claim.
+The final OPAL-SetBCE checkpoint beats Static best-on-val C6 by 0.0867 NLL and 1.4408 PPL, but Raw-SetBCE beats that final OPAL checkpoint by 0.0054 NLL and 0.0855 PPL. Validation checkpoint selection changes the seed42 result: OPAL best-on-val epoch2 reaches PPL 15.6204, ahead of Raw-SetBCE PPL 15.8283 and `layerwise_hidden_router` PPL 15.7491. Because the selected checkpoint has only one unique test mask and still lacks multi-seed confirmation, WikiText-2 should be treated as appendix-level public LM sanity / checkpoint-selection evidence, not a main OPAL superiority claim.

@@ -30,7 +30,7 @@ All entries below use Qwen2.5-1.5B, WikiText-2 raw, `skip_rate=0.25`, `skip_coun
 | OPAL-H9 | 1024 | 256 | 9 | 2000 | 221,952 | 9.1649 | 15.8283 | 16.0055 | 18 | deeper H^k does not rescue OPAL |
 | OPAL-H4 best-on-val | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 final | 15.6204 | 1 | epoch2 wins current Raw/layerwise, but collapses to one mask |
 | OPAL-H4 best-on-val minuniq8 | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 final | 15.8695 | 13 | dynamic checkpoint improves final OPAL but loses current Raw/layerwise |
-| Raw best-on-val | 1024 | 256 | 0 | 2000 | pending | 9.1649 | pending | NA | pending | must be run for fair checkpoint-selection comparison |
+| Raw best-on-val | 1024 | 256 | 0 | 2000 | 221,952 | 9.1649 | 15.6894 | NA | 7 | epoch24 improves Raw final but remains behind OPAL epoch2 |
 
 ## Original WikiText Bad Result
 
@@ -66,7 +66,24 @@ This checkpoint is better than Raw-SetBCE by 0.0132 NLL / 0.2079 PPL and better 
 
 To check whether a more dynamic checkpoint exists, selection was repeated with `WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS=8`. This selected epoch 33 (`validation_NLL=2.8022`, `validation_PPL=16.4809`, `validation_unique_masks=8`) and gave test NLL/PPL `2.7644 / 15.8695` with `test_unique_masks=13`. This dynamic checkpoint is better than the final epoch OPAL checkpoint but still slightly worse than Raw-SetBCE by 0.0026 NLL / 0.0412 PPL and worse than `layerwise_hidden_router` by 0.0076 NLL / 0.1204 PPL.
 
-Raw validation checkpoint selection is still pending. Until Raw is also selected by validation, epoch2 OPAL should be described as beating the current Raw final checkpoint, not as a fully fair best-on-val comparison.
+Raw validation checkpoint selection was also run. Raw best-on-val selects epoch 24 (`validation_NLL=2.7966`, `validation_PPL=16.3893`, `validation_unique_masks=4`) and gives test NLL/PPL `2.7530 / 15.6894` with `test_unique_masks=7`. This improves Raw final by 0.1399 PPL but still remains behind OPAL best-on-val epoch2 by 0.0689 PPL / 0.0044 NLL.
+
+Raw best-on-val compact server output:
+
+| field | value |
+|---|---:|
+| min_unique_masks | 0 |
+| best_epoch | 24 |
+| validation_NLL | 2.796628 |
+| validation_PPL | 16.389290 |
+| validation_unique_masks | 4 |
+| test_NLL | 2.752983 |
+| test_PPL | 15.689361 |
+| test_eval_tokens | 221,952 |
+| test_unique_masks | 7 |
+| exact_skip_count_rate | 1.000 |
+
+The raw 40-epoch validation table was not pasted into the chat; only the compact best-on-val JSON above is recorded here. The full per-epoch raw validation JSON files should be under `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25_raw_valckpt/` on the server.
 
 ### OPAL-H4 Validation Checkpoint Curve
 
@@ -164,7 +181,8 @@ Server run completed:
 | PuDDing-style | related | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 | 1.000 |
 | IG-style | related | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 | 1.000 |
 | layerwise_hidden_router | related | 2.7568 | 15.7491 | 0.5414 | 6.5842 | 8 | 1.000 |
-| Raw-SetBCE | ablation | 2.7618 | 15.8283 | 0.5464 | 6.6634 | 8 | 1.000 |
+| Raw-SetBCE final epoch | ablation | 2.7618 | 15.8283 | 0.5464 | 6.6634 | 8 | 1.000 |
+| Raw-SetBCE best-on-val epoch24 | ablation + val selection | 2.7530 | 15.6894 | 0.5376 | 6.5245 | 7 | 1.000 |
 | OPAL-SetBCE best-on-val minuniq8 epoch33 | ours + val selection | 2.7644 | 15.8695 | 0.5490 | 6.7046 | 13 | 1.000 |
 | OPAL-SetBCE | ours | 2.7672 | 15.9138 | 0.5518 | 6.7489 | 15 | 1.000 |
 | OPAL-SetBCE best-on-val epoch2 | ours + val selection | 2.7486 | 15.6204 | 0.5332 | 6.4555 | 1 | 1.000 |
@@ -174,11 +192,12 @@ Dynamic ranking among learned/adaptive methods:
 | rank | method | note |
 |---:|---|---|
 | 1 | OPAL-SetBCE best-on-val epoch2 | seed42 validation-selected checkpoint; lowest test PPL among evaluated skip methods, but collapses to one test mask |
-| 2 | layerwise_hidden_router | stronger-access in-framework baseline; not a full Dr.LLM reproduction |
-| 3 | Raw-SetBCE | same final Delta_NLL set labels, raw prefix only |
-| 4 | OPAL-SetBCE best-on-val minuniq8 epoch33 | dynamic checkpoint with 13 test unique masks; better than final OPAL but slightly behind Raw/layerwise |
-| 5 | OPAL-SetBCE final epoch | ours; beats static/PuDDing/IG but not Raw/layerwise before checkpoint selection |
-| 6 | PuDDing-style / IG-style | both select `ends_heavy` for every test window |
+| 2 | Raw-SetBCE best-on-val epoch24 | fair raw validation-selected comparison; improves Raw final but still behind OPAL epoch2 |
+| 3 | layerwise_hidden_router | stronger-access in-framework baseline; not a full Dr.LLM reproduction |
+| 4 | Raw-SetBCE final epoch | same final Delta_NLL set labels, raw prefix only |
+| 5 | OPAL-SetBCE best-on-val minuniq8 epoch33 | dynamic checkpoint with 13 test unique masks; better than final OPAL but slightly behind Raw/layerwise |
+| 6 | OPAL-SetBCE final epoch | ours; beats static/PuDDing/IG but not Raw/layerwise before checkpoint selection |
+| 7 | PuDDing-style / IG-style | both select `ends_heavy` for every test window |
 
 Selected candidate distributions:
 
@@ -346,6 +365,7 @@ PY
 | OPAL-H9 (`prefix_depth=9`) | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7729 / 16.0055 | H9 still loses Raw by 0.0111 NLL and is worse than H4 OPAL by 0.0057 NLL. |
 | validation checkpoint selection | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7486 / 15.6204 | Best-on-val epoch2 beats Raw/layerwise on seed42, but collapses to one test mask; cite as checkpoint-selection rescue, not dynamic-mask proof. |
 | validation checkpoint selection, minuniq8 | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7644 / 15.8695 | Dynamic epoch33 has 13 test unique masks and improves final OPAL, but remains slightly behind Raw/layerwise. |
+| Raw validation checkpoint selection | complete | 2.2154 / 9.1649 | 2.7530 / 15.6894 | NA | Raw best-on-val epoch24 improves Raw final, but remains behind OPAL best-on-val epoch2. |
 | static prior / swap q=1/2 | pending | NA | NA | NA | Defer unless old OPAL baselines or prefix variants show a path to beat Raw. |
 
 Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 suffix tokens per window, while `prefix512` scores 512 suffix tokens per window. Compare methods within the same prefix setting using Delta_NLL/Delta_PPL.
@@ -362,16 +382,15 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 | prefix length sensitivity | seed42 prefix512 complete | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | did not rescue SetBCE; OPAL still loses Raw |
 | OPAL-H9 / deeper H^k feature | complete | P0 | skip distribution shows layers 0..8 are effectively never skipped; H9 tested whether a deeper prefix hidden state helps | did not rescue SetBCE; OPAL-H9 still loses Raw |
 | validation checkpoint selection | complete for OPAL-H4 seed42 | P1 | current training may not choose best validation-PPL checkpoint | epoch2 test PPL 15.6204 beats Raw/layerwise, but unique_masks=1; minuniq8 epoch33 has 13 test unique masks but still loses Raw/layerwise |
-| Raw validation checkpoint selection | pending | P0 | needed for a fair best-on-val comparison against OPAL epoch2 | run `run_wikitext2_raw_val_ckpt_select_gpu01234567.sh` and paste compact JSON |
+| Raw validation checkpoint selection | complete | P0 | needed for a fair best-on-val comparison against OPAL epoch2 | Raw epoch24 improves Raw final but remains behind OPAL epoch2 |
 
 ## Next Minimal Experiments
 
 Priority order:
 
-1. Run Raw-SetBCE validation checkpoint selection. This is required before saying OPAL epoch2 fairly beats Raw.
-2. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
-3. Do not expand OPAL-SetBCE H4, H9, prefix512, or validation selection to three seeds until Raw best-on-val is known.
-4. Expand to three seeds only if an old OPAL baseline, static-prior variant, or a validation-selected OPAL variant beats Raw best-on-val on seed42.
+1. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
+2. Do not expand OPAL-SetBCE H4, H9, prefix512, or validation selection to three seeds until we decide whether the single-mask epoch2 checkpoint is acceptable evidence.
+3. Expand to three seeds only if an old OPAL baseline, static-prior variant, or a validation-selected OPAL variant beats Raw best-on-val on seed42 under an acceptable mask-diversity criterion.
 
 OPAL-H9 command already run:
 
@@ -416,7 +435,7 @@ Old OPAL baselines are not wired into the current WikiText-2 runner yet. Do not 
 ## Final Judgment
 
 - current decision: **appendix only**
-- reason: final-epoch OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. Validation-selected OPAL epoch2 beats the current Raw/layerwise test numbers, but collapses to one test mask and Raw best-on-val is still pending. The dynamic-constrained OPAL epoch33 keeps 13 test masks but still loses Raw/layerwise.
+- reason: final-epoch OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. Validation-selected OPAL epoch2 beats Raw best-on-val epoch24 and layerwise, but collapses to one test mask. The dynamic-constrained OPAL epoch33 keeps 13 test masks but still loses Raw best-on-val/layerwise.
 - recommended wording: WikiText-2 is a public LM sanity / checkpoint-selection diagnostic, not a main OPAL superiority claim.
 - do not write: "OPAL is best on WikiText-2." The table does not support that.
 - safe write: "On WikiText-2, final-epoch OPAL improves over fixed/candidate-library skipping baselines. Validation selection can recover a lower-PPL OPAL checkpoint, but the best checkpoint collapses to a single mask; when dynamic mask diversity is required, OPAL remains close to but slightly behind Raw-SetBCE and a stronger-access layerwise hidden router."

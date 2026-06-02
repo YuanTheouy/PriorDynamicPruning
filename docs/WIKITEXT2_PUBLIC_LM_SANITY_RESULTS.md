@@ -49,9 +49,10 @@ The OPAL-H4 40-epoch run was later evaluated checkpoint-by-checkpoint on validat
 | method | selected by | K skipped | NLL ↓ | PPL ↓ | Delta_NLL ↓ | Delta_PPL ↓ | eval_tokens | unique masks | exact-K |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | OPAL-SetBCE best-on-val epoch2 | validation NLL | 7 | 2.7486 | 15.6204 | 0.5332 | 6.4555 | 221,952 | 1 | 1.000 |
+| Raw-SetBCE best-on-val epoch24 | validation NLL | 7 | 2.7530 | 15.6894 | 0.5376 | 6.5245 | 221,952 | 7 | 1.000 |
 | OPAL-SetBCE best-on-val minuniq8 epoch33 | validation NLL, `unique_masks>=8` | 7 | 2.7644 | 15.8695 | 0.5490 | 6.7046 | 221,952 | 13 | 1.000 |
 
-This is better than the final OPAL checkpoint, Raw-SetBCE, and the related `layerwise_hidden_router` seed42 result. The caveat is `unique_masks=1`, so the best validation checkpoint behaves like a single high-quality OPAL-selected skip mask on test.
+OPAL best-on-val epoch2 is better than the final OPAL checkpoint, Raw best-on-val epoch24, and the related `layerwise_hidden_router` seed42 result. The caveat is `unique_masks=1`, so the best validation checkpoint behaves like a single high-quality OPAL-selected skip mask on test.
 
 The dynamic-constrained validation selection (`WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS=8`) selects epoch 33. It has 13 unique masks on test and improves over the final OPAL checkpoint, but remains slightly behind Raw-SetBCE and `layerwise_hidden_router`.
 
@@ -91,4 +92,4 @@ All three train losses are best at epoch 40, but OPAL-H4 validation PPL is best 
 
 ## Interpretation
 
-The final OPAL-SetBCE checkpoint beats Static best-on-val C6 by 0.0867 NLL and 1.4408 PPL, but Raw-SetBCE beats that final OPAL checkpoint by 0.0054 NLL and 0.0855 PPL. Validation checkpoint selection changes the seed42 result: OPAL best-on-val epoch2 reaches PPL 15.6204, ahead of Raw-SetBCE PPL 15.8283 and `layerwise_hidden_router` PPL 15.7491. Because the selected checkpoint has only one unique test mask, it is checkpoint-selection rescue rather than dynamic-mask proof. The dynamic-constrained epoch33 checkpoint has 13 test unique masks and PPL 15.8695, improving final OPAL but not Raw/layerwise. WikiText-2 should therefore be treated as appendix-level public LM sanity / checkpoint-selection evidence, not a main OPAL superiority claim.
+The final OPAL-SetBCE checkpoint beats Static best-on-val C6 by 0.0867 NLL and 1.4408 PPL, but Raw-SetBCE beats that final OPAL checkpoint by 0.0054 NLL and 0.0855 PPL. Validation checkpoint selection changes the seed42 result: OPAL best-on-val epoch2 reaches PPL 15.6204, ahead of Raw best-on-val epoch24 PPL 15.6894 and `layerwise_hidden_router` PPL 15.7491. Because the selected OPAL checkpoint has only one unique test mask, it is checkpoint-selection rescue rather than dynamic-mask proof. The dynamic-constrained epoch33 checkpoint has 13 test unique masks and PPL 15.8695, improving final OPAL but not Raw/layerwise. WikiText-2 should therefore be treated as appendix-level public LM sanity / checkpoint-selection evidence, not a main OPAL superiority claim.

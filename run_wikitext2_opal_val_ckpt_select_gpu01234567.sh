@@ -37,6 +37,7 @@ export WIKITEXT_MAX_GRAD_NORM="${WIKITEXT_MAX_GRAD_NORM:-1.0}"
 export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
 export WIKITEXT_VALCKPT_PARALLEL_WORKERS="${WIKITEXT_VALCKPT_PARALLEL_WORKERS:-$NUM_GPUS}"
 export WIKITEXT_VALCKPT_OMP_NUM_THREADS="${WIKITEXT_VALCKPT_OMP_NUM_THREADS:-2}"
+export WIKITEXT_VALCKPT_EVAL_ONLY="${WIKITEXT_VALCKPT_EVAL_ONLY:-0}"
 export WIKITEXT_DATASET_CACHE_DIR="${WIKITEXT_DATASET_CACHE_DIR:-}"
 if [ -z "${WIKITEXT_DATASET_DISK_PATH:-}" ] && [ -d "/workspace/datasets/wikitext/wikitext-2-raw-v1" ]; then
   export WIKITEXT_DATASET_DISK_PATH="/workspace/datasets/wikitext/wikitext-2-raw-v1"
@@ -280,6 +281,10 @@ last_ckpt="${WIKITEXT_EPOCH_CKPT_DIR}/risk_router_epoch$(printf "%03d" "$WIKITEX
 if [ -s "$last_ckpt" ]; then
   echo "=== Reuse epoch checkpoints through ${last_ckpt} ==="
 else
+  if [ "$WIKITEXT_VALCKPT_EVAL_ONLY" = "1" ]; then
+    echo "Missing epoch checkpoints through ${last_ckpt}; WIKITEXT_VALCKPT_EVAL_ONLY=1, so stop instead of retraining." >&2
+    exit 2
+  fi
   echo "=== Train OPAL-SetBCE with per-epoch checkpoints ==="
   run_accelerate ./eval_wikitext_opal_ppl.py train_router \
     --teacher_model "$WIKITEXT_MODEL_PATH" \

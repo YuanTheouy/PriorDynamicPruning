@@ -9,8 +9,10 @@ This document is reserved for the fixed three-seed WikiText-2 public LM sanity e
 ```bash
 cd /workspace/PriorDynamicPruning
 source ~/venvs/planrec/bin/activate
-python3 ./summarize_wikitext2_3seed_public_lm_results.py
+bash ./run_wikitext2_3seed_public_lm_gpu01234567.sh
 ```
+
+Do not use a shell variable containing multiple `KEY=VALUE` assignments with zsh. The fixed wrapper above exports each variable directly and avoids corrupting `WIKITEXT_MODEL_PATH`.
 
 Do not rerun completed seed42 experiments. Seed42 already has:
 
@@ -58,8 +60,8 @@ Do not rerun completed seed42 experiments. Seed42 already has:
 | seed | status | required action |
 |---:|---|---|
 | 42 | complete | do not rerun |
-| 13 | pending | run fixed command block from `WIKITEXT2_PUBLIC_LM_RELATED_RESULTS.md` or the chat command |
-| 3407 | pending | run fixed command block from `WIKITEXT2_PUBLIC_LM_RELATED_RESULTS.md` or the chat command |
+| 13 | pending | run `run_wikitext2_3seed_public_lm_gpu01234567.sh` |
+| 3407 | pending | run `run_wikitext2_3seed_public_lm_gpu01234567.sh` |
 
 ## Required Final Checks
 

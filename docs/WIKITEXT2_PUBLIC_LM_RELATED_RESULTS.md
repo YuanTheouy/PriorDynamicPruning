@@ -46,13 +46,15 @@ Seed status:
 | 13 | pending | run fixed three-seed supplement commands only |
 | 3407 | pending | run fixed three-seed supplement commands only |
 
-After seeds `13` and `3407` finish, regenerate the three-seed document from server artifacts:
+Run the remaining seeds and regenerate the three-seed document:
 
 ```bash
 cd /workspace/PriorDynamicPruning
 source ~/venvs/planrec/bin/activate
-python3 ./summarize_wikitext2_3seed_public_lm_results.py
+bash ./run_wikitext2_3seed_public_lm_gpu01234567.sh
 ```
+
+Do not use a zsh variable that stores many `KEY=VALUE` assignments; it can be passed as a single environment assignment and corrupt `WIKITEXT_MODEL_PATH`, producing an overlong run id.
 
 ## Original WikiText Bad Result
 

@@ -589,6 +589,53 @@ def train_candidate_router(args):
         history.append(epoch_metrics)
         if accelerator.is_main_process:
             print(f"Epoch {epoch + 1} finished: {json.dumps(epoch_metrics)}")
+            if getattr(args, "save_epoch_checkpoints", False):
+                epoch_dir = Path(args.epoch_checkpoint_dir or args.output_dir)
+                epoch_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped = accelerator.unwrap_model(router)
+                epoch_metadata = {
+                    "method": "wikitext2_delta_nll_greedy_set_bce",
+                    "router_input": args.router_input,
+                    "prompt_only_router_context": True,
+                    "target_leakage_guard": "router sees only first router_prefix_tokens; eval never loads greedy labels",
+                    "mask_application": "config.custom_layer_mask",
+                    "prefix_depth": int(args.prefix_depth) if args.router_input in ATTENTION_ROUTER_INPUTS else 0,
+                    "router_dim": int(args.router_dim) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+                    "router_heads": int(args.router_heads) if args.router_input in ATTENTION_ROUTER_INPUTS else None,
+                    "teacher_model": args.teacher_model,
+                    "risk_label_file": args.risk_label_file,
+                    "risk_objective": label_metadata.get("objective", "Delta_NLL"),
+                    "supervision_type": "skip_set",
+                    "set_loss_type": "bce",
+                    "label_search": label_metadata.get("search", "forward_greedy"),
+                    "dataset": "wikitext-2-raw-v1",
+                    "dataset_disk_path": args.dataset_disk_path,
+                    "split": args.split,
+                    "seq_len": int(args.seq_len),
+                    "router_prefix_tokens": int(args.router_prefix_tokens),
+                    "num_layers": int(num_layers),
+                    "base_hidden_size": int(hidden_size),
+                    "hidden_size": int(hidden_size),
+                    "state_size": int(hidden_size),
+                    "skip_rate": float(args.skip_rate),
+                    "skip_count": int(skip_count),
+                    "keep_count": int(keep_count),
+                    "protected_head": int(args.protected_head),
+                    "protected_tail": int(args.protected_tail),
+                    "allowed_layers": [int(idx) for idx in allowed_layers],
+                    "epoch": int(epoch + 1),
+                    "epochs": int(args.epochs),
+                    "lr": float(args.lr),
+                    "seed": int(args.seed),
+                }
+                torch.save(
+                    {
+                        "model_state_dict": unwrapped.state_dict(),
+                        "metadata": epoch_metadata,
+                        "epoch_metrics": epoch_metrics,
+                    },
+                    epoch_dir / f"risk_router_epoch{epoch + 1:03d}.pt",
+                )
 
     if accelerator.is_main_process:
         unwrapped = accelerator.unwrap_model(router)
@@ -1991,6 +2038,8 @@ def build_parser():
     train.add_argument("--dropout", type=float, default=0.0)
     train.add_argument("--max_grad_norm", type=float, default=1.0)
     train.add_argument("--output_dir", required=True)
+    train.add_argument("--save_epoch_checkpoints", action="store_true")
+    train.add_argument("--epoch_checkpoint_dir", default="")
     train.set_defaults(func=train_router)
 
     eval_p = sub.add_parser("eval")

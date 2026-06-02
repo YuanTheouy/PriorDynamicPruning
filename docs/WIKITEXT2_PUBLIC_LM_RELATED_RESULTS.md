@@ -47,26 +47,40 @@ Raw-SetBCE is ahead of OPAL-SetBCE by 0.0054 NLL / 0.0855 PPL. OPAL is not curre
 ## Why OPAL Did Not Win Yet
 
 - OPAL beats Static best-on-val C6, so the mask application and learned routing path are not completely broken.
-- OPAL loses narrowly to Raw-SetBCE, which suggests `prefix_hk_raw_attn` is not automatically a better signal for public LM windows.
+- OPAL loses narrowly to Raw-SetBCE and also loses to the stronger-access layerwise hidden router, which suggests `prefix_hk_raw_attn` is not automatically the best signal for public LM windows.
 - OPAL produces more unique masks than Raw, but WikiText-2 PPL rewards mask quality, not mask diversity.
 - The raw embedding baseline may be a lower-variance content prior for contiguous LM windows, while H^k may add noisy teacher-prefix features when the training set is only m=2000 windows.
-- This result should be described as partial generalization unless related baselines show OPAL is still better than PuDDing-style and IG-style.
+- PuDDing-style and IG-style both collapse to the static `ends_heavy` candidate on all 289 test windows, so OPAL beating them mostly says OPAL beats candidate-library selection, not that it beats all adaptive related-work styles.
 
 ## Related Baseline Table
 
-Pending server run:
+Server run completed:
 
-| method | type | NLL ↓ | PPL ↓ | Delta_NLL ↓ | Delta_PPL ↓ | unique masks |
-|---|---|---:|---:|---:|---:|---:|
-| Full | full | 2.2154 | 9.1649 | 0.0000 | 0.0000 | 1 |
-| Static uniform | static | 4.0673 | 58.3987 | 1.8519 | 49.2338 | 1 |
-| Static ends_heavy | static | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 |
-| Static best-on-val C6 | static | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 |
-| PuDDing-style | related | pending | pending | pending | pending | pending |
-| IG-style | related | pending | pending | pending | pending | pending |
-| layerwise_hidden_router | related | pending | pending | pending | pending | pending |
-| Raw-SetBCE | ablation | 2.7618 | 15.8283 | 0.5464 | 6.6634 | 8 |
-| OPAL-SetBCE | ours | 2.7672 | 15.9138 | 0.5518 | 6.7489 | 15 |
+| method | type | NLL ↓ | PPL ↓ | Delta_NLL ↓ | Delta_PPL ↓ | unique masks | exact-K |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Full | full | 2.2154 | 9.1649 | 0.0000 | 0.0000 | 1 | 1.000 |
+| Static uniform | static | 4.0673 | 58.3987 | 1.8519 | 49.2338 | 1 | 1.000 |
+| Static ends_heavy | static | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 | 1.000 |
+| Static best-on-val C6 | static | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 | 1.000 |
+| PuDDing-style | related | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 | 1.000 |
+| IG-style | related | 2.8539 | 17.3546 | 0.6385 | 8.1897 | 1 | 1.000 |
+| layerwise_hidden_router | related | 2.7568 | 15.7491 | 0.5414 | 6.5842 | 8 | 1.000 |
+| Raw-SetBCE | ablation | 2.7618 | 15.8283 | 0.5464 | 6.6634 | 8 | 1.000 |
+| OPAL-SetBCE | ours | 2.7672 | 15.9138 | 0.5518 | 6.7489 | 15 | 1.000 |
+
+Dynamic ranking among learned/adaptive methods:
+
+| rank | method | note |
+|---:|---|---|
+| 1 | layerwise_hidden_router | stronger-access in-framework baseline; not a full Dr.LLM reproduction |
+| 2 | Raw-SetBCE | same final Delta_NLL set labels, raw prefix only |
+| 3 | OPAL-SetBCE | ours; beats static/PuDDing/IG but not Raw/layerwise |
+| 4 | PuDDing-style / IG-style | both select `ends_heavy` for every test window |
+
+Selected candidate distributions:
+
+- PuDDing-style: `{"ends_heavy": 289}`
+- IG-style: `{"ends_heavy": 289}`
 
 ## OPAL Tuning Table
 
@@ -79,9 +93,11 @@ Pending server run:
 
 ## Final Judgment
 
-- current decision: **not main-text ready**
-- reason: OPAL beats static but loses Raw, and PuDDing-style / IG-style / layerwise-hidden baselines are not yet run.
-- paper placement rule: if OPAL beats Static best-on-val C6 and PuDDing/IG, this can become a main-text public LM sanity table; if it only beats static, use appendix wording as public LM sanity / partial generalization; if it does not beat static after correction, do not include WikiText except as negative diagnosis.
+- current decision: **appendix only**
+- reason: OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router.
+- recommended wording: WikiText-2 is a public LM sanity / partial generalization result, not a main OPAL superiority claim.
+- do not write: "OPAL is best on WikiText-2." The table does not support that.
+- safe write: "On WikiText-2, OPAL improves over fixed/candidate-library skipping baselines but remains slightly behind a raw-prefix set router and a stronger-access layerwise hidden router."
 
 ## Commands
 

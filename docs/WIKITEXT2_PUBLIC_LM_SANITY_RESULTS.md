@@ -77,4 +77,4 @@ The related-baseline runner will read these JSON files and regenerate this repor
 
 ## Interpretation
 
-OPAL-SetBCE beats Static best-on-val C6 by 0.0867 NLL and 1.4408 PPL, but Raw-SetBCE beats OPAL-SetBCE by 0.0054 NLL and 0.0855 PPL. This is a narrow but real loss against the raw ablation. WikiText-2 should be treated as a rescue/diagnostic experiment until PuDDing-style, IG-style, and layerwise-hidden baselines are included.
+OPAL-SetBCE beats Static best-on-val C6 by 0.0867 NLL and 1.4408 PPL, but Raw-SetBCE beats OPAL-SetBCE by 0.0054 NLL and 0.0855 PPL. The completed related-baseline rescue run also shows OPAL beating PuDDing-style/IG-style candidate-library baselines while losing to the stronger-access layerwise hidden router. WikiText-2 should therefore be treated as appendix-level public LM sanity / partial generalization, not a main OPAL superiority claim.

@@ -70,14 +70,15 @@ The dynamic-constrained validation selection (`WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS
 
 ## Router Training And Overlap
 
-The compact server log pasted into the chat did not include the exact first/best/last training losses or the overlap/hamming summary values. They are written by the server runner to:
+The full training/validation ledger is maintained in `docs/WIKITEXT2_PUBLIC_LM_RELATED_RESULTS.md`. The key train diagnostics pasted from the server are:
 
-- Raw training metrics: `policy_ckpts/wikitext2_public_lm_sanity/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25/raw_embedding_bce/training_metrics.json`
-- OPAL training metrics: `policy_ckpts/wikitext2_public_lm_sanity/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25/prefix_hk_raw_attn_bce/training_metrics.json`
-- Raw overlap: `results/wikitext2_public_lm_sanity/diagnostics/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25/raw_setbce_train_overlap.summary.json`
-- OPAL overlap: `results/wikitext2_public_lm_sanity/diagnostics/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25/opal_setbce_train_overlap.summary.json`
+| method | epochs | loss first ↓ | loss best ↓ | best epoch | loss last ↓ | overlap@7 ↑ | hamming ↓ | exact match ↑ | unique predicted masks |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Raw-SetBCE | 40 | 0.207188 | 0.082307 | 40 | 0.082307 | 0.940286 | 0.029857 | 0.640500 | 39 |
+| OPAL-H4-SetBCE | 40 | 0.564387 | 0.010671 | 40 | 0.010671 | 0.996429 | 0.001786 | 0.975500 | 53 |
+| OPAL-H9-SetBCE | 40 | 0.564667 | 0.015140 | 40 | 0.015140 | 0.992214 | 0.003893 | 0.951500 | 46 |
 
-The related-baseline runner will read these JSON files and regenerate this report with exact loss/overlap values on the server. I am not filling those missing scalar values by guess.
+All three train losses are best at epoch 40, but OPAL-H4 validation PPL is best at epoch 2. This is why the current diagnosis is overfitting/objective mismatch rather than insufficient training.
 
 ## Leakage Check
 

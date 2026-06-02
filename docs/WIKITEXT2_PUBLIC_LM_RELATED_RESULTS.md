@@ -17,6 +17,21 @@ Last updated: 2026-06-02
 - label_samples: 2000
 - candidate library: C16 `uniform`, `ends_heavy`, `first_k`, `last_k`, `middle_heavy`, `random_diverse_seed42`, `random_diverse_v1`...`random_diverse_v10`
 
+## Complete Experiment Ledger
+
+All entries below use Qwen2.5-1.5B, WikiText-2 raw, `skip_rate=0.25`, `skip_count=7`, `protected_head=4`, `protected_tail=2`, and seed 42 unless noted.
+
+| run | seq_len | router_prefix_tokens | prefix_depth | label_samples | eval_tokens | Full PPL | Raw PPL | OPAL PPL | OPAL unique masks | status |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| smoke after mask fix | 512 | 128 | 4 | 32 | 12,288 | 9.1589 | 37.0830 | 53.7724 | 31 | valid smoke only |
+| main final checkpoint | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 | 15.9138 | 15 | final OPAL loses Raw by 0.0855 PPL |
+| related baselines | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 | 15.9138 | 15 | PuDDing/IG/layerwise added |
+| prefix length sensitivity | 1024 | 512 | 4 | 2000 | 147,968 | 8.8763 | 15.5530 | 15.7777 | 21 | prefix512 does not rescue OPAL |
+| OPAL-H9 | 1024 | 256 | 9 | 2000 | 221,952 | 9.1649 | 15.8283 | 16.0055 | 18 | deeper H^k does not rescue OPAL |
+| OPAL-H4 best-on-val | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 final | 15.6204 | 1 | epoch2 wins current Raw/layerwise, but collapses to one mask |
+| OPAL-H4 best-on-val minuniq8 | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 final | 15.8695 | 13 | dynamic checkpoint improves final OPAL but loses current Raw/layerwise |
+| Raw best-on-val | 1024 | 256 | 0 | 2000 | pending | 9.1649 | pending | NA | pending | must be run for fair checkpoint-selection comparison |
+
 ## Original WikiText Bad Result
 
 | method | type | NLL ↓ | PPL ↓ | Delta_NLL ↓ | Delta_PPL ↓ | unique masks |
@@ -28,7 +43,7 @@ Last updated: 2026-06-02
 | Raw-SetBCE | ablation | 2.7618 | 15.8283 | 0.5464 | 6.6634 | 8 |
 | OPAL-SetBCE | ours | 2.7672 | 15.9138 | 0.5518 | 6.7489 | 15 |
 
-Raw-SetBCE is ahead of OPAL-SetBCE by 0.0054 NLL / 0.0855 PPL. OPAL is not currently the best learned method on WikiText-2.
+For the final 40-epoch checkpoints, Raw-SetBCE is ahead of OPAL-SetBCE by 0.0054 NLL / 0.0855 PPL. Later validation checkpoint selection changes the OPAL-H4 result, so this row should be cited specifically as the final-checkpoint comparison.
 
 ## Validation Checkpoint Selection Result
 
@@ -50,6 +65,65 @@ Validation-selection details:
 This checkpoint is better than Raw-SetBCE by 0.0132 NLL / 0.2079 PPL and better than `layerwise_hidden_router` by 0.0082 NLL / 0.1287 PPL on this seed42 test run. However, `unique_masks=1`, so this should be interpreted as validation checkpoint selection finding an OPAL checkpoint whose hard top-K scores collapse to one high-quality mask, not as evidence that dynamic OPAL mask diversity is helping on WikiText-2.
 
 To check whether a more dynamic checkpoint exists, selection was repeated with `WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS=8`. This selected epoch 33 (`validation_NLL=2.8022`, `validation_PPL=16.4809`, `validation_unique_masks=8`) and gave test NLL/PPL `2.7644 / 15.8695` with `test_unique_masks=13`. This dynamic checkpoint is better than the final epoch OPAL checkpoint but still slightly worse than Raw-SetBCE by 0.0026 NLL / 0.0412 PPL and worse than `layerwise_hidden_router` by 0.0076 NLL / 0.1204 PPL.
+
+Raw validation checkpoint selection is still pending. Until Raw is also selected by validation, epoch2 OPAL should be described as beating the current Raw final checkpoint, not as a fully fair best-on-val comparison.
+
+### OPAL-H4 Validation Checkpoint Curve
+
+This is the complete 40-epoch validation sweep for OPAL-H4. It explains the apparent contradiction: the best validation-PPL checkpoint is epoch 2 but has only one validation mask; later checkpoints become more dynamic but validation PPL worsens.
+
+| epoch | val_NLL ↓ | val_PPL ↓ | validation unique masks | exact-K | dominant mask count | dominant keep mask |
+|---:|---:|---:|---:|---:|---:|---|
+| 2 | 2.793761 | 16.342371 | 1 | 1.000 | 253 | `1111111111000000011111111111` |
+| 15 | 2.796481 | 16.386880 | 2 | 1.000 | 156 | `1111111111100000001111111111` |
+| 19 | 2.796734 | 16.391028 | 4 | 1.000 | 151 | `1111111111100000001111111111` |
+| 18 | 2.796926 | 16.394173 | 4 | 1.000 | 163 | `1111111111100000001111111111` |
+| 13 | 2.797322 | 16.400659 | 2 | 1.000 | 180 | `1111111111100000001111111111` |
+| 16 | 2.797689 | 16.406692 | 2 | 1.000 | 193 | `1111111111100000001111111111` |
+| 14 | 2.797702 | 16.406901 | 2 | 1.000 | 200 | `1111111111100000001111111111` |
+| 10 | 2.797829 | 16.408985 | 2 | 1.000 | 183 | `1111111111100000001111111111` |
+| 17 | 2.798136 | 16.414018 | 3 | 1.000 | 194 | `1111111111100000001111111111` |
+| 11 | 2.798759 | 16.424249 | 2 | 1.000 | 216 | `1111111111100000001111111111` |
+| 12 | 2.798923 | 16.426942 | 2 | 1.000 | 218 | `1111111111100000001111111111` |
+| 20 | 2.799472 | 16.435962 | 6 | 1.000 | 145 | `1111111111100000001111111111` |
+| 25 | 2.799591 | 16.437918 | 6 | 1.000 | 137 | `1111111111100000001111111111` |
+| 1 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 3 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 4 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 5 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 6 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 7 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 8 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 9 | 2.800673 | 16.455725 | 1 | 1.000 | 253 | `1111111111100000001111111111` |
+| 33 | 2.802204 | 16.480923 | 8 | 1.000 | 152 | `1111111111100000001111111111` |
+| 23 | 2.802472 | 16.485354 | 6 | 1.000 | 133 | `1111111111100000001111111111` |
+| 24 | 2.802850 | 16.491585 | 7 | 1.000 | 134 | `1111111111100000001111111111` |
+| 22 | 2.803736 | 16.506204 | 5 | 1.000 | 138 | `1111111111100000001111111111` |
+| 29 | 2.804502 | 16.518842 | 10 | 1.000 | 142 | `1111111111100000001111111111` |
+| 28 | 2.804655 | 16.521379 | 7 | 1.000 | 137 | `1111111111100000001111111111` |
+| 31 | 2.804810 | 16.523943 | 8 | 1.000 | 134 | `1111111111100000001111111111` |
+| 30 | 2.805284 | 16.531776 | 13 | 1.000 | 155 | `1111111111100000001111111111` |
+| 21 | 2.805545 | 16.536086 | 6 | 1.000 | 148 | `1111111111100000001111111111` |
+| 26 | 2.805935 | 16.542540 | 9 | 1.000 | 115 | `1111111111100000001111111111` |
+| 35 | 2.806021 | 16.543954 | 10 | 1.000 | 128 | `1111111111100000001111111111` |
+| 32 | 2.806731 | 16.555704 | 10 | 1.000 | 127 | `1111111111100000001111111111` |
+| 27 | 2.806834 | 16.557418 | 7 | 1.000 | 126 | `1111111111100000001111111111` |
+| 39 | 2.807405 | 16.566867 | 12 | 1.000 | 131 | `1111111111100000001111111111` |
+| 40 | 2.807570 | 16.569604 | 15 | 1.000 | 129 | `1111111111100000001111111111` |
+| 38 | 2.807625 | 16.570509 | 12 | 1.000 | 127 | `1111111111100000001111111111` |
+| 37 | 2.807957 | 16.576013 | 11 | 1.000 | 115 | `1111111111100000001111111111` |
+| 34 | 2.808994 | 16.593221 | 14 | 1.000 | 99 | `1111111111000000011111111111` |
+| 36 | 2.812425 | 16.650242 | 11 | 1.000 | 103 | `1111111111100000001111111111` |
+
+Dynamic-constrained eligible checkpoints with `validation unique masks >= 8`:
+
+| rank | epoch | val_NLL ↓ | val_PPL ↓ | validation unique masks | test_NLL ↓ | test_PPL ↓ | test unique masks | note |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 33 | 2.802204 | 16.480923 | 8 | 2.764400 | 15.869519 | 13 | selected by minuniq8; improves final OPAL but loses current Raw/layerwise |
+| 2 | 29 | 2.804502 | 16.518842 | 10 | pending | pending | pending | validation-only |
+| 3 | 31 | 2.804810 | 16.523943 | 8 | pending | pending | pending | validation-only |
+| 4 | 30 | 2.805284 | 16.531776 | 13 | pending | pending | pending | validation-only |
+| 5 | 26 | 2.805935 | 16.542540 | 9 | pending | pending | pending | validation-only |
 
 ## WikiText-2 Audit
 
@@ -129,18 +203,20 @@ Pairwise agreement:
 | Raw-SetBCE vs layerwise_hidden_router | 0.9402 | 0.0299 | 0.6125 |
 | OPAL-SetBCE vs layerwise_hidden_router | 0.9046 | 0.0477 | 0.4291 |
 
-Interpretation: WikiText-2 is not asking the router to skip early layers. It mostly asks for a shifted middle-block skip policy. OPAL's extra mask diversity does not currently translate into lower PPL; layerwise_hidden_router wins because it more reliably chooses the same high-quality middle-block masks. This also suggests the original `prefix_depth=4` OPAL feature may be too shallow. Since layers `0..8` are almost never skipped, a more informative OPAL variant is to route from a teacher prefix hidden state after the first 9 layers.
+Interpretation: WikiText-2 is not asking the router to skip early layers. It mostly asks for a shifted middle-block skip policy. In the final checkpoints, OPAL's extra mask diversity does not translate into lower PPL; layerwise_hidden_router wins because it more reliably chooses the same high-quality middle-block masks. Validation selection can improve OPAL PPL, but the best checkpoint collapses to one mask; the dynamic-constrained checkpoint remains behind Raw/layerwise.
 
 ## Training Diagnostics
 
-| method | loss first ↓ | loss best ↓ | loss last ↓ | overlap@7 ↑ | hamming ↓ | pairwise predicted hamming | exact match ↑ | unique teacher masks | unique predicted masks |
+| method | epochs | loss first ↓ | loss best ↓ | best epoch | loss last ↓ | overlap@7 ↑ | hamming ↓ | exact match ↑ | unique predicted masks |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Raw-SetBCE | 0.207188 | 0.082307 | 0.082307 | 0.940286 | 0.029857 | pending artifact extract | 0.640500 | pending artifact extract | 39 |
-| OPAL-H4-SetBCE | 0.564387 | 0.010671 | 0.010671 | 0.996429 | 0.001786 | pending artifact extract | 0.975500 | pending artifact extract | 53 |
-| OPAL-H9-SetBCE | 0.564667 | 0.015140 | 0.015140 | 0.992214 | 0.003893 | pending artifact extract | 0.951500 | pending artifact extract | 46 |
+| Raw-SetBCE | 40 | 0.207188 | 0.082307 | 40 | 0.082307 | 0.940286 | 0.029857 | 0.640500 | 39 |
+| OPAL-H4-SetBCE | 40 | 0.564387 | 0.010671 | 40 | 0.010671 | 0.996429 | 0.001786 | 0.975500 | 53 |
+| OPAL-H9-SetBCE | 40 | 0.564667 | 0.015140 | 40 | 0.015140 | 0.992214 | 0.003893 | 0.951500 | 46 |
 | layerwise_hidden_router | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract |
 
 Readout: Raw fits train labels less tightly but generalizes slightly better on test PPL. OPAL-H4/H9 nearly memorize the train greedy sets (`exact_match` 0.9755 / 0.9515), yet test PPL stays behind Raw. More epochs are unlikely to help this SetBCE formulation; if anything, validation checkpoint selection or a less overfit objective would be the next diagnostic.
+
+The training loss curve is monotonic in the pasted summaries: all three best losses occur at epoch 40. The validation curve tells a different story for OPAL-H4: validation PPL is best at epoch 2, long before train BCE reaches its best value. This supports the overfitting/objective-mismatch diagnosis.
 
 The remaining `pairwise predicted hamming`, `unique teacher masks`, and layerwise training diagnostics can still be extracted from server artifacts with the command below if needed.
 
@@ -286,14 +362,16 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 | prefix length sensitivity | seed42 prefix512 complete | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | did not rescue SetBCE; OPAL still loses Raw |
 | OPAL-H9 / deeper H^k feature | complete | P0 | skip distribution shows layers 0..8 are effectively never skipped; H9 tested whether a deeper prefix hidden state helps | did not rescue SetBCE; OPAL-H9 still loses Raw |
 | validation checkpoint selection | complete for OPAL-H4 seed42 | P1 | current training may not choose best validation-PPL checkpoint | epoch2 test PPL 15.6204 beats Raw/layerwise, but unique_masks=1; minuniq8 epoch33 has 13 test unique masks but still loses Raw/layerwise |
+| Raw validation checkpoint selection | pending | P0 | needed for a fair best-on-val comparison against OPAL epoch2 | run `run_wikitext2_raw_val_ckpt_select_gpu01234567.sh` and paste compact JSON |
 
 ## Next Minimal Experiments
 
 Priority order:
 
-1. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
-2. Do not expand OPAL-SetBCE H4, H9, or prefix512 to three seeds: all seed42 variants still lose Raw-SetBCE.
-3. Expand to three seeds only if an old OPAL baseline, static-prior variant, or another clearly specified OPAL variant beats Raw-SetBCE on seed42.
+1. Run Raw-SetBCE validation checkpoint selection. This is required before saying OPAL epoch2 fairly beats Raw.
+2. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
+3. Do not expand OPAL-SetBCE H4, H9, prefix512, or validation selection to three seeds until Raw best-on-val is known.
+4. Expand to three seeds only if an old OPAL baseline, static-prior variant, or a validation-selected OPAL variant beats Raw best-on-val on seed42.
 
 OPAL-H9 command already run:
 
@@ -338,10 +416,10 @@ Old OPAL baselines are not wired into the current WikiText-2 runner yet. Do not 
 ## Final Judgment
 
 - current decision: **appendix only**
-- reason: OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. The prefix512 and H9 seed42 rescue runs also lose Raw-SetBCE.
-- recommended wording: WikiText-2 is a public LM sanity / partial generalization result, not a main OPAL superiority claim.
+- reason: final-epoch OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. Validation-selected OPAL epoch2 beats the current Raw/layerwise test numbers, but collapses to one test mask and Raw best-on-val is still pending. The dynamic-constrained OPAL epoch33 keeps 13 test masks but still loses Raw/layerwise.
+- recommended wording: WikiText-2 is a public LM sanity / checkpoint-selection diagnostic, not a main OPAL superiority claim.
 - do not write: "OPAL is best on WikiText-2." The table does not support that.
-- safe write: "On WikiText-2, OPAL improves over fixed/candidate-library skipping baselines but remains slightly behind a raw-prefix set router and a stronger-access layerwise hidden router."
+- safe write: "On WikiText-2, final-epoch OPAL improves over fixed/candidate-library skipping baselines. Validation selection can recover a lower-PPL OPAL checkpoint, but the best checkpoint collapses to a single mask; when dynamic mask diversity is required, OPAL remains close to but slightly behind Raw-SetBCE and a stronger-access layerwise hidden router."
 
 ## Commands
 
@@ -363,6 +441,24 @@ WIKITEXT_RUN_PUDDING=1 \
 WIKITEXT_RUN_IG=1 \
 WIKITEXT_RUN_LAYERWISE=1 \
 bash ./run_wikitext2_related_baselines_gpu01234567.sh
+```
+
+Run Raw validation checkpoint selection:
+
+```bash
+cd /workspace/PriorDynamicPruning
+source ~/venvs/planrec/bin/activate
+git pull --ff-only origin codex/opal-llm-experiments
+
+WIKITEXT_MODEL_PATH=/workspace/ckpts/Qwen2.5-1.5B \
+WIKITEXT_LABEL_SAMPLES=2000 \
+WIKITEXT_EVAL_WINDOWS=512 \
+WIKITEXT_SEQ_LEN=1024 \
+WIKITEXT_ROUTER_PREFIX_TOKENS=256 \
+WIKITEXT_SEED=42 \
+WIKITEXT_BASE_PORT=58700 \
+WIKITEXT_VALCKPT_PARALLEL_WORKERS=8 \
+bash ./run_wikitext2_raw_val_ckpt_select_gpu01234567.sh
 ```
 
 Minimal OPAL correction if needed:
@@ -388,3 +484,7 @@ bash ./run_wikitext2_public_lm_sanity_gpu01234567.sh
 - candidate labels: `results/wikitext2_public_lm_sanity/related_labels/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25_c16_candidate_delta_nll.jsonl`
 - related metrics: `results/wikitext2_public_lm_sanity/related_metrics/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25/`
 - related checkpoints: `policy_ckpts/wikitext2_public_lm_related/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25/`
+- OPAL validation checkpoint metrics: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25_valckpt/`
+- OPAL validation checkpoint checkpoints: `policy_ckpts/wikitext2_public_lm_val_ckpt/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25_valckpt/`
+- Raw validation checkpoint metrics: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25_raw_valckpt/`
+- Raw validation checkpoint checkpoints: `policy_ckpts/wikitext2_public_lm_val_ckpt/wikitext2_Qwen2_5-1_5B_maskcfg_seq1024_pref256_m2000_seed42_skip0p25_raw_valckpt/`

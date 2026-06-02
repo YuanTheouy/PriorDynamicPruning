@@ -35,6 +35,8 @@ export WIKITEXT_ROUTER_DIM="${WIKITEXT_ROUTER_DIM:-256}"
 export WIKITEXT_ROUTER_HEADS="${WIKITEXT_ROUTER_HEADS:-4}"
 export WIKITEXT_MAX_GRAD_NORM="${WIKITEXT_MAX_GRAD_NORM:-1.0}"
 export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
+export WIKITEXT_VALCKPT_PARALLEL_WORKERS="${WIKITEXT_VALCKPT_PARALLEL_WORKERS:-$NUM_GPUS}"
+export WIKITEXT_VALCKPT_OMP_NUM_THREADS="${WIKITEXT_VALCKPT_OMP_NUM_THREADS:-2}"
 export WIKITEXT_DATASET_CACHE_DIR="${WIKITEXT_DATASET_CACHE_DIR:-}"
 if [ -z "${WIKITEXT_DATASET_DISK_PATH:-}" ] && [ -d "/workspace/datasets/wikitext/wikitext-2-raw-v1" ]; then
   export WIKITEXT_DATASET_DISK_PATH="/workspace/datasets/wikitext/wikitext-2-raw-v1"
@@ -128,6 +130,138 @@ sys.exit(0 if math.isfinite(float(payload.get("nll", "nan"))) else 1)
 PY
 }
 
+make_visible_gpu_array() {
+  local visible_gpu_csv="${CUDA_VISIBLE_DEVICES:-}"
+  if [ -z "$visible_gpu_csv" ]; then
+    visible_gpu_csv="$(seq -s, 0 "$((NUM_GPUS - 1))")"
+  fi
+  visible_gpu_csv="${visible_gpu_csv// /}"
+  IFS=',' read -r -a VISIBLE_GPU_IDS <<< "$visible_gpu_csv"
+}
+
+eval_epoch_checkpoint_single_gpu() {
+  local epoch="$1"
+  local gpu_id="$2"
+  local epoch_tag
+  epoch_tag="$(printf "%03d" "$epoch")"
+  local ckpt="${WIKITEXT_EPOCH_CKPT_DIR}/risk_router_epoch${epoch_tag}.pt"
+  local out="${WIKITEXT_VAL_METRIC_DIR}/opal_epoch${epoch_tag}_validation.json"
+  if json_usable "$out"; then
+    echo "=== Reuse validation metric: ${out} ==="
+    return 0
+  fi
+  if [ ! -s "$ckpt" ]; then
+    echo "Missing checkpoint: ${ckpt}" >&2
+    return 2
+  fi
+  echo "=== GPU ${gpu_id}: evaluate epoch ${epoch_tag} ==="
+  CUDA_VISIBLE_DEVICES="$gpu_id" \
+  OMP_NUM_THREADS="$WIKITEXT_VALCKPT_OMP_NUM_THREADS" \
+  MKL_NUM_THREADS="$WIKITEXT_VALCKPT_OMP_NUM_THREADS" \
+  python3 ./eval_wikitext_opal_ppl.py eval \
+    --teacher_model "$WIKITEXT_MODEL_PATH" \
+    --split validation \
+    --dataset_disk_path "$WIKITEXT_DATASET_DISK_PATH" \
+    --dataset_cache_dir "$WIKITEXT_DATASET_CACHE_DIR" \
+    --seq_len "$WIKITEXT_SEQ_LEN" \
+    --router_prefix_tokens "$WIKITEXT_ROUTER_PREFIX_TOKENS" \
+    --eval_windows "$WIKITEXT_EVAL_WINDOWS" \
+    --method router \
+    --method_label "OPAL-SetBCE epoch${epoch} validation" \
+    --risk_router_ckpt "$ckpt" \
+    --prefix_depth "$WIKITEXT_PREFIX_DEPTH" \
+    --skip_rate "$WIKITEXT_SKIP_RATE" \
+    --skip_count "$WIKITEXT_SKIP_COUNT" \
+    --protected_head "$WIKITEXT_PROTECTED_HEAD" \
+    --protected_tail "$WIKITEXT_PROTECTED_TAIL" \
+    --run_name "${WIKITEXT_RUN_ID}_opal_epoch${epoch_tag}_validation" \
+    --batch_size "$WIKITEXT_EVAL_BATCH_SIZE" \
+    --output_json "$out" \
+    --precision "$WIKITEXT_PRECISION" \
+    --seed "$WIKITEXT_SEED"
+}
+
+eval_epoch_checkpoint_worker() {
+  local worker_idx="$1"
+  local worker_count="$2"
+  local gpu_id="$3"
+  local epoch
+  for epoch in $(seq 1 "$WIKITEXT_EPOCHS"); do
+    if [ "$(( (epoch - 1) % worker_count ))" -ne "$worker_idx" ]; then
+      continue
+    fi
+    eval_epoch_checkpoint_single_gpu "$epoch" "$gpu_id"
+  done
+}
+
+eval_all_epoch_checkpoints_parallel() {
+  make_visible_gpu_array
+  if [ "${#VISIBLE_GPU_IDS[@]}" -eq 0 ]; then
+    echo "No visible GPUs found from CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}." >&2
+    return 2
+  fi
+  local worker_count="$WIKITEXT_VALCKPT_PARALLEL_WORKERS"
+  if [ "$worker_count" -gt "${#VISIBLE_GPU_IDS[@]}" ]; then
+    worker_count="${#VISIBLE_GPU_IDS[@]}"
+  fi
+  if [ "$worker_count" -gt "$WIKITEXT_EPOCHS" ]; then
+    worker_count="$WIKITEXT_EPOCHS"
+  fi
+  if [ "$worker_count" -lt 1 ]; then
+    echo "WIKITEXT_VALCKPT_PARALLEL_WORKERS must be >= 1." >&2
+    return 2
+  fi
+
+  echo "=== Parallel validation sweep: ${worker_count} single-GPU workers over ${WIKITEXT_EPOCHS} checkpoints ==="
+  echo "=== Visible GPUs: ${VISIBLE_GPU_IDS[*]} ==="
+  local -a worker_pids=()
+  local -a worker_logs=()
+  local worker_idx
+  for worker_idx in $(seq 0 "$((worker_count - 1))"); do
+    local gpu_id="${VISIBLE_GPU_IDS[$worker_idx]}"
+    local log_path="${WIKITEXT_VAL_METRIC_DIR}/validation_worker_gpu${gpu_id}.log"
+    worker_logs+=("$log_path")
+    echo "=== Start validation worker ${worker_idx} on GPU ${gpu_id}; log ${log_path} ==="
+    (
+      set -euo pipefail
+      eval_epoch_checkpoint_worker "$worker_idx" "$worker_count" "$gpu_id"
+    ) > "$log_path" 2>&1 &
+    worker_pids+=("$!")
+  done
+
+  local status=0
+  local pid
+  for pid in "${worker_pids[@]}"; do
+    if ! wait "$pid"; then
+      status=1
+    fi
+  done
+
+  if [ "$status" -ne 0 ]; then
+    echo "=== At least one validation worker failed. Log tails follow. ===" >&2
+    local log_path
+    for log_path in "${worker_logs[@]}"; do
+      echo "--- ${log_path} ---" >&2
+      tail -n 80 "$log_path" >&2 || true
+    done
+    return "$status"
+  fi
+
+  local missing=0
+  local epoch
+  for epoch in $(seq 1 "$WIKITEXT_EPOCHS"); do
+    local out="${WIKITEXT_VAL_METRIC_DIR}/opal_epoch$(printf "%03d" "$epoch")_validation.json"
+    if ! json_usable "$out"; then
+      echo "Missing or unusable validation metric after parallel sweep: ${out}" >&2
+      missing=1
+    fi
+  done
+  if [ "$missing" -ne 0 ]; then
+    return 2
+  fi
+  echo "=== Parallel validation sweep complete ==="
+}
+
 if [ ! -s "$WIKITEXT_LABEL_FILE" ]; then
   echo "Missing greedy labels: ${WIKITEXT_LABEL_FILE}" >&2
   echo "Run run_wikitext2_public_lm_sanity_gpu01234567.sh once for this label run first." >&2
@@ -175,39 +309,7 @@ else
 fi
 
 echo "=== Evaluate every epoch checkpoint on validation ==="
-for epoch in $(seq 1 "$WIKITEXT_EPOCHS"); do
-  ckpt="${WIKITEXT_EPOCH_CKPT_DIR}/risk_router_epoch$(printf "%03d" "$epoch").pt"
-  out="${WIKITEXT_VAL_METRIC_DIR}/opal_epoch$(printf "%03d" "$epoch")_validation.json"
-  if json_usable "$out"; then
-    echo "=== Reuse validation metric: ${out} ==="
-    continue
-  fi
-  if [ ! -s "$ckpt" ]; then
-    echo "Missing checkpoint: ${ckpt}" >&2
-    exit 2
-  fi
-  run_accelerate ./eval_wikitext_opal_ppl.py eval \
-    --teacher_model "$WIKITEXT_MODEL_PATH" \
-    --split validation \
-    --dataset_disk_path "$WIKITEXT_DATASET_DISK_PATH" \
-    --dataset_cache_dir "$WIKITEXT_DATASET_CACHE_DIR" \
-    --seq_len "$WIKITEXT_SEQ_LEN" \
-    --router_prefix_tokens "$WIKITEXT_ROUTER_PREFIX_TOKENS" \
-    --eval_windows "$WIKITEXT_EVAL_WINDOWS" \
-    --method router \
-    --method_label "OPAL-SetBCE epoch${epoch} validation" \
-    --risk_router_ckpt "$ckpt" \
-    --prefix_depth "$WIKITEXT_PREFIX_DEPTH" \
-    --skip_rate "$WIKITEXT_SKIP_RATE" \
-    --skip_count "$WIKITEXT_SKIP_COUNT" \
-    --protected_head "$WIKITEXT_PROTECTED_HEAD" \
-    --protected_tail "$WIKITEXT_PROTECTED_TAIL" \
-    --run_name "${WIKITEXT_RUN_ID}_opal_epoch$(printf "%03d" "$epoch")_validation" \
-    --batch_size "$WIKITEXT_EVAL_BATCH_SIZE" \
-    --output_json "$out" \
-    --precision "$WIKITEXT_PRECISION" \
-    --seed "$WIKITEXT_SEED"
-done
+eval_all_epoch_checkpoints_parallel
 
 echo "=== Select best validation checkpoint ==="
 python3 - "$WIKITEXT_VAL_METRIC_DIR" "$WIKITEXT_EPOCH_CKPT_DIR" "$WIKITEXT_BEST_JSON" <<'PY'

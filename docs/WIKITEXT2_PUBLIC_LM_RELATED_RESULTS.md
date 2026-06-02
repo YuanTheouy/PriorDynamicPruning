@@ -31,10 +31,11 @@ All entries below use Qwen2.5-1.5B, WikiText-2 raw, `skip_rate=0.25`, `skip_coun
 | OPAL-H4 best-on-val | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 final | 15.6204 | 1 | epoch2 wins current Raw/layerwise, but collapses to one mask |
 | OPAL-H4 best-on-val minuniq8 | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 | 15.8283 final | 15.8695 | 13 | dynamic checkpoint improves final OPAL but loses current Raw/layerwise |
 | Raw best-on-val | 1024 | 256 | 0 | 2000 | 221,952 | 9.1649 | 15.6894 | NA | 7 | epoch24 improves Raw final but remains behind OPAL epoch2 |
+| three-seed best-on-val | 1024 | 256 | 4 | 2000 | 221,952 | 9.1649 mean | 15.6918 mean | 15.6207 mean | 1.3333 mean | OPAL wins Raw best-on-val/layerwise by mean PPL, but is static-like |
 
 ## Three-Seed Supplement Status
 
-New fixed three-seed result document:
+Fixed three-seed result document:
 
 - `docs/WIKITEXT2_3SEED_PUBLIC_LM_RESULTS.md`
 
@@ -43,18 +44,27 @@ Seed status:
 | seed | status | note |
 |---:|---|---|
 | 42 | complete | do not rerun; all required methods including Raw/OPAL best-on-val are present |
-| 13 | pending | run fixed three-seed supplement commands only |
-| 3407 | pending | run fixed three-seed supplement commands only |
+| 13 | complete | all required methods including Raw/OPAL best-on-val are present |
+| 3407 | complete | all required methods including Raw/OPAL best-on-val are present |
 
-Run the remaining seeds and regenerate the three-seed document:
+Three-seed headline:
 
-```bash
-cd /workspace/PriorDynamicPruning
-source ~/venvs/planrec/bin/activate
-bash ./run_wikitext2_3seed_public_lm_gpu01234567.sh
-```
+| method | PPL mean ↓ | PPL std | NLL mean ↓ | unique_masks mean | key note |
+|---|---:|---:|---:|---:|---|
+| OPAL-SetBCE best-on-val | 15.6207 | 0.0005 | 2.7486 | 1.3333 | wins Raw best-on-val/layerwise by mean PPL, but is static-like |
+| Raw-SetBCE best-on-val | 15.6918 | 0.0270 | 2.7531 | 6.0000 | validation-selected raw baseline |
+| layerwise_hidden_router | 15.7403 | 0.0222 | 2.7562 | 7.6667 | stronger-access baseline |
+| OPAL-SetBCE final epoch | 15.9816 | 0.0808 | 2.7714 | 16.6667 | dynamic but worse than Raw/layerwise |
 
-Do not use a zsh variable that stores many `KEY=VALUE` assignments; it can be passed as a single environment assignment and corrupt `WIKITEXT_MODEL_PATH`, producing an overlong run id.
+Required judgments:
+
+- OPAL best-on-val wins Raw best-on-val by three-seed mean PPL: `True`
+- OPAL best-on-val wins `layerwise_hidden_router` by three-seed mean PPL: `True`
+- Per-seed OPAL best-on-val wins Raw best-on-val: `[(42, True), (13, True), (3407, True)]`
+- Per-seed OPAL best-on-val wins layerwise: `[(42, True), (13, True), (3407, True)]`
+- OPAL best-on-val unique masks: `[1, 2, 1]`; mean `1.3333`
+- PuDDing-style / IG-style both select `ends_heavy` for all 289 test windows on every seed.
+- Caveat: this is a validation-selected static-like OPAL checkpoint result, not evidence of dynamic mask-diversity superiority.
 
 ## Original WikiText Bad Result
 
@@ -180,17 +190,16 @@ Dynamic-constrained eligible checkpoints with `validation unique masks >= 8`:
 | static best selection | pass | C6 best is selected by validation PPL, not test PPL. |
 | label objective | pass | Greedy labels optimize suffix Delta_NLL. New candidate labels also optimize suffix Delta_NLL. |
 
-## Why OPAL Did Not Win Yet
+## Final-Epoch Failure And Low-Diversity Caveat
 
-- OPAL beats Static best-on-val C6, so the mask application and learned routing path are not completely broken.
-- OPAL loses narrowly to Raw-SetBCE and also loses to the stronger-access layerwise hidden router, which suggests `prefix_hk_raw_attn` is not automatically the best signal for public LM windows.
-- OPAL produces more unique masks than Raw, but WikiText-2 PPL rewards mask quality, not mask diversity.
-- The raw embedding baseline may be a lower-variance content prior for contiguous LM windows, while H^k may add noisy teacher-prefix features when the training set is only m=2000 windows.
-- PuDDing-style and IG-style both collapse to the static `ends_heavy` candidate on all 289 test windows, so OPAL beating them mostly says OPAL beats candidate-library selection, not that it beats all adaptive related-work styles.
-- The H9 deeper-prefix test did not rescue SetBCE: OPAL-H9 is worse than Raw-SetBCE and slightly worse than the original H4 OPAL run.
-- Train diagnostics rule out simple under-training: OPAL-H4/H9 fit train skip sets far better than Raw, but test PPL is worse, so the failure is a generalization/objective mismatch rather than insufficient optimization.
-- Validation checkpoint selection does rescue seed42 test PPL: epoch 2 beats Raw-SetBCE and `layerwise_hidden_router`. The caveat is that the selected checkpoint uses only one mask on test, so it behaves like an OPAL-scored static selector rather than a diverse dynamic router.
-- A constrained dynamic checkpoint also exists: requiring at least 8 validation unique masks selects epoch 33, which has 13 unique test masks and improves over the final epoch OPAL checkpoint. It does not beat Raw-SetBCE or `layerwise_hidden_router`, so the dynamic-mask story remains appendix-level.
+- Final-epoch OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, so the mask application and learned routing path are not broken.
+- Final-epoch OPAL loses to Raw-SetBCE and to the stronger-access layerwise hidden router, which shows that training to epoch 40 overfits the greedy set labels on WikiText-2.
+- Train diagnostics support this: OPAL-H4/H9 fit train skip sets far better than Raw, but final test PPL is worse, so the issue is validation/generalization rather than insufficient optimization.
+- Validation checkpoint selection fixes PPL: across three seeds, OPAL best-on-val beats Raw best-on-val and `layerwise_hidden_router` by mean PPL and on every seed.
+- The caveat is severe: OPAL best-on-val uses very few masks (`[1, 2, 1]` unique masks across seeds 42/13/3407), so it behaves like a validation-selected static-like OPAL checkpoint.
+- PuDDing-style and IG-style both collapse to the static `ends_heavy` candidate on all 289 test windows for every seed, so OPAL beating them mostly says OPAL beats candidate-library selection on this low-entropy layer-skip regime.
+- The H9 deeper-prefix test did not rescue dynamic SetBCE: OPAL-H9 is worse than Raw-SetBCE and slightly worse than the original H4 OPAL final run.
+- A constrained dynamic checkpoint exists on seed42 (`min_unique_masks>=8`, epoch33, 13 test unique masks), but it does not beat Raw-SetBCE or `layerwise_hidden_router`; dynamic-mask diversity is not the winning WikiText-2 story.
 
 ## Related Baseline Table
 
@@ -390,6 +399,7 @@ PY
 | validation checkpoint selection | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7486 / 15.6204 | Best-on-val epoch2 beats Raw/layerwise on seed42, but collapses to one test mask; cite as checkpoint-selection rescue, not dynamic-mask proof. |
 | validation checkpoint selection, minuniq8 | complete | 2.2154 / 9.1649 | 2.7618 / 15.8283 | 2.7644 / 15.8695 | Dynamic epoch33 has 13 test unique masks and improves final OPAL, but remains slightly behind Raw/layerwise. |
 | Raw validation checkpoint selection | complete | 2.2154 / 9.1649 | 2.7530 / 15.6894 | NA | Raw best-on-val epoch24 improves Raw final, but remains behind OPAL best-on-val epoch2. |
+| three-seed validation checkpoint selection | complete | 2.2154 / 9.1649 | 2.7531 / 15.6918 mean | 2.7486 / 15.6207 mean | OPAL best-on-val beats Raw best-on-val and layerwise by mean PPL across seeds 42/13/3407, but OPAL unique masks average only 1.3333. |
 | static prior / swap q=1/2 | pending | NA | NA | NA | Defer unless old OPAL baselines or prefix variants show a path to beat Raw. |
 
 Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 suffix tokens per window, while `prefix512` scores 512 suffix tokens per window. Compare methods within the same prefix setting using Delta_NLL/Delta_PPL.
@@ -402,10 +412,10 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 | OPAL-PrefixLast old | missing on WikiText-2 | P0 | old submission-style OPAL reference; needed to know whether SetBCE is worse than previous OPAL formulation | run seed42 first |
 | OPAL-Attn old one-layer | missing on WikiText-2 | P0 | old one-layer attention OPAL ablation; needed for continuity with prior tables | run seed42 first |
 | static best-on-val C16 | optional missing | P2 | PuDDing/IG use C16; static best currently C6, so C16 static can check whether candidate library itself contains a stronger static mask | optional after P0 |
-| 3 seeds | missing | P2 | needed only if a seed42 setting becomes paper-worthy | do not run until prefix512 or old OPAL wins Raw |
+| 3 seeds | complete | P0 | required to decide whether WikiText-2 can be positive public LM sanity | OPAL best-on-val wins Raw best-on-val and layerwise by mean PPL, but with low unique masks |
 | prefix length sensitivity | seed42 prefix512 complete | P1 | likely rescue axis for OPAL-SetBCE on long LM windows | did not rescue SetBCE; OPAL still loses Raw |
 | OPAL-H9 / deeper H^k feature | complete | P0 | skip distribution shows layers 0..8 are effectively never skipped; H9 tested whether a deeper prefix hidden state helps | did not rescue SetBCE; OPAL-H9 still loses Raw |
-| validation checkpoint selection | complete for OPAL-H4 seed42 | P1 | current training may not choose best validation-PPL checkpoint | epoch2 test PPL 15.6204 beats Raw/layerwise, but unique_masks=1; minuniq8 epoch33 has 13 test unique masks but still loses Raw/layerwise |
+| validation checkpoint selection | complete for three seeds | P1 | current training may not choose best validation-PPL checkpoint | OPAL best-on-val wins Raw best-on-val/layerwise across all three seeds, but unique_masks are `[1, 2, 1]` |
 | Raw validation checkpoint selection | complete | P0 | needed for a fair best-on-val comparison against OPAL epoch2 | Raw epoch24 improves Raw final but remains behind OPAL epoch2 |
 
 ## Next Minimal Experiments
@@ -413,8 +423,8 @@ Do not compare absolute Full PPL across prefix lengths: `prefix256` scores 768 s
 Priority order:
 
 1. Run OPAL-PrefixLast old and OPAL-Attn old one-layer on WikiText-2 seed42. These are the most important missing historical OPAL baselines.
-2. Do not expand OPAL-SetBCE H4, H9, prefix512, or validation selection to three seeds until we decide whether the single-mask epoch2 checkpoint is acceptable evidence.
-3. Expand to three seeds only if an old OPAL baseline, static-prior variant, or a validation-selected OPAL variant beats Raw best-on-val on seed42 under an acceptable mask-diversity criterion.
+2. Do not run more OPAL-SetBCE tuning for this WikiText-2 sanity unless the paper needs a dynamic-mask-diversity claim. The current three-seed result already supports a validation-selected public LM sanity claim.
+3. If the paper needs a dynamic-mask-diversity claim on public LM, a different public LM benchmark or a stricter dynamic selection criterion is needed; the current best-on-val OPAL checkpoints are static-like.
 
 OPAL-H9 command already run:
 
@@ -458,11 +468,11 @@ Old OPAL baselines are not wired into the current WikiText-2 runner yet. Do not 
 
 ## Final Judgment
 
-- current decision: **appendix only**
-- reason: final-epoch OPAL beats Static best-on-val C6, PuDDing-style, and IG-style, but loses to Raw-SetBCE and the stronger-access layerwise_hidden_router. Validation-selected OPAL epoch2 beats Raw best-on-val epoch24 and layerwise, but collapses to one test mask. The dynamic-constrained OPAL epoch33 keeps 13 test masks but still loses Raw best-on-val/layerwise.
-- recommended wording: WikiText-2 is a public LM sanity / checkpoint-selection diagnostic, not a main OPAL superiority claim.
-- do not write: "OPAL is best on WikiText-2." The table does not support that.
-- safe write: "On WikiText-2, final-epoch OPAL improves over fixed/candidate-library skipping baselines. Validation selection can recover a lower-PPL OPAL checkpoint, but the best checkpoint collapses to a single mask; when dynamic mask diversity is required, OPAL remains close to but slightly behind Raw-SetBCE and a stronger-access layerwise hidden router."
+- current decision: **positive public LM sanity with a low-diversity caveat**
+- reason: across seeds `42/13/3407`, OPAL-SetBCE best-on-val has mean PPL `15.6207`, beating Raw-SetBCE best-on-val mean PPL `15.6918` and `layerwise_hidden_router` mean PPL `15.7403`. It also beats Raw/layerwise on every individual seed. However, OPAL best-on-val unique masks are `[1, 2, 1]`, so the best checkpoints are static-like.
+- recommended wording: WikiText-2 is a positive public LM sanity for validation-selected OPAL-SetBCE PPL, not evidence that dynamic mask diversity wins on public LM.
+- do not write: "OPAL's dynamic mask diversity dominates on WikiText-2." The three-seed table does not support that.
+- safe write: "On WikiText-2, validation-selected OPAL-SetBCE achieves lower three-seed mean PPL than Raw-SetBCE best-on-val, a stronger-access layerwise hidden router, fixed static masks, and candidate-library PuDDing/IG-style baselines. The selected OPAL checkpoints are low-diversity (`unique_masks` near 1), so we interpret this as a static-like validation-selected public LM sanity rather than a dynamic mask-diversity result."
 
 ## Commands
 

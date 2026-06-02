@@ -38,6 +38,8 @@ export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
 export WIKITEXT_VALCKPT_PARALLEL_WORKERS="${WIKITEXT_VALCKPT_PARALLEL_WORKERS:-$NUM_GPUS}"
 export WIKITEXT_VALCKPT_OMP_NUM_THREADS="${WIKITEXT_VALCKPT_OMP_NUM_THREADS:-2}"
 export WIKITEXT_VALCKPT_EVAL_ONLY="${WIKITEXT_VALCKPT_EVAL_ONLY:-0}"
+export WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS="${WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS:-0}"
+export WIKITEXT_VALCKPT_REPORT_TOPK="${WIKITEXT_VALCKPT_REPORT_TOPK:-40}"
 export WIKITEXT_DATASET_CACHE_DIR="${WIKITEXT_DATASET_CACHE_DIR:-}"
 if [ -z "${WIKITEXT_DATASET_DISK_PATH:-}" ] && [ -d "/workspace/datasets/wikitext/wikitext-2-raw-v1" ]; then
   export WIKITEXT_DATASET_DISK_PATH="/workspace/datasets/wikitext/wikitext-2-raw-v1"
@@ -67,6 +69,9 @@ export WIKITEXT_VALCKPT_DIR="${WIKITEXT_VALCKPT_ROOT}/prefix_hk_raw_attn_bce"
 export WIKITEXT_EPOCH_CKPT_DIR="${WIKITEXT_VALCKPT_DIR}/epoch_checkpoints"
 export WIKITEXT_VAL_METRIC_DIR="${WIKITEXT_RESULT_ROOT}/val_ckpt_metrics/${WIKITEXT_RUN_ID}"
 export WIKITEXT_BEST_JSON="${WIKITEXT_VAL_METRIC_DIR}/best_validation_checkpoint.json"
+if [ "$WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS" != "0" ]; then
+  export WIKITEXT_BEST_JSON="${WIKITEXT_VAL_METRIC_DIR}/best_validation_checkpoint_minuniq${WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS}.json"
+fi
 
 mkdir -p "$WIKITEXT_EPOCH_CKPT_DIR" "$WIKITEXT_VAL_METRIC_DIR"
 
@@ -317,25 +322,71 @@ echo "=== Evaluate every epoch checkpoint on validation ==="
 eval_all_epoch_checkpoints_parallel
 
 echo "=== Select best validation checkpoint ==="
-python3 - "$WIKITEXT_VAL_METRIC_DIR" "$WIKITEXT_EPOCH_CKPT_DIR" "$WIKITEXT_BEST_JSON" <<'PY'
+python3 - "$WIKITEXT_VAL_METRIC_DIR" "$WIKITEXT_EPOCH_CKPT_DIR" "$WIKITEXT_BEST_JSON" "$WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS" "$WIKITEXT_VALCKPT_REPORT_TOPK" <<'PY'
 import glob, json, os, sys
-metric_dir, ckpt_dir, best_json = sys.argv[1:]
+metric_dir, ckpt_dir, best_json, min_unique_raw, report_topk_raw = sys.argv[1:]
+min_unique = int(min_unique_raw)
+report_topk = int(report_topk_raw)
 rows = []
 for path in sorted(glob.glob(os.path.join(metric_dir, "opal_epoch*_validation.json"))):
     payload = json.load(open(path))
     epoch = int(os.path.basename(path).split("epoch", 1)[1].split("_", 1)[0])
+    mask_summary = payload.get("mask_summary") or {}
+    mask_usage = mask_summary.get("mask_usage") or {}
+    dominant_mask, dominant_count = ("", 0)
+    if mask_usage:
+        dominant_mask, dominant_count = max(mask_usage.items(), key=lambda item: int(item[1]))
     rows.append({
         "epoch": epoch,
         "nll": float(payload["nll"]),
         "ppl": float(payload["ppl"]),
+        "unique_masks": int(payload.get("unique_masks", mask_summary.get("unique_masks", 0))),
+        "exact_skip_count_rate": float(payload.get("exact_skip_count_rate", mask_summary.get("exact_skip_count_rate", 0.0))),
+        "dominant_mask": dominant_mask,
+        "dominant_mask_count": int(dominant_count),
         "metric_json": path,
         "checkpoint": os.path.join(ckpt_dir, f"risk_router_epoch{epoch:03d}.pt"),
     })
 if not rows:
     raise SystemExit("No validation metrics found.")
-best = min(rows, key=lambda row: (row["nll"], row["epoch"]))
-payload = {"best": best, "rows": rows}
+eligible = [row for row in rows if int(row["unique_masks"]) >= min_unique]
+if not eligible:
+    raise SystemExit(f"No validation metrics satisfy min_unique_masks={min_unique}.")
+best = min(eligible, key=lambda row: (row["nll"], row["epoch"]))
+top_by_nll = sorted(rows, key=lambda row: (row["nll"], row["epoch"]))[: max(1, report_topk)]
+top_dynamic = sorted(eligible, key=lambda row: (row["nll"], row["epoch"]))[: max(1, min(report_topk, len(eligible)))]
+payload = {
+    "selection": {
+        "min_unique_masks": min_unique,
+        "eligible_epochs": len(eligible),
+        "report_topk": report_topk,
+    },
+    "best": best,
+    "rows": rows,
+    "top_by_validation_nll": top_by_nll,
+    "top_eligible_by_validation_nll": top_dynamic,
+}
 json.dump(payload, open(best_json, "w"), indent=2)
+print(f"Validation checkpoint table: min_unique_masks={min_unique}, eligible_epochs={len(eligible)}/{len(rows)}")
+print("| epoch | val_NLL | val_PPL | unique_masks | exact-K | dominant_mask_count | dominant_mask |")
+print("|---:|---:|---:|---:|---:|---:|---|")
+for row in top_by_nll:
+    print(
+        f"| {row['epoch']} | {row['nll']:.6f} | {row['ppl']:.6f} | "
+        f"{row['unique_masks']} | {row['exact_skip_count_rate']:.3f} | "
+        f"{row['dominant_mask_count']} | {row['dominant_mask']} |"
+    )
+if min_unique > 0:
+    print(f"\nTop eligible checkpoints with unique_masks >= {min_unique}:")
+    print("| epoch | val_NLL | val_PPL | unique_masks | exact-K | dominant_mask_count | dominant_mask |")
+    print("|---:|---:|---:|---:|---:|---:|---|")
+    for row in top_dynamic:
+        print(
+            f"| {row['epoch']} | {row['nll']:.6f} | {row['ppl']:.6f} | "
+            f"{row['unique_masks']} | {row['exact_skip_count_rate']:.3f} | "
+            f"{row['dominant_mask_count']} | {row['dominant_mask']} |"
+        )
+print("\nSelected checkpoint:")
 print(json.dumps(best, indent=2))
 PY
 
@@ -349,7 +400,11 @@ import json, sys
 print(json.load(open(sys.argv[1]))["best"]["epoch"])
 PY
 )"
-test_json="${WIKITEXT_VAL_METRIC_DIR}/opal_best_val_epoch$(printf "%03d" "$best_epoch")_test.json"
+selection_suffix=""
+if [ "$WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS" != "0" ]; then
+  selection_suffix="_minuniq${WIKITEXT_VALCKPT_MIN_UNIQUE_MASKS}"
+fi
+test_json="${WIKITEXT_VAL_METRIC_DIR}/opal_best_val${selection_suffix}_epoch$(printf "%03d" "$best_epoch")_test.json"
 if json_usable "$test_json"; then
   echo "=== Reuse best-checkpoint test metric: ${test_json} ==="
 else
@@ -363,14 +418,14 @@ else
     --router_prefix_tokens "$WIKITEXT_ROUTER_PREFIX_TOKENS" \
     --eval_windows "$WIKITEXT_EVAL_WINDOWS" \
     --method router \
-    --method_label "OPAL-SetBCE best-on-val epoch${best_epoch}" \
+    --method_label "OPAL-SetBCE best-on-val${selection_suffix} epoch${best_epoch}" \
     --risk_router_ckpt "$best_ckpt" \
     --prefix_depth "$WIKITEXT_PREFIX_DEPTH" \
     --skip_rate "$WIKITEXT_SKIP_RATE" \
     --skip_count "$WIKITEXT_SKIP_COUNT" \
     --protected_head "$WIKITEXT_PROTECTED_HEAD" \
     --protected_tail "$WIKITEXT_PROTECTED_TAIL" \
-    --run_name "${WIKITEXT_RUN_ID}_opal_best_val_epoch$(printf "%03d" "$best_epoch")_test" \
+    --run_name "${WIKITEXT_RUN_ID}_opal_best_val${selection_suffix}_epoch$(printf "%03d" "$best_epoch")_test" \
     --batch_size "$WIKITEXT_EVAL_BATCH_SIZE" \
     --output_json "$test_json" \
     --precision "$WIKITEXT_PRECISION" \
@@ -380,16 +435,19 @@ fi
 echo "=== Compact validation-checkpoint result ==="
 python3 - "$WIKITEXT_BEST_JSON" "$test_json" <<'PY'
 import json, sys
-best = json.load(open(sys.argv[1]))["best"]
+payload = json.load(open(sys.argv[1]))
+best = payload["best"]
 test = json.load(open(sys.argv[2]))
 print(json.dumps({
+    "min_unique_masks": payload.get("selection", {}).get("min_unique_masks", 0),
     "best_epoch": best["epoch"],
     "validation_NLL": best["nll"],
     "validation_PPL": best["ppl"],
+    "validation_unique_masks": best.get("unique_masks"),
     "test_NLL": test["nll"],
     "test_PPL": test["ppl"],
     "test_eval_tokens": test["eval_tokens"],
-    "unique_masks": test.get("unique_masks"),
+    "test_unique_masks": test.get("unique_masks"),
     "exact_skip_count_rate": test.get("exact_skip_count_rate"),
 }, ensure_ascii=False))
 PY

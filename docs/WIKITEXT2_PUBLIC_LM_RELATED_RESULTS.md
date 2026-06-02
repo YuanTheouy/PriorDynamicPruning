@@ -52,6 +52,7 @@ Raw-SetBCE is ahead of OPAL-SetBCE by 0.0054 NLL / 0.0855 PPL. OPAL is not curre
 - The raw embedding baseline may be a lower-variance content prior for contiguous LM windows, while H^k may add noisy teacher-prefix features when the training set is only m=2000 windows.
 - PuDDing-style and IG-style both collapse to the static `ends_heavy` candidate on all 289 test windows, so OPAL beating them mostly says OPAL beats candidate-library selection, not that it beats all adaptive related-work styles.
 - The H9 deeper-prefix test did not rescue SetBCE: OPAL-H9 is worse than Raw-SetBCE and slightly worse than the original H4 OPAL run.
+- Train diagnostics rule out simple under-training: OPAL-H4/H9 fit train skip sets far better than Raw, but test PPL is worse, so the failure is a generalization/objective mismatch rather than insufficient optimization.
 
 ## Related Baseline Table
 
@@ -105,13 +106,16 @@ Interpretation: WikiText-2 is not asking the router to skip early layers. It mos
 
 ## Training Diagnostics
 
-Exact train-loss and train-label overlap diagnostics were produced as server-side artifacts, but the scalar values are not present in the compact metric log pasted into this local thread. Do not invent these values. Extract them from `/workspace/PriorDynamicPruning` with the command below and then replace the `pending artifact extract` cells.
-
 | method | loss first ↓ | loss best ↓ | loss last ↓ | overlap@7 ↑ | hamming ↓ | pairwise predicted hamming | exact match ↑ | unique teacher masks | unique predicted masks |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Raw-SetBCE | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract |
-| OPAL-SetBCE | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract |
+| Raw-SetBCE | 0.207188 | 0.082307 | 0.082307 | 0.940286 | 0.029857 | pending artifact extract | 0.640500 | pending artifact extract | 39 |
+| OPAL-H4-SetBCE | 0.564387 | 0.010671 | 0.010671 | 0.996429 | 0.001786 | pending artifact extract | 0.975500 | pending artifact extract | 53 |
+| OPAL-H9-SetBCE | 0.564667 | 0.015140 | 0.015140 | 0.992214 | 0.003893 | pending artifact extract | 0.951500 | pending artifact extract | 46 |
 | layerwise_hidden_router | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract | pending artifact extract |
+
+Readout: Raw fits train labels less tightly but generalizes slightly better on test PPL. OPAL-H4/H9 nearly memorize the train greedy sets (`exact_match` 0.9755 / 0.9515), yet test PPL stays behind Raw. More epochs are unlikely to help this SetBCE formulation; if anything, validation checkpoint selection or a less overfit objective would be the next diagnostic.
+
+The remaining `pairwise predicted hamming`, `unique teacher masks`, and layerwise training diagnostics can still be extracted from server artifacts with the command below if needed.
 
 Server artifact extraction command:
 

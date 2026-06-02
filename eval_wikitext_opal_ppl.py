@@ -26,6 +26,7 @@ from wikitext_opal_utils import (
     C6_STATIC_STRATEGIES,
     aggregate_loss_rows,
     allowed_layers_from_policy,
+    clear_custom_policy,
     collate_wikitext_windows,
     detect_num_layers,
     dtype_from_precision,
@@ -36,6 +37,7 @@ from wikitext_opal_utils import (
     mask_key,
     read_jsonl,
     resolve_skip_budget,
+    set_custom_policy,
     skipped_layers_from_keep_mask,
     static_keep_mask,
     summarize_keep_masks,
@@ -73,13 +75,16 @@ def teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers: in
         dtype=torch.float32,
         device=input_ids.device,
     )
-    with torch.no_grad():
-        return model.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            layer_mask=prefix_mask,
-            use_cache=False,
-        ).last_hidden_state
+    set_custom_policy(model, prefix_mask)
+    try:
+        with torch.no_grad():
+            return model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).last_hidden_state
+    finally:
+        clear_custom_policy(model)
 
 
 def build_router(
@@ -142,15 +147,21 @@ def load_router_checkpoint(path: str, hidden_size: int, num_layers: int, device)
 
 
 def forward_loss_rows(model, input_ids, attention_mask, labels, layer_mask=None):
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        layer_mask=layer_mask,
-        use_cache=False,
-    )
-    rows = lm_loss_stats_from_logits(outputs.logits, labels)
-    del outputs
-    return rows
+    if layer_mask is None:
+        clear_custom_policy(model)
+    else:
+        set_custom_policy(model, layer_mask)
+    try:
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        rows = lm_loss_stats_from_logits(outputs.logits, labels)
+        del outputs
+        return rows
+    finally:
+        clear_custom_policy(model)
 
 
 def load_label_rows(path: str) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
@@ -276,6 +287,7 @@ def train_router(args):
                     "router_prefix_tokens": int(args.router_prefix_tokens),
                     "token_count_train_split": int(len(token_ids)),
                     "target_leakage_guard": "router sees only first router_prefix_tokens; NLL labels score suffix tokens only",
+                    "mask_application": "config.custom_layer_mask",
                 },
                 indent=2,
             )
@@ -344,6 +356,7 @@ def train_router(args):
             "router_input": args.router_input,
             "prompt_only_router_context": True,
             "target_leakage_guard": "router sees only first router_prefix_tokens; eval never loads greedy labels",
+            "mask_application": "config.custom_layer_mask",
             "prefix_depth": int(args.prefix_depth) if args.router_input in ATTENTION_ROUTER_INPUTS else 0,
             "router_features": (
                 ["raw_token_sequence", "hk_token_sequence", "attention_mask", "layer_queries"]
@@ -560,6 +573,7 @@ def eval_method(args):
             "exact_skip_count_rate": float(mask_summary["exact_skip_count_rate"]),
             "uses_greedy_labels_at_eval": False,
             "target_leakage_guard": "router sees only first router_prefix_tokens; PPL scores suffix tokens only",
+            "mask_application": "config.custom_layer_mask",
             "rows": rows if args.save_rows_in_json else [],
         }
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

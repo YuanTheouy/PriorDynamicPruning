@@ -46,6 +46,32 @@ def detect_num_layers(model) -> int:
     raise ValueError("Could not detect decoder layer count.")
 
 
+def set_custom_policy(model, mask_payload) -> None:
+    model.config.custom_layer_mask = mask_payload
+    model.config.custom_layer_actions = None
+    model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    layer_owner = getattr(model, "model", model)
+    if hasattr(layer_owner, "layers"):
+        for layer in layer_owner.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                layer.self_attn.config.custom_layer_mask = mask_payload
+                layer.self_attn.config.custom_layer_actions = None
+                layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+
+
+def clear_custom_policy(model) -> None:
+    model.config.custom_layer_mask = None
+    model.config.custom_layer_actions = None
+    model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    layer_owner = getattr(model, "model", model)
+    if hasattr(layer_owner, "layers"):
+        for layer in layer_owner.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                layer.self_attn.config.custom_layer_mask = None
+                layer.self_attn.config.custom_layer_actions = None
+                layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+
+
 def resolve_skip_budget(
     num_layers: int,
     skip_rate: float,

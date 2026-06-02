@@ -39,6 +39,7 @@ export WIKITEXT_ROUTER_DIM="${WIKITEXT_ROUTER_DIM:-256}"
 export WIKITEXT_ROUTER_HEADS="${WIKITEXT_ROUTER_HEADS:-4}"
 export WIKITEXT_MAX_GRAD_NORM="${WIKITEXT_MAX_GRAD_NORM:-1.0}"
 export WIKITEXT_DATASET_CACHE_DIR="${WIKITEXT_DATASET_CACHE_DIR:-}"
+export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
 if [ -z "${WIKITEXT_DATASET_DISK_PATH:-}" ] && [ -d "/workspace/datasets/wikitext/wikitext-2-raw-v1" ]; then
   export WIKITEXT_DATASET_DISK_PATH="/workspace/datasets/wikitext/wikitext-2-raw-v1"
 else
@@ -71,7 +72,7 @@ cd "$REPO_DIR"
 
 model_tag="$(basename "$WIKITEXT_MODEL_PATH" | tr ' ./:' '____')"
 skip_tag="$(printf "%s" "$WIKITEXT_SKIP_RATE" | tr "." "p")"
-export WIKITEXT_RUN_ID="wikitext2_${model_tag}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}"
+export WIKITEXT_RUN_ID="wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}"
 export WIKITEXT_RESULT_ROOT="${WIKITEXT_RESULT_ROOT:-${REPO_DIR}/results/wikitext2_public_lm_sanity}"
 export WIKITEXT_LABEL_DIR="${WIKITEXT_LABEL_DIR:-${WIKITEXT_RESULT_ROOT}/labels}"
 export WIKITEXT_METRIC_DIR="${WIKITEXT_METRIC_DIR:-${WIKITEXT_RESULT_ROOT}/metrics/${WIKITEXT_RUN_ID}}"
@@ -219,6 +220,7 @@ echo "WIKITEXT_PROTECTED_HEAD=${WIKITEXT_PROTECTED_HEAD}"
 echo "WIKITEXT_PROTECTED_TAIL=${WIKITEXT_PROTECTED_TAIL}"
 echo "WIKITEXT_DATASET_DISK_PATH=${WIKITEXT_DATASET_DISK_PATH}"
 echo "WIKITEXT_DATASET_CACHE_DIR=${WIKITEXT_DATASET_CACHE_DIR}"
+echo "WIKITEXT_MASK_IMPL_TAG=${WIKITEXT_MASK_IMPL_TAG}"
 echo "WIKITEXT_LABEL_FILE=${WIKITEXT_LABEL_FILE}"
 echo "RAW_ROUTER_CKPT=${RAW_ROUTER_CKPT}"
 echo "OPAL_ROUTER_CKPT=${OPAL_ROUTER_CKPT}"
@@ -393,6 +395,25 @@ eval_json "$UNIFORM_TEST_JSON" \
   --batch_size "$WIKITEXT_EVAL_BATCH_SIZE" \
   --precision "$WIKITEXT_PRECISION" \
   --seed "$WIKITEXT_SEED"
+
+python3 - "$FULL_TEST_JSON" "$UNIFORM_TEST_JSON" <<'PY'
+import json
+import math
+import sys
+
+full = json.load(open(sys.argv[1]))
+static = json.load(open(sys.argv[2]))
+skip_count = int(static.get("skip_count") or 0)
+delta = abs(float(static["nll"]) - float(full["nll"]))
+if skip_count > 0 and delta <= 1e-12:
+    print(
+        "Layer-mask sanity failed: Static uniform NLL is exactly equal to Full NLL "
+        f"with skip_count={skip_count}. This usually means the model forward ignored the skip mask.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print(f"Layer-mask sanity ok: static_uniform_delta_nll={float(static['nll']) - float(full['nll']):.12g}")
+PY
 
 eval_json "$ENDS_TEST_JSON" \
   --teacher_model "$WIKITEXT_MODEL_PATH" \

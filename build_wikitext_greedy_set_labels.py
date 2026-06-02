@@ -19,6 +19,7 @@ from transformers import AutoTokenizer, Qwen2ForCausalLM
 
 from wikitext_opal_utils import (
     allowed_layers_from_policy,
+    clear_custom_policy,
     collate_wikitext_windows,
     detect_num_layers,
     dtype_from_precision,
@@ -26,6 +27,7 @@ from wikitext_opal_utils import (
     lm_loss_stats_from_logits,
     load_wikitext_token_ids,
     resolve_skip_budget,
+    set_custom_policy,
     WikitextWindowDataset,
 )
 
@@ -58,15 +60,21 @@ def parse_args():
 
 
 def forward_nll_rows(model, input_ids, attention_mask, labels, layer_mask=None):
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        layer_mask=layer_mask,
-        use_cache=False,
-    )
-    rows = lm_loss_stats_from_logits(outputs.logits, labels)
-    del outputs
-    return rows
+    if layer_mask is None:
+        clear_custom_policy(model)
+    else:
+        set_custom_policy(model, layer_mask)
+    try:
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        rows = lm_loss_stats_from_logits(outputs.logits, labels)
+        del outputs
+        return rows
+    finally:
+        clear_custom_policy(model)
 
 
 def evaluate_candidate_batch(
@@ -297,6 +305,7 @@ def main():
                         "dataset_path": args.dataset_path,
                         "dataset_name": args.dataset_name,
                         "dataset_disk_path": args.dataset_disk_path,
+                        "mask_application": "config.custom_layer_mask",
                         "target_leakage_guard": "router sees only first router_prefix_tokens; NLL scores suffix tokens only",
                     },
                 }
@@ -342,6 +351,7 @@ def main():
             "protected_tail": int(args.protected_tail),
             "allowed_layers": [int(idx) for idx in allowed_layers],
             "candidate_batch_size": int(args.candidate_batch_size),
+            "mask_application": "config.custom_layer_mask",
             "target_leakage_guard": "router sees only first router_prefix_tokens; NLL scores suffix tokens only",
         }
         metadata_path = output_path.with_suffix(output_path.suffix + ".metadata.json")

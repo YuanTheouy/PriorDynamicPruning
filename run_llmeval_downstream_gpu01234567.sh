@@ -15,6 +15,14 @@ export NEXT_PORT="$BASE_PORT"
 export PATH="/root/venvs/planrec/bin:${HOME}/venvs/planrec/bin:${PATH}"
 export PYTHONPATH="${REPO_DIR}/transformers/src:${REPO_DIR}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+# The public lm-eval datasets are small, but Hugging Face may route parquet
+# downloads through Xet/CAS, which is fragile from the server network. These
+# defaults keep unattended runs on the regular HF/mirror path unless the caller
+# explicitly overrides them.
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"
+export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-60}"
 
 export LLMEVAL_MODEL_PATH="${LLMEVAL_MODEL_PATH:-/workspace/ckpts/Qwen2.5-1.5B}"
 export LLMEVAL_TASKS="${LLMEVAL_TASKS:-piqa,openbookqa,winogrande,hellaswag,arc_easy,arc_challenge}"
@@ -234,6 +242,8 @@ echo "LLMEVAL_DTYPE=${LLMEVAL_DTYPE}"
 echo "LLMEVAL_SKIP_COUNT=${LLMEVAL_SKIP_COUNT}"
 echo "LLMEVAL_OUTPUT_ROOT=${LLMEVAL_OUTPUT_ROOT}"
 echo "LLMEVAL_REPORT_MD=${LLMEVAL_REPORT_MD}"
+echo "HF_ENDPOINT=${HF_ENDPOINT}"
+echo "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}"
 echo "Evaluator=lm-evaluation-harness simple_evaluate"
 echo "This script consumes existing WikiText routers/artifacts only; it does not rerun WikiText PPL."
 

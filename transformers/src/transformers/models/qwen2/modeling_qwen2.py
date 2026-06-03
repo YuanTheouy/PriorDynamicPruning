@@ -279,6 +279,15 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         rank = int(config.get("rank", 0))
         if mode == "none" or rank <= 0:
             return hidden_states
+        adapter = getattr(self.self_attn.config, "custom_compensation_adapter", None)
+        if mode == "learned_lowrank" and adapter is not None:
+            start = time.perf_counter()
+            compensated = adapter(hidden_states, layer_idx)
+            stats = getattr(self.self_attn.config, "custom_compensation_runtime_stats", None)
+            if isinstance(stats, dict):
+                stats["calls"] = int(stats.get("calls", 0)) + 1
+                stats["total_sec"] = float(stats.get("total_sec", 0.0)) + (time.perf_counter() - start)
+            return compensated
         rank = max(0, min(rank, hidden_states.shape[-1]))
         if rank <= 0:
             return hidden_states

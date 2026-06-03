@@ -43,6 +43,7 @@ from wikitext_opal_utils import (
     keep_masks_from_skip_risk,
     lm_loss_stats_from_logits,
     load_wikitext_token_ids,
+    LowRankResidualAdapter,
     mask_key,
     read_jsonl,
     related_candidate_masks,
@@ -184,6 +185,56 @@ def load_router_checkpoint(path: str, hidden_size: int, num_layers: int, device)
     return router, metadata
 
 
+def build_lowrank_adapter(num_layers: int, hidden_size: int, rank: int, model_config) -> LowRankResidualAdapter:
+    eps = float(getattr(model_config, "rms_norm_eps", 1e-6))
+    return LowRankResidualAdapter(
+        num_layers=int(num_layers),
+        hidden_size=int(hidden_size),
+        rank=int(rank),
+        eps=eps,
+    )
+
+
+def save_lowrank_adapter_checkpoint(path: str, adapter: LowRankResidualAdapter, metadata: Dict[str, object]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": adapter.state_dict(),
+            "metadata": dict(metadata),
+        },
+        output_path,
+    )
+
+
+def load_lowrank_adapter_checkpoint(path: str, num_layers: int, hidden_size: int, device, model_config):
+    checkpoint = torch.load(path, map_location="cpu")
+    metadata = dict(checkpoint.get("metadata") or {})
+    rank = int(metadata.get("rank") or metadata.get("compensation_rank") or 16)
+    adapter = build_lowrank_adapter(num_layers, hidden_size, rank, model_config)
+    adapter.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+    adapter.to(device).eval()
+    return adapter, metadata
+
+
+def kl_full_to_skipped_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_student = student_logits[..., :-1, :].float().contiguous()
+    shift_teacher = teacher_logits[..., :-1, :].float().contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    valid = shift_labels.ne(-100)
+    if int(valid.sum().item()) <= 0:
+        return shift_student.sum() * 0.0
+    student_log_probs = F.log_softmax(shift_student, dim=-1)
+    teacher_log_probs = F.log_softmax(shift_teacher, dim=-1)
+    token_kl = F.kl_div(
+        student_log_probs,
+        teacher_log_probs,
+        reduction="none",
+        log_target=True,
+    ).sum(dim=-1)
+    return token_kl[valid].mean()
+
+
 def forward_loss_rows(
     model,
     input_ids,
@@ -193,13 +244,20 @@ def forward_loss_rows(
     compensation_mode: str = "none",
     compensation_rank: int = 0,
     compensation_static_gate: float = 1.0,
+    compensation_adapter=None,
 ):
     if layer_mask is None:
         clear_custom_policy(model)
     else:
         comp = compensation_config(compensation_mode, compensation_rank, compensation_static_gate)
         action_payload = action_payload_from_keep_mask(layer_mask) if comp.get("mode") != "none" else None
-        set_custom_policy(model, layer_mask, action_payload=action_payload, compensation_config_payload=comp)
+        set_custom_policy(
+            model,
+            layer_mask,
+            action_payload=action_payload,
+            compensation_config_payload=comp,
+            compensation_adapter=compensation_adapter,
+        )
     try:
         outputs = model(
             input_ids=input_ids,
@@ -213,6 +271,135 @@ def forward_loss_rows(
         return rows
     finally:
         clear_custom_policy(model)
+
+
+def load_mask_runtime(
+    spec: Dict[str, object],
+    model,
+    hidden_size: int,
+    num_layers: int,
+    device,
+    default_skip_count: int,
+    default_allowed_layers: Sequence[int],
+    protected_head: int,
+    protected_tail: int,
+    seed: int,
+) -> Dict[str, object]:
+    method = str(spec.get("method") or "")
+    runtime: Dict[str, object] = {
+        "slug": str(spec.get("slug") or method),
+        "method": method,
+        "method_label": str(spec.get("method_label") or spec.get("label") or method),
+        "allowed_layers": list(default_allowed_layers),
+        "skip_count": int(default_skip_count),
+        "prefix_depth": int(spec.get("prefix_depth") or 4),
+    }
+    if method == "static":
+        strategy = str(spec.get("static_strategy") or "ends_heavy")
+        runtime["static_strategy"] = strategy
+        runtime["static_mask"] = static_keep_mask(
+            strategy,
+            num_layers=num_layers,
+            skip_count=int(default_skip_count),
+            protected_head=protected_head,
+            protected_tail=protected_tail,
+            seed=seed,
+        )
+    elif method == "router":
+        ckpt = str(spec.get("risk_router_ckpt") or "")
+        router, metadata = load_router_checkpoint(ckpt, hidden_size, num_layers, device)
+        runtime["router"] = router
+        runtime["router_metadata"] = metadata
+        runtime["risk_router_ckpt"] = ckpt
+        runtime["allowed_layers"] = metadata.get("allowed_layers") or list(default_allowed_layers)
+        runtime["skip_count"] = int(metadata.get("skip_count") or default_skip_count)
+        runtime["prefix_depth"] = int(metadata.get("prefix_depth") or spec.get("prefix_depth") or 4)
+    elif method == "candidate_router":
+        ckpt = str(spec.get("candidate_router_ckpt") or "")
+        router, metadata = load_candidate_router_checkpoint(ckpt, hidden_size, device)
+        runtime["candidate_router"] = router
+        runtime["candidate_router_metadata"] = metadata
+        runtime["candidate_router_ckpt"] = ckpt
+        runtime["allowed_layers"] = metadata.get("allowed_layers") or list(default_allowed_layers)
+        runtime["skip_count"] = int(metadata.get("skip_count") or default_skip_count)
+    elif method == "ig":
+        artifact = str(spec.get("ig_artifact") or "")
+        centers, metadata = load_ig_artifact(artifact, device)
+        runtime["ig_centers"] = centers
+        runtime["ig_metadata"] = metadata
+        runtime["ig_artifact"] = artifact
+        runtime["allowed_layers"] = metadata.get("allowed_layers") or list(default_allowed_layers)
+        runtime["skip_count"] = int(metadata.get("skip_count") or default_skip_count)
+    else:
+        raise ValueError(f"Unsupported mask runtime method: {method}")
+    return runtime
+
+
+def keep_masks_for_runtime(
+    runtime: Dict[str, object],
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    router_prefix_tokens: int,
+    num_layers: int,
+) -> Tuple[List[List[int]], List[Optional[str]]]:
+    method = str(runtime["method"])
+    selected_candidate_ids: List[Optional[str]] = [None for _ in range(input_ids.size(0))]
+    if method == "static":
+        return [list(runtime["static_mask"]) for _ in range(input_ids.size(0))], selected_candidate_ids
+    if method == "router":
+        router_input_ids, router_attention_mask = router_prefix_batch(
+            input_ids,
+            attention_mask,
+            router_prefix_tokens,
+        )
+        metadata = dict(runtime.get("router_metadata") or {})
+        pred_risk = router_forward(
+            runtime["router"],
+            str(metadata.get("router_input") or "raw_embedding"),
+            model,
+            router_input_ids,
+            router_attention_mask,
+            num_layers,
+            int(runtime.get("prefix_depth") or 4),
+        )
+        return keep_masks_from_skip_risk(
+            pred_risk,
+            skip_count=int(runtime["skip_count"]),
+            allowed_layers=runtime["allowed_layers"],
+        ), selected_candidate_ids
+    if method == "candidate_router":
+        router_input_ids, router_attention_mask = router_prefix_batch(
+            input_ids,
+            attention_mask,
+            router_prefix_tokens,
+        )
+        metadata = dict(runtime["candidate_router_metadata"])
+        pred_delta = runtime["candidate_router"](raw_embedding_state(model, router_input_ids, router_attention_mask))
+        candidate_indices = pred_delta.float().argmin(dim=1).detach().cpu().tolist()
+        candidate_ids = [str(value) for value in metadata["candidate_ids"]]
+        candidate_keep_masks = metadata["candidate_keep_masks"]
+        keep_masks = [[int(v) for v in candidate_keep_masks[int(idx)]] for idx in candidate_indices]
+        selected_candidate_ids = [candidate_ids[int(idx)] for idx in candidate_indices]
+        return keep_masks, selected_candidate_ids
+    if method == "ig":
+        router_input_ids, router_attention_mask = router_prefix_batch(
+            input_ids,
+            attention_mask,
+            router_prefix_tokens,
+        )
+        metadata = dict(runtime["ig_metadata"])
+        state = F.normalize(raw_embedding_state(model, router_input_ids, router_attention_mask).float(), dim=-1)
+        distances = torch.cdist(state.float(), runtime["ig_centers"].float(), p=2)
+        clusters = distances.argmin(dim=1).detach().cpu().tolist()
+        cluster_candidate_indices = [int(idx) for idx in metadata["cluster_candidate_indices"]]
+        candidate_ids = [str(value) for value in metadata["candidate_ids"]]
+        candidate_keep_masks = metadata["candidate_keep_masks"]
+        candidate_indices = [cluster_candidate_indices[int(cluster_idx)] for cluster_idx in clusters]
+        keep_masks = [[int(v) for v in candidate_keep_masks[int(idx)]] for idx in candidate_indices]
+        selected_candidate_ids = [candidate_ids[int(idx)] for idx in candidate_indices]
+        return keep_masks, selected_candidate_ids
+    raise ValueError(f"Unsupported mask runtime method: {method}")
 
 
 def load_label_rows(path: str) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
@@ -1154,6 +1341,186 @@ def train_router(args):
         print(f"Saved router checkpoint to {output_dir / 'risk_router.pt'}")
 
 
+def train_shared_compensation_adapter(args):
+    if args.method_specs_json:
+        method_specs = json.loads(Path(args.method_specs_json).read_text(encoding="utf-8"))
+    else:
+        raise ValueError("--method_specs_json is required")
+    if not isinstance(method_specs, list) or not method_specs:
+        raise ValueError("--method_specs_json must contain a non-empty list")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(args.seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    dataset, token_ids = make_dataset_for_split(
+        args,
+        tokenizer,
+        selected_window_ids=None,
+        max_windows=int(args.train_windows),
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda batch: collate_wikitext_windows(batch, args.router_prefix_tokens),
+    )
+
+    model = Qwen2ForCausalLM.from_pretrained(
+        args.teacher_model,
+        torch_dtype=dtype_from_precision(args.precision),
+    )
+    model.to(device).eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    num_layers = detect_num_layers(model)
+    hidden_size = int(model.config.hidden_size)
+    skip_count, keep_count = resolve_skip_budget(num_layers, args.skip_rate, args.skip_count)
+    allowed_layers = allowed_layers_from_policy(num_layers, args.protected_head, args.protected_tail)
+
+    runtimes = [
+        load_mask_runtime(
+            spec,
+            model,
+            hidden_size,
+            num_layers,
+            device,
+            skip_count,
+            allowed_layers,
+            args.protected_head,
+            args.protected_tail,
+            args.seed,
+        )
+        for spec in method_specs
+    ]
+    adapter = build_lowrank_adapter(num_layers, hidden_size, args.compensation_rank, model.config).to(device)
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    comp = compensation_config("learned_lowrank", args.compensation_rank, args.compensation_static_gate)
+
+    metadata = {
+        "method": "wikitext2_shared_lowrank_residual_compensation",
+        "adapter_formula": "h_out = h_in + B_l A_l RMSNorm(h_in)",
+        "scope": "single_shared_adapter_across_methods",
+        "teacher_model": args.teacher_model,
+        "dataset": "wikitext-2-raw-v1",
+        "dataset_disk_path": args.dataset_disk_path,
+        "split": args.split,
+        "seq_len": int(args.seq_len),
+        "router_prefix_tokens": int(args.router_prefix_tokens),
+        "train_windows": int(len(dataset)),
+        "token_count_train_split": int(len(token_ids)),
+        "num_layers": int(num_layers),
+        "hidden_size": int(hidden_size),
+        "rank": int(args.compensation_rank),
+        "adapter_param_count": int(adapter.parameter_count()),
+        "skip_rate": float(args.skip_rate),
+        "skip_count": int(skip_count),
+        "keep_count": int(keep_count),
+        "protected_head": int(args.protected_head),
+        "protected_tail": int(args.protected_tail),
+        "allowed_layers": [int(idx) for idx in allowed_layers],
+        "epochs": int(args.epochs),
+        "lr": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "kl_temperature": float(args.kl_temperature),
+        "base_model_frozen": True,
+        "method_specs": method_specs,
+        "target_leakage_guard": "adapter is trained on train split only; eval/test path does not load labels",
+    }
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(json.dumps(metadata, indent=2))
+
+    history = []
+    for epoch in range(int(args.epochs)):
+        adapter.train()
+        total_loss = 0.0
+        total_steps = 0
+        iterator = tqdm(dataloader, desc=f"shared-comp epoch {epoch + 1}/{args.epochs}")
+        for batch in iterator:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            with torch.no_grad():
+                clear_custom_policy(model)
+                teacher_outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+                teacher_logits = teacher_outputs.logits.detach()
+                del teacher_outputs
+
+            optimizer.zero_grad(set_to_none=True)
+            loss_values = []
+            for runtime in runtimes:
+                keep_masks, _ = keep_masks_for_runtime(
+                    runtime,
+                    model,
+                    input_ids,
+                    attention_mask,
+                    args.router_prefix_tokens,
+                    num_layers,
+                )
+                layer_mask = torch.tensor(keep_masks, dtype=torch.float32, device=device)
+                action_payload = action_payload_from_keep_mask(layer_mask)
+                set_custom_policy(
+                    model,
+                    layer_mask,
+                    action_payload=action_payload,
+                    compensation_config_payload=comp,
+                    compensation_adapter=adapter,
+                )
+                student_outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+                loss_i = kl_full_to_skipped_loss(
+                    student_outputs.logits / float(args.kl_temperature),
+                    teacher_logits / float(args.kl_temperature),
+                    labels,
+                ) * (float(args.kl_temperature) ** 2)
+                if not torch.isfinite(loss_i.detach()):
+                    raise FloatingPointError(
+                        f"Non-finite shared compensation loss: {float(loss_i.detach().float().item())}"
+                    )
+                (loss_i / float(len(runtimes))).backward()
+                loss_values.append(float(loss_i.detach().float().item()))
+                del student_outputs
+                clear_custom_policy(model)
+            loss_value = float(sum(loss_values) / max(1, len(loss_values)))
+            if float(args.max_grad_norm) > 0:
+                torch.nn.utils.clip_grad_norm_(adapter.parameters(), float(args.max_grad_norm))
+            optimizer.step()
+            total_loss += loss_value
+            total_steps += 1
+            iterator.set_postfix({"loss": f"{loss_value:.6f}"})
+            del teacher_logits
+
+        epoch_metrics = {
+            "epoch": int(epoch + 1),
+            "loss": float(total_loss / max(1, total_steps)),
+            "steps": int(total_steps),
+        }
+        history.append(epoch_metrics)
+        print(f"Epoch {epoch + 1} finished: {json.dumps(epoch_metrics)}")
+
+    adapter.eval()
+    checkpoint_path = output_dir / "shared_lowrank_adapter.pt"
+    save_lowrank_adapter_checkpoint(str(checkpoint_path), adapter, metadata)
+    (output_dir / "training_metrics.json").write_text(
+        json.dumps({"metadata": metadata, "history": history}, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Saved shared compensation adapter to {checkpoint_path}")
+
+
 def eval_method(args):
     accelerator = Accelerator()
     device = accelerator.device
@@ -1223,6 +1590,18 @@ def eval_method(args):
             protected_head=args.protected_head,
             protected_tail=args.protected_tail,
             seed=args.seed,
+        )
+    compensation_adapter = None
+    compensation_adapter_metadata: Dict[str, object] = {}
+    if args.compensation_mode == "learned_lowrank":
+        if not args.compensation_adapter_ckpt:
+            raise ValueError("--compensation_adapter_ckpt is required for learned_lowrank compensation")
+        compensation_adapter, compensation_adapter_metadata = load_lowrank_adapter_checkpoint(
+            args.compensation_adapter_ckpt,
+            num_layers,
+            hidden_size,
+            device,
+            model.config,
         )
 
     output_path = Path(args.output_json)
@@ -1309,6 +1688,7 @@ def eval_method(args):
                 compensation_mode=args.compensation_mode,
                 compensation_rank=args.compensation_rank,
                 compensation_static_gate=args.compensation_static_gate,
+                compensation_adapter=compensation_adapter,
             )
             for sample_id, window_start, stats, keep_mask, candidate_id in zip(
                 sample_ids,
@@ -1404,6 +1784,13 @@ def eval_method(args):
                 args.compensation_mode,
                 args.compensation_rank if args.method != "full" else 0,
                 args.compensation_static_gate,
+            ),
+            "compensation_adapter_ckpt": args.compensation_adapter_ckpt if args.compensation_mode == "learned_lowrank" else "",
+            "compensation_adapter_metadata": compensation_adapter_metadata,
+            "compensation_adapter_param_count": int(
+                compensation_adapter_metadata.get("adapter_param_count", 0)
+                if compensation_adapter_metadata
+                else 0
             ),
             "compensation_runtime_calls": int(max([int(row.get("compensation_runtime_calls", 0)) for row in rows] or [0])),
             "compensation_runtime_total_sec": float(max([float(row.get("compensation_runtime_total_sec", 0.0)) for row in rows] or [0.0])),
@@ -2120,6 +2507,27 @@ def build_parser():
     train.add_argument("--epoch_checkpoint_dir", default="")
     train.set_defaults(func=train_router)
 
+    comp_train = sub.add_parser("train_shared_compensation_adapter")
+    add_data_args(comp_train)
+    comp_train.add_argument("--method_specs_json", required=True)
+    comp_train.add_argument("--train_windows", type=int, default=2000)
+    comp_train.add_argument("--sample_strategy", choices=["first", "random"], default="random")
+    comp_train.add_argument("--sample_seed", type=int, default=42)
+    comp_train.add_argument("--skip_rate", type=float, default=0.25)
+    comp_train.add_argument("--skip_count", type=int, default=7)
+    comp_train.add_argument("--protected_head", type=int, default=4)
+    comp_train.add_argument("--protected_tail", type=int, default=2)
+    comp_train.add_argument("--batch_size", type=int, default=1)
+    comp_train.add_argument("--epochs", type=int, default=1)
+    comp_train.add_argument("--lr", type=float, default=1e-4)
+    comp_train.add_argument("--weight_decay", type=float, default=0.0)
+    comp_train.add_argument("--max_grad_norm", type=float, default=1.0)
+    comp_train.add_argument("--compensation_rank", type=int, default=16)
+    comp_train.add_argument("--compensation_static_gate", type=float, default=1.0)
+    comp_train.add_argument("--kl_temperature", type=float, default=1.0)
+    comp_train.add_argument("--output_dir", required=True)
+    comp_train.set_defaults(func=train_shared_compensation_adapter)
+
     eval_p = sub.add_parser("eval")
     add_data_args(eval_p)
     eval_p.add_argument("--eval_windows", type=int, default=512)
@@ -2140,6 +2548,7 @@ def build_parser():
     eval_p.add_argument("--compensation_mode", default="none")
     eval_p.add_argument("--compensation_rank", type=int, default=0)
     eval_p.add_argument("--compensation_static_gate", type=float, default=1.0)
+    eval_p.add_argument("--compensation_adapter_ckpt", default="")
     eval_p.add_argument("--run_name", required=True)
     eval_p.add_argument("--output_json", required=True)
     eval_p.add_argument("--save_rows_in_json", action="store_true")

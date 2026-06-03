@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
@@ -76,6 +77,48 @@ def compensation_config(mode: str = "none", rank: int = 0, static_gate: float = 
     }
 
 
+class LowRankResidualAdapter(nn.Module):
+    """Per-layer low-rank residual repair: h + B_l A_l RMSNorm(h)."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_size: int,
+        rank: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.num_layers = int(num_layers)
+        self.hidden_size = int(hidden_size)
+        self.rank = int(rank)
+        self.eps = float(eps)
+        if self.num_layers <= 0 or self.hidden_size <= 0 or self.rank <= 0:
+            raise ValueError(
+                f"Invalid LowRankResidualAdapter shape: "
+                f"num_layers={num_layers}, hidden_size={hidden_size}, rank={rank}"
+            )
+        self.norm_weight = nn.Parameter(torch.ones(self.num_layers, self.hidden_size))
+        self.down = nn.Parameter(torch.empty(self.num_layers, self.hidden_size, self.rank))
+        self.up = nn.Parameter(torch.zeros(self.num_layers, self.rank, self.hidden_size))
+        nn.init.normal_(self.down, mean=0.0, std=0.02)
+
+    def parameter_count(self) -> int:
+        return int(sum(param.numel() for param in self.parameters()))
+
+    def forward(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        layer_idx = int(layer_idx)
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            return hidden_states
+        original_dtype = hidden_states.dtype
+        x = hidden_states.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = x * self.norm_weight[layer_idx].float()
+        z = torch.matmul(x, self.down[layer_idx].float())
+        residual = torch.matmul(z, self.up[layer_idx].float())
+        return hidden_states + residual.to(dtype=original_dtype)
+
+
 def action_payload_from_keep_mask(mask_payload):
     """Map keep masks to Qwen2 layer actions: 1=compute, 2=compensate skipped."""
     if mask_payload is None:
@@ -101,7 +144,13 @@ def compensation_runtime_stats(model) -> Dict[str, float]:
     }
 
 
-def set_custom_policy(model, mask_payload, action_payload=None, compensation_config_payload=None) -> None:
+def set_custom_policy(
+    model,
+    mask_payload,
+    action_payload=None,
+    compensation_config_payload=None,
+    compensation_adapter=None,
+) -> None:
     config = compensation_config_payload or {"mode": "none", "rank": 0}
     stats = getattr(model.config, "custom_compensation_runtime_stats", None)
     if not isinstance(stats, dict):
@@ -109,6 +158,7 @@ def set_custom_policy(model, mask_payload, action_payload=None, compensation_con
     model.config.custom_layer_mask = mask_payload
     model.config.custom_layer_actions = action_payload
     model.config.custom_compensation_config = config
+    model.config.custom_compensation_adapter = compensation_adapter
     model.config.custom_compensation_runtime_stats = stats
     layer_owner = getattr(model, "model", model)
     if hasattr(layer_owner, "layers"):
@@ -117,6 +167,7 @@ def set_custom_policy(model, mask_payload, action_payload=None, compensation_con
                 layer.self_attn.config.custom_layer_mask = mask_payload
                 layer.self_attn.config.custom_layer_actions = action_payload
                 layer.self_attn.config.custom_compensation_config = config
+                layer.self_attn.config.custom_compensation_adapter = compensation_adapter
                 layer.self_attn.config.custom_compensation_runtime_stats = model.config.custom_compensation_runtime_stats
 
 
@@ -125,6 +176,7 @@ def clear_custom_policy(model) -> None:
     model.config.custom_layer_mask = None
     model.config.custom_layer_actions = None
     model.config.custom_compensation_config = {"mode": "none", "rank": 0}
+    model.config.custom_compensation_adapter = None
     model.config.custom_compensation_runtime_stats = stats
     layer_owner = getattr(model, "model", model)
     if hasattr(layer_owner, "layers"):
@@ -133,6 +185,7 @@ def clear_custom_policy(model) -> None:
                 layer.self_attn.config.custom_layer_mask = None
                 layer.self_attn.config.custom_layer_actions = None
                 layer.self_attn.config.custom_compensation_config = {"mode": "none", "rank": 0}
+                layer.self_attn.config.custom_compensation_adapter = None
                 layer.self_attn.config.custom_compensation_runtime_stats = stats
 
 

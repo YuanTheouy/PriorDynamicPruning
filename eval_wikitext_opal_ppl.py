@@ -19,7 +19,7 @@ transformers_src_path = os.path.join(current_dir, "transformers", "src")
 sys.path.insert(0, transformers_src_path)
 sys.path.insert(0, current_dir)
 
-from transformers import AutoTokenizer, Qwen2ForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from models.opal_risk_router import (
     LayerQueryCrossAttentionRiskRouter,
@@ -512,7 +512,7 @@ def build_candidate_labels(args):
     )
     dataloader = accelerator.prepare(dataloader)
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )
@@ -703,7 +703,7 @@ def train_candidate_router(args):
         collate_fn=lambda batch: collate_wikitext_windows(batch, args.router_prefix_tokens),
     )
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )
@@ -943,7 +943,7 @@ def build_ig_artifact(args):
     )
     dataloader = accelerator.prepare(dataloader)
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )
@@ -1119,7 +1119,7 @@ def train_router(args):
         collate_fn=lambda batch: collate_wikitext_windows(batch, args.router_prefix_tokens),
     )
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )
@@ -1370,7 +1370,7 @@ def train_shared_compensation_adapter(args):
         collate_fn=lambda batch: collate_wikitext_windows(batch, args.router_prefix_tokens),
     )
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )
@@ -1545,7 +1545,7 @@ def eval_method(args):
     )
     dataloader = accelerator.prepare(dataloader)
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )
@@ -1838,7 +1838,7 @@ def diagnose_overlap(args):
     )
     dataloader = accelerator.prepare(dataloader)
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )

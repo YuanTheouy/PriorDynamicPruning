@@ -46,6 +46,7 @@ export LLMEVAL_PREFETCH_LIMIT="${LLMEVAL_PREFETCH_LIMIT:-1}"
 export LLMEVAL_COMPENSATION_MODE="${LLMEVAL_COMPENSATION_MODE:-none}"
 export LLMEVAL_COMPENSATION_RANK="${LLMEVAL_COMPENSATION_RANK:-0}"
 export LLMEVAL_COMPENSATION_STATIC_GATE="${LLMEVAL_COMPENSATION_STATIC_GATE:-1.0}"
+export LLMEVAL_COMPENSATION_ADAPTER_CKPT="${LLMEVAL_COMPENSATION_ADAPTER_CKPT:-}"
 
 cd "$REPO_DIR"
 
@@ -257,6 +258,7 @@ eval_method() {
     --compensation_mode "$LLMEVAL_COMPENSATION_MODE" \
     --compensation_rank "$LLMEVAL_COMPENSATION_RANK" \
     --compensation_static_gate "$LLMEVAL_COMPENSATION_STATIC_GATE" \
+    --compensation_adapter_ckpt "$LLMEVAL_COMPENSATION_ADAPTER_CKPT" \
     --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
     --seed "$seed" \
     --limit "$LLMEVAL_LIMIT" \
@@ -305,6 +307,7 @@ run_direct_eval_on_gpu() {
     --compensation_mode "$LLMEVAL_COMPENSATION_MODE" \
     --compensation_rank "$LLMEVAL_COMPENSATION_RANK" \
     --compensation_static_gate "$LLMEVAL_COMPENSATION_STATIC_GATE" \
+    --compensation_adapter_ckpt "$LLMEVAL_COMPENSATION_ADAPTER_CKPT" \
     --prefix_depth "$LLMEVAL_PREFIX_DEPTH" \
     --seed "$seed" \
     --limit "$limit_override" \
@@ -441,10 +444,15 @@ echo "LLMEVAL_PREFETCH_LIMIT=${LLMEVAL_PREFETCH_LIMIT}"
 echo "LLMEVAL_COMPENSATION_MODE=${LLMEVAL_COMPENSATION_MODE}"
 echo "LLMEVAL_COMPENSATION_RANK=${LLMEVAL_COMPENSATION_RANK}"
 echo "LLMEVAL_COMPENSATION_STATIC_GATE=${LLMEVAL_COMPENSATION_STATIC_GATE}"
+echo "LLMEVAL_COMPENSATION_ADAPTER_CKPT=${LLMEVAL_COMPENSATION_ADAPTER_CKPT}"
 echo "HF_ENDPOINT=${HF_ENDPOINT}"
 echo "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}"
 echo "Evaluator=lm-evaluation-harness simple_evaluate"
 echo "This script consumes existing WikiText routers/artifacts only; it does not rerun WikiText PPL."
+
+if [ "$LLMEVAL_COMPENSATION_MODE" = "learned_lowrank" ]; then
+  require_file "$LLMEVAL_COMPENSATION_ADAPTER_CKPT"
+fi
 
 for seed in $LLMEVAL_SEEDS; do
   echo "=== Seed ${seed}: resolve existing WikiText artifacts ==="
@@ -504,6 +512,7 @@ python3 ./eval_lm_eval_harness_opal.py summarize \
   --compensation_mode "$LLMEVAL_COMPENSATION_MODE" \
   --compensation_rank "$LLMEVAL_COMPENSATION_RANK" \
   --compensation_static_gate "$LLMEVAL_COMPENSATION_STATIC_GATE" \
+  --compensation_adapter_ckpt "$LLMEVAL_COMPENSATION_ADAPTER_CKPT" \
   --date "$(date +%F)"
 
 echo "=== Done: downstream lm-eval-style run ==="

@@ -26,6 +26,7 @@ from lm_eval.models.utils_hf import pad_and_concat
 from eval_wikitext_opal_ppl import (
     load_candidate_router_checkpoint,
     load_ig_artifact,
+    load_lowrank_adapter_checkpoint,
     load_router_checkpoint,
     raw_embedding_state,
     router_forward,
@@ -127,6 +128,7 @@ class OpalHarnessLM(HFLM):
         compensation_mode: str = "none",
         compensation_rank: int = 0,
         compensation_static_gate: float = 1.0,
+        compensation_adapter_ckpt: str = "",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -153,6 +155,21 @@ class OpalHarnessLM(HFLM):
         self.method_state: Dict[str, object] = {}
         hidden_size = int(self.model.config.hidden_size)
         num_layers = len(self.model.model.layers)
+        self.compensation_adapter = None
+        self.compensation_adapter_metadata: Dict[str, object] = {}
+        if self.compensation_config.get("mode") == "learned_lowrank":
+            if not compensation_adapter_ckpt:
+                raise ValueError("--compensation_adapter_ckpt is required for learned_lowrank compensation")
+            self.compensation_adapter, self.compensation_adapter_metadata = load_lowrank_adapter_checkpoint(
+                compensation_adapter_ckpt,
+                num_layers,
+                hidden_size,
+                self.device,
+                self.model.config,
+            )
+            self.compensation_adapter_ckpt = str(compensation_adapter_ckpt)
+        else:
+            self.compensation_adapter_ckpt = ""
 
         if self.opal_method == "static":
             self.method_state["static_mask"] = static_keep_mask(
@@ -307,6 +324,7 @@ class OpalHarnessLM(HFLM):
                 layer_mask,
                 action_payload=action_payload,
                 compensation_config_payload=self.compensation_config,
+                compensation_adapter=self.compensation_adapter,
             )
         try:
             with torch.no_grad(), torch.autocast(
@@ -469,6 +487,7 @@ def run_eval(args):
         compensation_mode=args.compensation_mode,
         compensation_rank=args.compensation_rank,
         compensation_static_gate=args.compensation_static_gate,
+        compensation_adapter_ckpt=args.compensation_adapter_ckpt,
         batch_size=args.batch_size,
         max_length=args.max_length,
         dtype=args.dtype,
@@ -557,6 +576,13 @@ def run_eval(args):
         "lm_eval_versions": results.get("versions", {}),
         "mask_application": "config.custom_layer_mask",
         "compensation": lm.compensation_config,
+        "compensation_adapter_ckpt": lm.compensation_adapter_ckpt,
+        "compensation_adapter_metadata": lm.compensation_adapter_metadata,
+        "compensation_adapter_param_count": int(
+            lm.compensation_adapter_metadata.get("adapter_param_count", 0)
+            if lm.compensation_adapter_metadata
+            else 0
+        ),
         **compensation_runtime_stats(lm.model),
         "target_leakage_guard": "lm-eval-harness builds prompts; router masks use context tokens only, never continuation tokens",
     }
@@ -636,6 +662,7 @@ def summarize(args):
         f"- skip_rate / skip_count: `{args.skip_rate}` / `{args.skip_count}`",
         f"- protected_head / protected_tail: `{args.protected_head}` / `{args.protected_tail}`",
         f"- compensation: `{args.compensation_mode}` rank `{args.compensation_rank}` gate `{args.compensation_static_gate}`",
+        f"- compensation_adapter_ckpt: `{args.compensation_adapter_ckpt}`",
         "- mask leakage guard: harness builds context/continuation; router masks use context tokens only",
         "",
         "## Per-Seed Task Results",
@@ -801,6 +828,7 @@ def build_parser():
     eval_p.add_argument("--compensation_mode", default="none")
     eval_p.add_argument("--compensation_rank", type=int, default=0)
     eval_p.add_argument("--compensation_static_gate", type=float, default=1.0)
+    eval_p.add_argument("--compensation_adapter_ckpt", default="")
     eval_p.add_argument("--num_fewshot", type=int, default=0)
     eval_p.add_argument("--limit", type=float, default=0)
     eval_p.add_argument("--seed", type=int, default=42)
@@ -825,6 +853,7 @@ def build_parser():
     report.add_argument("--compensation_mode", default="none")
     report.add_argument("--compensation_rank", type=int, default=0)
     report.add_argument("--compensation_static_gate", type=float, default=1.0)
+    report.add_argument("--compensation_adapter_ckpt", default="")
     report.add_argument("--date", default="2026-06-02")
     report.set_defaults(func=summarize)
     return parser

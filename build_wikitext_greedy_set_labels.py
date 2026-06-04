@@ -15,7 +15,7 @@ transformers_src_path = os.path.join(current_dir, "transformers", "src")
 sys.path.insert(0, transformers_src_path)
 sys.path.insert(0, current_dir)
 
-from transformers import AutoTokenizer, Qwen2ForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from wikitext_opal_utils import (
     allowed_layers_from_policy,
@@ -214,7 +214,7 @@ def main():
     )
     dataloader = accelerator.prepare(dataloader)
 
-    model = Qwen2ForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model,
         torch_dtype=dtype_from_precision(args.precision),
     )
@@ -302,6 +302,8 @@ def main():
                     "greedy_steps": steps,
                     "metadata": {
                         "teacher_model": args.teacher_model,
+                        "teacher_model_class": type(model).__name__,
+                        "teacher_config_model_type": str(getattr(model.config, "model_type", "")),
                         "dataset_path": args.dataset_path,
                         "dataset_name": args.dataset_name,
                         "dataset_disk_path": args.dataset_disk_path,
@@ -327,6 +329,8 @@ def main():
                 f.write(json.dumps(row) + "\n")
         metadata = {
             "teacher_model": args.teacher_model,
+            "teacher_model_class": type(model).__name__,
+            "teacher_config_model_type": str(getattr(model.config, "model_type", "")),
             "dataset_path": args.dataset_path,
             "dataset_name": args.dataset_name,
             "dataset_disk_path": args.dataset_disk_path,

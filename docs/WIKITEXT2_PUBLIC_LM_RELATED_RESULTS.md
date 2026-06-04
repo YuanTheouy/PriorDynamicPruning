@@ -474,6 +474,39 @@ Old OPAL baselines are not wired into the current WikiText-2 runner yet. Do not 
 - do not write: "OPAL's dynamic mask diversity dominates on WikiText-2." The three-seed table does not support that.
 - safe write: "On WikiText-2, validation-selected OPAL-SetBCE achieves lower three-seed mean PPL than Raw-SetBCE best-on-val, a stronger-access layerwise hidden router, fixed static masks, and candidate-library PuDDing/IG-style baselines. The selected OPAL checkpoints are low-diversity (`unique_masks` near 1), so we interpret this as a static-like validation-selected public LM sanity rather than a dynamic mask-diversity result."
 
+## Qwen3-8B Clean K9 Addendum
+
+Detailed audit log: `docs/WIKITEXT2_QWEN3_8B_CLEAN_K9_AUDIT.md`.
+
+The old Qwen3 K9 artifacts with Full PPL around `35191` and Raw best-on-val test PPL `223.70` are invalid. The old greedy label file had `NLL_full mean=10.3924`, `PPL_full median=33399.01`, and `Delta_NLL mean=-2.357`, proving that the Full scoring path was already poisoned. These artifacts should not be cited.
+
+The clean Qwen3 K9 label/run id is:
+
+`wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_seq1024_pref256_m2000_seed42_skip0p25`
+
+Clean Qwen3 K9 seed42 related-baseline results:
+
+| method | NLL | PPL | Delta_NLL | Delta_PPL | unique_masks | conclusion |
+|---|---:|---:|---:|---:|---:|---|
+| Full | 2.2523 | 9.5100 | 0.0000 | 0.0000 | 1 | clean baseline |
+| Static best-on-val C6 | 3.2548 | 25.9140 | 1.0024 | 16.4040 | 1 | static reference |
+| PuDDing-style | 3.2625 | 26.1159 | 1.0102 | 16.6059 | 5 | candidate baseline |
+| IG-style | 3.2648 | 26.1749 | 1.0125 | 16.6649 | 2 | candidate baseline |
+| layerwise_hidden_router | 3.0952 | 22.0914 | 0.8428 | 12.5814 | 204 | stronger-access baseline |
+| Raw-SetBCE final | 3.0151 | 20.3915 | 0.7628 | 10.8814 | 224 | best final BCE row |
+| OPAL-SetBCE final | 3.0341 | 20.7827 | 0.7818 | 11.2727 | 247 | beats static/candidate/layerwise, trails Raw final |
+
+Clean Qwen3 K9 BCE validation diagnostics:
+
+| method | checkpoint | train_BCE | train overlap@9 | train exact_match | val_PPL | unique_masks |
+|---|---|---:|---:|---:|---:|---:|
+| Raw-SetBCE | epoch1 | 0.374393 | 0.6518 | 0.0025 | 19.9038 | 8 |
+| Raw-SetBCE | epoch40 | 0.125054 | 0.9514 | 0.6245 | 21.5621 | 199 |
+| OPAL-SetBCE | epoch1 | 0.556382 | 0.6492 | 0.0025 | 19.8515 | 1 |
+| OPAL-SetBCE | epoch40 | 0.038534 | 0.9827 | 0.8555 | 21.5494 | 214 |
+
+Readout: lower BCE and higher greedy-label overlap do not imply better validation PPL on clean Qwen3. This is the concrete reason to run the Exact-K CE loss ablation on the same clean labels. Until that ablation is complete, cite Qwen3 as valid but diagnostically mixed: dynamic BCE routers work and beat static/candidate baselines, while final OPAL-SetBCE still slightly trails Raw-SetBCE and shows a surrogate-loss mismatch.
+
 ## Commands
 
 Run related baselines:

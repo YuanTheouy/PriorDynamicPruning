@@ -34,6 +34,8 @@ export WIKITEXT_LR="${WIKITEXT_LR:-1e-4}"
 export WIKITEXT_ROUTER_DIM="${WIKITEXT_ROUTER_DIM:-256}"
 export WIKITEXT_ROUTER_HEADS="${WIKITEXT_ROUTER_HEADS:-4}"
 export WIKITEXT_MAX_GRAD_NORM="${WIKITEXT_MAX_GRAD_NORM:-1.0}"
+export WIKITEXT_SET_LOSS_TYPE="${WIKITEXT_SET_LOSS_TYPE:-bce}"
+export WIKITEXT_EXACT_K_SCORE_CLIP="${WIKITEXT_EXACT_K_SCORE_CLIP:-50.0}"
 export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
 export WIKITEXT_VALCKPT_PARALLEL_WORKERS="${WIKITEXT_VALCKPT_PARALLEL_WORKERS:-$NUM_GPUS}"
 export WIKITEXT_VALCKPT_OMP_NUM_THREADS="${WIKITEXT_VALCKPT_OMP_NUM_THREADS:-2}"
@@ -84,7 +86,8 @@ export WIKITEXT_RUN_ID="${WIKITEXT_RUN_ID:-${WIKITEXT_LABEL_RUN_ID}${prefix_dept
 export WIKITEXT_RESULT_ROOT="${WIKITEXT_RESULT_ROOT:-${REPO_DIR}/results/wikitext2_public_lm_sanity}"
 export WIKITEXT_LABEL_FILE="${WIKITEXT_RESULT_ROOT}/labels/${WIKITEXT_LABEL_RUN_ID}_delta_nll_greedy_set_labels.jsonl"
 export WIKITEXT_VALCKPT_ROOT="${WIKITEXT_VALCKPT_ROOT:-${REPO_DIR}/policy_ckpts/wikitext2_public_lm_val_ckpt/${WIKITEXT_RUN_ID}}"
-export WIKITEXT_VALCKPT_DIR="${WIKITEXT_VALCKPT_ROOT}/prefix_hk_raw_attn_bce"
+export WIKITEXT_LOSS_DIR_TAG="${WIKITEXT_SET_LOSS_TYPE}"
+export WIKITEXT_VALCKPT_DIR="${WIKITEXT_VALCKPT_ROOT}/prefix_hk_raw_attn_${WIKITEXT_LOSS_DIR_TAG}"
 export WIKITEXT_EPOCH_CKPT_DIR="${WIKITEXT_VALCKPT_DIR}/epoch_checkpoints"
 export WIKITEXT_VAL_METRIC_DIR="${WIKITEXT_RESULT_ROOT}/val_ckpt_metrics/${WIKITEXT_RUN_ID}"
 export WIKITEXT_BEST_JSON="${WIKITEXT_VAL_METRIC_DIR}/best_validation_checkpoint.json"
@@ -203,7 +206,7 @@ eval_epoch_checkpoint_single_gpu() {
     --router_prefix_tokens "$WIKITEXT_ROUTER_PREFIX_TOKENS" \
     --eval_windows "$WIKITEXT_EVAL_WINDOWS" \
     --method router \
-    --method_label "OPAL-SetBCE epoch${epoch} validation" \
+    --method_label "OPAL-${WIKITEXT_SET_LOSS_TYPE} epoch${epoch} validation" \
     --risk_router_ckpt "$ckpt" \
     --prefix_depth "$WIKITEXT_PREFIX_DEPTH" \
     --skip_rate "$WIKITEXT_SKIP_RATE" \
@@ -309,6 +312,7 @@ echo "WIKITEXT_RUN_ID=${WIKITEXT_RUN_ID}"
 echo "WIKITEXT_LABEL_RUN_ID=${WIKITEXT_LABEL_RUN_ID}"
 echo "WIKITEXT_RESOLVED_SKIP_COUNT=${WIKITEXT_RESOLVED_SKIP_COUNT}"
 echo "WIKITEXT_PREFIX_DEPTH=${WIKITEXT_PREFIX_DEPTH}"
+echo "WIKITEXT_SET_LOSS_TYPE=${WIKITEXT_SET_LOSS_TYPE}"
 echo "WIKITEXT_LABEL_FILE=${WIKITEXT_LABEL_FILE}"
 echo "WIKITEXT_EPOCH_CKPT_DIR=${WIKITEXT_EPOCH_CKPT_DIR}"
 echo "WIKITEXT_VAL_METRIC_DIR=${WIKITEXT_VAL_METRIC_DIR}"
@@ -321,7 +325,7 @@ else
     echo "Missing epoch checkpoints through ${last_ckpt}; WIKITEXT_VALCKPT_EVAL_ONLY=1, so stop instead of retraining." >&2
     exit 2
   fi
-  echo "=== Train OPAL-SetBCE with per-epoch checkpoints ==="
+  echo "=== Train OPAL router (${WIKITEXT_SET_LOSS_TYPE}) with per-epoch checkpoints ==="
   run_accelerate ./eval_wikitext_opal_ppl.py train_router \
     --teacher_model "$WIKITEXT_MODEL_PATH" \
     --split train \
@@ -342,6 +346,8 @@ else
     --router_dim "$WIKITEXT_ROUTER_DIM" \
     --router_heads "$WIKITEXT_ROUTER_HEADS" \
     --max_grad_norm "$WIKITEXT_MAX_GRAD_NORM" \
+    --set_loss_type "$WIKITEXT_SET_LOSS_TYPE" \
+    --exact_k_score_clip "$WIKITEXT_EXACT_K_SCORE_CLIP" \
     --output_dir "$WIKITEXT_VALCKPT_DIR" \
     --save_epoch_checkpoints \
     --epoch_checkpoint_dir "$WIKITEXT_EPOCH_CKPT_DIR" \
@@ -449,7 +455,7 @@ else
     --router_prefix_tokens "$WIKITEXT_ROUTER_PREFIX_TOKENS" \
     --eval_windows "$WIKITEXT_EVAL_WINDOWS" \
     --method router \
-    --method_label "OPAL-SetBCE best-on-val${selection_suffix} epoch${best_epoch}" \
+    --method_label "OPAL-${WIKITEXT_SET_LOSS_TYPE} best-on-val${selection_suffix} epoch${best_epoch}" \
     --risk_router_ckpt "$best_ckpt" \
     --prefix_depth "$WIKITEXT_PREFIX_DEPTH" \
     --skip_rate "$WIKITEXT_SKIP_RATE" \

@@ -26,6 +26,7 @@ from models.opal_risk_router import (
     LayerwiseHiddenRiskRouter,
     OpalRiskRouter,
     PromptCandidateMaskRouter,
+    exact_k_subset_ce_loss,
 )
 from wikitext_opal_utils import (
     C6_STATIC_STRATEGIES,
@@ -1200,6 +1201,7 @@ def train_router(args):
                     "covered_rows": len(selected_window_ids),
                     "seq_len": int(args.seq_len),
                     "router_prefix_tokens": int(args.router_prefix_tokens),
+                    "set_loss_type": args.set_loss_type,
                     "token_count_train_split": int(len(token_ids)),
                     "target_leakage_guard": "router sees only first router_prefix_tokens; NLL labels score suffix tokens only",
                     "mask_application": "config.custom_layer_mask",
@@ -1237,7 +1239,16 @@ def train_router(args):
                 dtype=torch.float32,
                 device=device,
             )
-            loss = F.binary_cross_entropy_with_logits(-pred.float(), target.float())
+            if args.set_loss_type == "exact_k_ce":
+                loss = exact_k_subset_ce_loss(
+                    pred.float(),
+                    target.float(),
+                    allowed_layers=[int(idx) for idx in allowed_layers],
+                    skip_count=int(skip_count),
+                    score_clip=float(args.exact_k_score_clip),
+                )
+            else:
+                loss = F.binary_cross_entropy_with_logits(-pred.float(), target.float())
             if not torch.isfinite(loss.detach()):
                 raise FloatingPointError(f"Non-finite router loss: {float(loss.detach().float().item())}")
             optimizer.zero_grad()
@@ -1267,7 +1278,7 @@ def train_router(args):
                 epoch_dir = Path(args.epoch_checkpoint_dir or args.output_dir)
                 epoch_dir.mkdir(parents=True, exist_ok=True)
                 epoch_metadata = {
-                    "method": "wikitext2_delta_nll_greedy_set_bce",
+                    "method": f"wikitext2_delta_nll_greedy_set_{args.set_loss_type}",
                     "router_input": args.router_input,
                     "prompt_only_router_context": True,
                     "target_leakage_guard": "router sees only first router_prefix_tokens; eval never loads greedy labels",
@@ -1279,7 +1290,8 @@ def train_router(args):
                     "risk_label_file": args.risk_label_file,
                     "risk_objective": label_metadata.get("objective", "Delta_NLL"),
                     "supervision_type": "skip_set",
-                    "set_loss_type": "bce",
+                    "set_loss_type": args.set_loss_type,
+                    "exact_k_score_clip": float(args.exact_k_score_clip),
                     "label_search": label_metadata.get("search", "forward_greedy"),
                     "dataset": "wikitext-2-raw-v1",
                     "dataset_disk_path": args.dataset_disk_path,
@@ -1313,7 +1325,7 @@ def train_router(args):
     if accelerator.is_main_process:
         unwrapped = accelerator.unwrap_model(router)
         metadata = {
-            "method": "wikitext2_delta_nll_greedy_set_bce",
+            "method": f"wikitext2_delta_nll_greedy_set_{args.set_loss_type}",
             "router_input": args.router_input,
             "prompt_only_router_context": True,
             "target_leakage_guard": "router sees only first router_prefix_tokens; eval never loads greedy labels",
@@ -1344,7 +1356,8 @@ def train_router(args):
             "risk_label_file": args.risk_label_file,
             "risk_objective": label_metadata.get("objective", "Delta_NLL"),
             "supervision_type": "skip_set",
-            "set_loss_type": "bce",
+            "set_loss_type": args.set_loss_type,
+            "exact_k_score_clip": float(args.exact_k_score_clip),
             "label_search": label_metadata.get("search", "forward_greedy"),
             "dataset": "wikitext-2-raw-v1",
             "dataset_disk_path": args.dataset_disk_path,
@@ -2536,6 +2549,8 @@ def build_parser():
     train.add_argument("--router_heads", type=int, default=4)
     train.add_argument("--dropout", type=float, default=0.0)
     train.add_argument("--max_grad_norm", type=float, default=1.0)
+    train.add_argument("--set_loss_type", choices=["bce", "exact_k_ce"], default="bce")
+    train.add_argument("--exact_k_score_clip", type=float, default=50.0)
     train.add_argument("--output_dir", required=True)
     train.add_argument("--save_epoch_checkpoints", action="store_true")
     train.add_argument("--epoch_checkpoint_dir", default="")

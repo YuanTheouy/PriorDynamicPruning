@@ -56,7 +56,11 @@ cd "$REPO_DIR"
 
 model_tag="$(basename "$WIKITEXT_MODEL_PATH" | tr ' ./:' '____')"
 skip_tag="$(printf "%s" "$WIKITEXT_SKIP_RATE" | tr "." "p")"
-export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}}"
+skip_budget_tag=""
+if [ "$WIKITEXT_SKIP_COUNT" != "0" ]; then
+  skip_budget_tag="_K${WIKITEXT_SKIP_COUNT}"
+fi
+export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}}"
 export WIKITEXT_RUN_ID="${WIKITEXT_RUN_ID:-${WIKITEXT_LABEL_RUN_ID}_raw_valckpt}"
 export WIKITEXT_RESULT_ROOT="${WIKITEXT_RESULT_ROOT:-${REPO_DIR}/results/wikitext2_public_lm_sanity}"
 export WIKITEXT_LABEL_FILE="${WIKITEXT_RESULT_ROOT}/labels/${WIKITEXT_LABEL_RUN_ID}_delta_nll_greedy_set_labels.jsonl"

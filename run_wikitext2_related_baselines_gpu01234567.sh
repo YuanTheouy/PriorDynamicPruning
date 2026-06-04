@@ -69,10 +69,25 @@ cd "$REPO_DIR"
 
 model_tag="$(basename "$WIKITEXT_MODEL_PATH" | tr ' ./:' '____')"
 skip_tag="$(printf "%s" "$WIKITEXT_SKIP_RATE" | tr "." "p")"
-skip_budget_tag=""
-if [ "$WIKITEXT_SKIP_COUNT" != "0" ]; then
-  skip_budget_tag="_K${WIKITEXT_SKIP_COUNT}"
-fi
+export WIKITEXT_RESOLVED_SKIP_COUNT="${WIKITEXT_RESOLVED_SKIP_COUNT:-$(python3 - "$WIKITEXT_MODEL_PATH" "$WIKITEXT_SKIP_RATE" "$WIKITEXT_SKIP_COUNT" <<'PY'
+import sys
+from transformers import AutoConfig
+
+model_path, skip_rate_raw, skip_count_raw = sys.argv[1:]
+skip_count = int(skip_count_raw)
+if skip_count > 0:
+    print(skip_count)
+    raise SystemExit(0)
+config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+num_layers = getattr(config, "num_hidden_layers", None)
+if num_layers is None and getattr(config, "text_config", None) is not None:
+    num_layers = getattr(config.text_config, "num_hidden_layers", None)
+if num_layers is None:
+    raise SystemExit(f"Could not resolve num_hidden_layers from {model_path}")
+print(max(0, min(int(num_layers), int(round(int(num_layers) * float(skip_rate_raw))))))
+PY
+)}"
+skip_budget_tag="_K${WIKITEXT_RESOLVED_SKIP_COUNT}"
 export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}}"
 prefix_depth_tag=""
 if [ "$WIKITEXT_PREFIX_DEPTH" != "4" ]; then
@@ -165,6 +180,17 @@ line_count_at_least() {
   test -s "$path" && [ "$(wc -l < "$path")" -ge "$min_rows" ]
 }
 
+label_file_usable() {
+  local path="$1"
+  local min_rows="$2"
+  test -s "$path" && python3 ./check_wikitext_label_sanity.py \
+    --label_file "$path" \
+    --min_rows "$min_rows" \
+    --max_full_nll_mean "${WIKITEXT_LABEL_MAX_FULL_NLL_MEAN:-5.0}" \
+    --max_full_ppl_median "${WIKITEXT_LABEL_MAX_FULL_PPL_MEDIAN:-200.0}" \
+    --quiet
+}
+
 json_usable() {
   local path="$1"
   python3 - "$path" <<'PY'
@@ -251,6 +277,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "NUM_GPUS=${NUM_GPUS}"
 echo "WIKITEXT_RUN_ID=${WIKITEXT_RUN_ID}"
 echo "WIKITEXT_LABEL_RUN_ID=${WIKITEXT_LABEL_RUN_ID}"
+echo "WIKITEXT_RESOLVED_SKIP_COUNT=${WIKITEXT_RESOLVED_SKIP_COUNT}"
 echo "WIKITEXT_LABEL_FILE=${WIKITEXT_LABEL_FILE}"
 echo "WIKITEXT_CANDIDATE_LABEL_FILE=${WIKITEXT_CANDIDATE_LABEL_FILE}"
 echo "WIKITEXT_PREFIX_DEPTH=${WIKITEXT_PREFIX_DEPTH}"
@@ -268,10 +295,14 @@ fi
 if line_count_at_least "$WIKITEXT_CANDIDATE_LABEL_FILE" "$WIKITEXT_LABEL_SAMPLES"; then
   echo "=== Reuse C16 candidate labels: ${WIKITEXT_CANDIDATE_LABEL_FILE} ==="
 else
-  if ! line_count_at_least "$WIKITEXT_LABEL_FILE" "$WIKITEXT_LABEL_SAMPLES"; then
+  if ! label_file_usable "$WIKITEXT_LABEL_FILE" "$WIKITEXT_LABEL_SAMPLES"; then
     echo "=== Greedy labels missing; run the base WikiText-2 sanity first ==="
     WIKITEXT_BASE_PORT="$NEXT_PORT" bash ./run_wikitext2_public_lm_sanity_gpu01234567.sh
     NEXT_PORT="$((NEXT_PORT + 40))"
+    if ! label_file_usable "$WIKITEXT_LABEL_FILE" "$WIKITEXT_LABEL_SAMPLES"; then
+      echo "Greedy labels are missing or failed sanity after base run: ${WIKITEXT_LABEL_FILE}" >&2
+      exit 2
+    fi
   fi
   echo "=== Build WikiText-2 C16 candidate Delta_NLL labels ==="
   run_accelerate ./eval_wikitext_opal_ppl.py build_candidate_labels \

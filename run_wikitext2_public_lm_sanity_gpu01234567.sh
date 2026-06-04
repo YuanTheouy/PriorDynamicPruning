@@ -72,10 +72,25 @@ cd "$REPO_DIR"
 
 model_tag="$(basename "$WIKITEXT_MODEL_PATH" | tr ' ./:' '____')"
 skip_tag="$(printf "%s" "$WIKITEXT_SKIP_RATE" | tr "." "p")"
-skip_budget_tag=""
-if [ "$WIKITEXT_SKIP_COUNT" != "0" ]; then
-  skip_budget_tag="_K${WIKITEXT_SKIP_COUNT}"
-fi
+export WIKITEXT_RESOLVED_SKIP_COUNT="${WIKITEXT_RESOLVED_SKIP_COUNT:-$(python3 - "$WIKITEXT_MODEL_PATH" "$WIKITEXT_SKIP_RATE" "$WIKITEXT_SKIP_COUNT" <<'PY'
+import sys
+from transformers import AutoConfig
+
+model_path, skip_rate_raw, skip_count_raw = sys.argv[1:]
+skip_count = int(skip_count_raw)
+if skip_count > 0:
+    print(skip_count)
+    raise SystemExit(0)
+config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+num_layers = getattr(config, "num_hidden_layers", None)
+if num_layers is None and getattr(config, "text_config", None) is not None:
+    num_layers = getattr(config.text_config, "num_hidden_layers", None)
+if num_layers is None:
+    raise SystemExit(f"Could not resolve num_hidden_layers from {model_path}")
+print(max(0, min(int(num_layers), int(round(int(num_layers) * float(skip_rate_raw))))))
+PY
+)}"
+skip_budget_tag="_K${WIKITEXT_RESOLVED_SKIP_COUNT}"
 export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}}"
 prefix_depth_tag=""
 if [ "$WIKITEXT_PREFIX_DEPTH" != "4" ]; then
@@ -146,6 +161,17 @@ line_count_at_least() {
   local path="$1"
   local min_rows="$2"
   test -s "$path" && [ "$(wc -l < "$path")" -ge "$min_rows" ]
+}
+
+label_file_usable() {
+  local path="$1"
+  local min_rows="$2"
+  test -s "$path" && python3 ./check_wikitext_label_sanity.py \
+    --label_file "$path" \
+    --min_rows "$min_rows" \
+    --max_full_nll_mean "${WIKITEXT_LABEL_MAX_FULL_NLL_MEAN:-5.0}" \
+    --max_full_ppl_median "${WIKITEXT_LABEL_MAX_FULL_PPL_MEDIAN:-200.0}" \
+    --quiet
 }
 
 json_usable() {
@@ -227,6 +253,7 @@ echo "WIKITEXT_ROUTER_PREFIX_TOKENS=${WIKITEXT_ROUTER_PREFIX_TOKENS}"
 echo "WIKITEXT_PREFIX_DEPTH=${WIKITEXT_PREFIX_DEPTH}"
 echo "WIKITEXT_SKIP_RATE=${WIKITEXT_SKIP_RATE}"
 echo "WIKITEXT_SKIP_COUNT=${WIKITEXT_SKIP_COUNT}"
+echo "WIKITEXT_RESOLVED_SKIP_COUNT=${WIKITEXT_RESOLVED_SKIP_COUNT}"
 echo "WIKITEXT_PROTECTED_HEAD=${WIKITEXT_PROTECTED_HEAD}"
 echo "WIKITEXT_PROTECTED_TAIL=${WIKITEXT_PROTECTED_TAIL}"
 echo "WIKITEXT_DATASET_DISK_PATH=${WIKITEXT_DATASET_DISK_PATH}"
@@ -237,8 +264,14 @@ echo "RAW_ROUTER_CKPT=${RAW_ROUTER_CKPT}"
 echo "OPAL_ROUTER_CKPT=${OPAL_ROUTER_CKPT}"
 echo "WIKITEXT_REPORT_MD=${WIKITEXT_REPORT_MD}"
 
-if line_count_at_least "$WIKITEXT_LABEL_FILE" "$WIKITEXT_LABEL_SAMPLES"; then
-  echo "=== Reuse WikiText-2 Delta_NLL greedy set labels: ${WIKITEXT_LABEL_FILE} ==="
+if [ -s "$WIKITEXT_LABEL_FILE" ]; then
+  if label_file_usable "$WIKITEXT_LABEL_FILE" "$WIKITEXT_LABEL_SAMPLES"; then
+    echo "=== Reuse WikiText-2 Delta_NLL greedy set labels: ${WIKITEXT_LABEL_FILE} ==="
+  else
+    echo "Existing WikiText label file failed sanity checks; refusing to reuse or overwrite in-place: ${WIKITEXT_LABEL_FILE}" >&2
+    echo "Use a fresh WIKITEXT_MASK_IMPL_TAG/WIKITEXT_LABEL_RUN_ID or quarantine the old run first." >&2
+    exit 2
+  fi
 else
   echo "=== Build WikiText-2 Delta_NLL greedy set labels ==="
   run_accelerate ./build_wikitext_greedy_set_labels.py \

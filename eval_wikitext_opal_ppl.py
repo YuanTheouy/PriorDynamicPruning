@@ -407,6 +407,7 @@ def load_label_rows(path: str) -> Tuple[List[Dict[str, object]], Dict[str, objec
     rows.sort(key=lambda row: int(row["sample_id"]))
     if not rows:
         raise ValueError(f"No label rows found in {path}")
+    validate_label_full_stats(rows, path)
     metadata_path = Path(path).with_suffix(Path(path).suffix + ".metadata.json")
     metadata = {}
     if metadata_path.exists():
@@ -427,6 +428,39 @@ def load_label_rows(path: str) -> Tuple[List[Dict[str, object]], Dict[str, objec
         if key not in metadata and rows[0].get(key) is not None:
             metadata[key] = rows[0].get(key)
     return rows, metadata
+
+
+def validate_label_full_stats(rows: Sequence[Dict[str, object]], path: str) -> None:
+    nll_full = []
+    ppl_full = []
+    for row in rows:
+        try:
+            nll = float(row["NLL_full"])
+            ppl = float(row["PPL_full"])
+        except Exception as exc:
+            raise ValueError(f"Label row lacks finite NLL_full/PPL_full in {path}") from exc
+        if not math.isfinite(nll) or not math.isfinite(ppl):
+            raise ValueError(f"Label row has non-finite NLL_full/PPL_full in {path}")
+        nll_full.append(nll)
+        ppl_full.append(ppl)
+    if not nll_full:
+        return
+    max_nll_mean = float(os.environ.get("WIKITEXT_LABEL_MAX_FULL_NLL_MEAN", "5.0"))
+    max_ppl_median = float(os.environ.get("WIKITEXT_LABEL_MAX_FULL_PPL_MEDIAN", "200.0"))
+    mean_nll = sum(nll_full) / len(nll_full)
+    median_ppl = sorted(ppl_full)[len(ppl_full) // 2]
+    if len(ppl_full) % 2 == 0:
+        sorted_ppl = sorted(ppl_full)
+        median_ppl = 0.5 * (sorted_ppl[len(ppl_full) // 2 - 1] + sorted_ppl[len(ppl_full) // 2])
+    if mean_nll > max_nll_mean or median_ppl > max_ppl_median:
+        raise RuntimeError(
+            "Refusing poisoned WikiText greedy label file: "
+            f"NLL_full_mean={mean_nll:.6g} "
+            f"(max {max_nll_mean:.6g}), "
+            f"PPL_full_median={median_ppl:.6g} "
+            f"(max {max_ppl_median:.6g}), "
+            f"path={path}"
+        )
 
 
 def load_candidate_label_rows(path: str) -> Tuple[List[Dict[str, object]], Dict[str, object]]:

@@ -235,60 +235,43 @@ Readout: train-label imitation improves strongly from epoch 1 to epoch 40, but v
 - The clean Qwen3 K9 run is valid.
 - Clean final Raw/OPAL BCE beat static/candidate/layerwise baselines, but OPAL final trails Raw final slightly.
 - Clean best-on-val BCE selects very early checkpoints. OPAL best-on-val has the best validation PPL among Raw/OPAL BCE, but is low diversity (`unique_masks=1`).
-- Because BCE gets lower while validation PPL worsens, the next loss ablation should test Exact-K CE on the same clean labels.
+- Because BCE gets lower while validation PPL worsens, Exact-K CE was tested on the same clean labels. It gives a small OPAL-side gain, but does not beat Raw BCE best and remains low-diversity.
 
-Safe paper wording for Qwen3 until Exact-K results arrive:
+Safe paper wording for Qwen3 after Exact-K:
 
-> On clean Qwen3-8B WikiText-2 with 25% layer skipping (K=9), dynamic Raw/OPAL routers outperform fixed and candidate-library baselines. However, final OPAL-SetBCE remains slightly behind Raw-SetBCE, and validation diagnostics show that stronger BCE imitation of greedy labels can hurt PPL, motivating a top-K-aware loss ablation.
+> On clean Qwen3-8B WikiText-2 with 25% layer skipping (K=9), dynamic Raw/OPAL routers outperform fixed and candidate-library baselines. However, validation-selected Raw BCE remains ahead of OPAL under the tested BCE and Exact-K CE objectives; Exact-K CE provides only a small low-diversity OPAL-side improvement.
 
-## Pending Exact-K CE Loss Ablation
+## Three-Seed Exact-K CE Loss Ablation
 
-Added by commit `513be4e`.
+Detailed three-seed table: `docs/WIKITEXT2_QWEN3_3SEED_EXACTK_RESULTS.md`.
 
-The BCE rows above already exist and should not be rerun. The only missing rows are:
+This ablation used the same clean greedy labels and compared BCE with Exact-K CE under the same Qwen3 K9 setting.
 
-| method | label source | loss | status |
-|---|---|---|---|
-| Raw router | same clean greedy labels | Exact-K CE | pending server run |
-| OPAL router | same clean greedy labels | Exact-K CE | pending server run |
+| method | seeds | test PPL mean | test PPL std | unique_masks mean | PPL values |
+|---|---:|---:|---:|---:|---|
+| Full | 3 | 9.5100 | 0.0000 | 1.00 | `[9.5100, 9.5100, 9.5100]` |
+| Raw BCE final | 3 | 20.4493 | 0.0698 | 220.67 | `[20.3915, 20.5474, 20.4089]` |
+| OPAL BCE final | 3 | 21.1057 | 0.2653 | 256.00 | `[20.7827, 21.1016, 21.4327]` |
+| Raw BCE best | 3 | 19.0200 | 0.0781 | 10.00 | `[19.0762, 19.0742, 18.9095]` |
+| OPAL BCE best | 3 | 19.0497 | 0.0120 | 3.00 | `[19.0412, 19.0666, 19.0412]` |
+| Raw ExactK best | 3 | 19.0754 | 0.1526 | 9.67 | `[19.0762, 19.2620, 18.8881]` |
+| OPAL ExactK best | 3 | 19.0405 | 0.0011 | 1.33 | `[19.0389, 19.0412, 19.0412]` |
 
-Expected output md after the server run:
+Per-seed OPAL Exact-K checkpoints:
 
-`docs/WIKITEXT2_QWEN3_EXACTK_LOSS_RESULTS.md`
+| seed | best_epoch | validation_PPL | test_PPL | unique_masks |
+|---:|---:|---:|---:|---:|
+| 42 | 1 | 19.8515 | 19.0389 | 2 |
+| 13 | 1 | 19.8515 | 19.0412 | 1 |
+| 3407 | 1 | 19.8515 | 19.0412 | 1 |
 
-Minimal command already provided separately:
+Readout:
 
-```bash
-export LABEL=wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_seq1024_pref256_m2000_seed42_skip0p25
-export WIKITEXT_MODEL_PATH=/workspace/Models/Qwen3-8B
-export WIKITEXT_DATASET_DISK_PATH=/workspace/datasets/wikitext/wikitext-2-raw-v1
-export WIKITEXT_LABEL_RUN_ID=$LABEL
-export WIKITEXT_LABEL_SAMPLES=2000
-export WIKITEXT_EVAL_WINDOWS=512
-export WIKITEXT_EPOCHS=40
-export WIKITEXT_SEQ_LEN=1024
-export WIKITEXT_ROUTER_PREFIX_TOKENS=256
-export WIKITEXT_SKIP_RATE=0.25
-export WIKITEXT_SKIP_COUNT=9
-export WIKITEXT_PROTECTED_HEAD=4
-export WIKITEXT_PROTECTED_TAIL=2
-export WIKITEXT_SEED=42
-export WIKITEXT_PRECISION=bf16
-export WIKITEXT_TRAIN_BATCH_SIZE=4
-export WIKITEXT_EVAL_BATCH_SIZE=1
-export WIKITEXT_VALCKPT_PARALLEL_WORKERS=8
-export WIKITEXT_SET_LOSS_TYPE=exact_k_ce
-export WIKITEXT_EXACT_K_SCORE_CLIP=50.0
+- Exact-K CE slightly improves OPAL best-on-val over OPAL BCE best: `19.0405` vs `19.0497` mean PPL.
+- Exact-K CE does not make OPAL beat the strongest raw-prefix baseline: Raw BCE best remains better, `19.0200` vs `19.0405` mean PPL.
+- Exact-K CE also does not solve dynamic diversity. OPAL Exact-K selects epoch 1 on every seed and has unique masks `[2, 1, 1]`.
+- Raw Exact-K is worse than Raw BCE best on mean PPL, so Exact-K CE is not a general win for this Qwen3 K9 setup.
 
-export WIKITEXT_RUN_ID=${LABEL}_raw_exactk_valckpt
-export WIKITEXT_BASE_PORT=59600
-bash ./run_wikitext2_raw_val_ckpt_select_gpu01234567.sh
+Updated Qwen3 conclusion:
 
-export WIKITEXT_RUN_ID=${LABEL}_opal_exactk_valckpt
-export WIKITEXT_BASE_PORT=59700
-bash ./run_wikitext2_opal_val_ckpt_select_gpu01234567.sh
-
-python3 ./summarize_wikitext2_qwen3_exactk_loss_results.py \
-  --label_run_id "$LABEL" \
-  --output_md docs/WIKITEXT2_QWEN3_EXACTK_LOSS_RESULTS.md
-```
+> On clean Qwen3-8B WikiText-2 with 25% layer skipping (K=9), dynamic routers beat fixed and candidate-library baselines, but validation-selected Raw BCE remains the best skip method among the BCE/Exact-K CE loss ablation. OPAL Exact-K CE gives a small OPAL-side improvement but remains low-diversity and does not establish an OPAL-over-Raw win.

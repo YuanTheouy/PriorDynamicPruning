@@ -505,7 +505,20 @@ Clean Qwen3 K9 BCE validation diagnostics:
 | OPAL-SetBCE | epoch1 | 0.556382 | 0.6492 | 0.0025 | 19.8515 | 1 |
 | OPAL-SetBCE | epoch40 | 0.038534 | 0.9827 | 0.8555 | 21.5494 | 214 |
 
-Readout: lower BCE and higher greedy-label overlap do not imply better validation PPL on clean Qwen3. This is the concrete reason to run the Exact-K CE loss ablation on the same clean labels. Until that ablation is complete, cite Qwen3 as valid but diagnostically mixed: dynamic BCE routers work and beat static/candidate baselines, while final OPAL-SetBCE still slightly trails Raw-SetBCE and shows a surrogate-loss mismatch.
+Readout: lower BCE and higher greedy-label overlap do not imply better validation PPL on clean Qwen3. This is the concrete reason the Exact-K CE loss ablation was run on the same clean labels.
+
+Three-seed Qwen3 K9 BCE vs Exact-K CE summary:
+
+| method | seeds | test PPL mean | test PPL std | unique_masks mean | result |
+|---|---:|---:|---:|---:|---|
+| Raw BCE best | 3 | 19.0200 | 0.0781 | 10.00 | strongest skip method in this ablation |
+| OPAL BCE best | 3 | 19.0497 | 0.0120 | 3.00 | slightly worse than Raw BCE best |
+| Raw ExactK best | 3 | 19.0754 | 0.1526 | 9.67 | worse than Raw BCE best |
+| OPAL ExactK best | 3 | 19.0405 | 0.0011 | 1.33 | small OPAL-side gain, still behind Raw BCE best |
+
+Exact-K CE gives OPAL a small improvement over OPAL BCE best (`19.0405` vs `19.0497` mean PPL), but it does not establish an OPAL-over-Raw win. OPAL Exact-K also remains low-diversity: it selects epoch 1 on every seed with unique masks `[2, 1, 1]`.
+
+Updated Qwen3 conclusion: cite Qwen3 as valid but diagnostically mixed. Dynamic BCE routers beat static/candidate baselines, while the best validation-selected Raw BCE router remains ahead of OPAL under both BCE and Exact-K CE variants.
 
 ## Commands
 

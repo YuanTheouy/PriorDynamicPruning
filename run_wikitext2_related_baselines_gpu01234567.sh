@@ -31,6 +31,8 @@ export WIKITEXT_PREFIX_DEPTH="${WIKITEXT_PREFIX_DEPTH:-4}"
 export WIKITEXT_PRECISION="${WIKITEXT_PRECISION:-bf16}"
 export WIKITEXT_LABEL_BATCH_SIZE="${WIKITEXT_LABEL_BATCH_SIZE:-1}"
 export WIKITEXT_CANDIDATE_BATCH_SIZE="${WIKITEXT_CANDIDATE_BATCH_SIZE:-4}"
+export WIKITEXT_LABEL_SEARCH="${WIKITEXT_LABEL_SEARCH:-forward_greedy}"
+export WIKITEXT_LABEL_BEAM_WIDTH="${WIKITEXT_LABEL_BEAM_WIDTH:-1}"
 export WIKITEXT_TRAIN_BATCH_SIZE="${WIKITEXT_TRAIN_BATCH_SIZE:-4}"
 export WIKITEXT_EVAL_BATCH_SIZE="${WIKITEXT_EVAL_BATCH_SIZE:-1}"
 export WIKITEXT_LR="${WIKITEXT_LR:-1e-4}"
@@ -88,7 +90,13 @@ print(max(0, min(int(num_layers), int(round(int(num_layers) * float(skip_rate_ra
 PY
 )}"
 skip_budget_tag="_K${WIKITEXT_RESOLVED_SKIP_COUNT}"
-export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}}"
+label_search_run_tag=""
+label_search_file_tag="greedy"
+if [ "$WIKITEXT_LABEL_SEARCH" = "beam" ]; then
+  label_search_run_tag="_beam${WIKITEXT_LABEL_BEAM_WIDTH}"
+  label_search_file_tag="beam${WIKITEXT_LABEL_BEAM_WIDTH}"
+fi
+export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}${label_search_run_tag}}"
 prefix_depth_tag=""
 if [ "$WIKITEXT_PREFIX_DEPTH" != "4" ]; then
   prefix_depth_tag="_h${WIKITEXT_PREFIX_DEPTH}"
@@ -104,7 +112,7 @@ export WIKITEXT_RELATED_METRIC_DIR="${WIKITEXT_RELATED_METRIC_DIR:-${WIKITEXT_RE
 export WIKITEXT_RELATED_CKPT_ROOT="${WIKITEXT_RELATED_CKPT_ROOT:-${REPO_DIR}/policy_ckpts/wikitext2_public_lm_related/${WIKITEXT_RUN_ID}}"
 export WIKITEXT_REPORT_MD="${WIKITEXT_REPORT_MD:-${REPO_DIR}/docs/WIKITEXT2_PUBLIC_LM_SANITY_RESULTS.md}"
 export WIKITEXT_RELATED_REPORT_MD="${WIKITEXT_RELATED_REPORT_MD:-${REPO_DIR}/docs/WIKITEXT2_PUBLIC_LM_RELATED_RESULTS.md}"
-export WIKITEXT_LABEL_FILE="${WIKITEXT_LABEL_DIR}/${WIKITEXT_LABEL_RUN_ID}_delta_nll_greedy_set_labels.jsonl"
+export WIKITEXT_LABEL_FILE="${WIKITEXT_LABEL_DIR}/${WIKITEXT_LABEL_RUN_ID}_delta_nll_${label_search_file_tag}_set_labels.jsonl"
 export WIKITEXT_CANDIDATE_LABEL_FILE="${WIKITEXT_RELATED_LABEL_DIR}/${WIKITEXT_LABEL_RUN_ID}_c16_candidate_delta_nll.jsonl"
 
 export RAW_ROUTER_DIR="${WIKITEXT_CKPT_ROOT}/raw_embedding_bce"

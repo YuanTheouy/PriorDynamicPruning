@@ -37,6 +37,8 @@ export WIKITEXT_MAX_GRAD_NORM="${WIKITEXT_MAX_GRAD_NORM:-1.0}"
 export WIKITEXT_SET_LOSS_TYPE="${WIKITEXT_SET_LOSS_TYPE:-bce}"
 export WIKITEXT_EXACT_K_SCORE_CLIP="${WIKITEXT_EXACT_K_SCORE_CLIP:-50.0}"
 export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
+export WIKITEXT_LABEL_SEARCH="${WIKITEXT_LABEL_SEARCH:-forward_greedy}"
+export WIKITEXT_LABEL_BEAM_WIDTH="${WIKITEXT_LABEL_BEAM_WIDTH:-1}"
 export WIKITEXT_VALCKPT_PARALLEL_WORKERS="${WIKITEXT_VALCKPT_PARALLEL_WORKERS:-$NUM_GPUS}"
 export WIKITEXT_VALCKPT_OMP_NUM_THREADS="${WIKITEXT_VALCKPT_OMP_NUM_THREADS:-2}"
 export WIKITEXT_VALCKPT_EVAL_ONLY="${WIKITEXT_VALCKPT_EVAL_ONLY:-0}"
@@ -77,14 +79,20 @@ print(max(0, min(int(num_layers), int(round(int(num_layers) * float(skip_rate_ra
 PY
 )}"
 skip_budget_tag="_K${WIKITEXT_RESOLVED_SKIP_COUNT}"
-export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}}"
+label_search_run_tag=""
+label_search_file_tag="greedy"
+if [ "$WIKITEXT_LABEL_SEARCH" = "beam" ]; then
+  label_search_run_tag="_beam${WIKITEXT_LABEL_BEAM_WIDTH}"
+  label_search_file_tag="beam${WIKITEXT_LABEL_BEAM_WIDTH}"
+fi
+export WIKITEXT_LABEL_RUN_ID="${WIKITEXT_LABEL_RUN_ID:-wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}${label_search_run_tag}}"
 prefix_depth_tag=""
 if [ "$WIKITEXT_PREFIX_DEPTH" != "4" ]; then
   prefix_depth_tag="_h${WIKITEXT_PREFIX_DEPTH}"
 fi
 export WIKITEXT_RUN_ID="${WIKITEXT_RUN_ID:-${WIKITEXT_LABEL_RUN_ID}${prefix_depth_tag}_valckpt}"
 export WIKITEXT_RESULT_ROOT="${WIKITEXT_RESULT_ROOT:-${REPO_DIR}/results/wikitext2_public_lm_sanity}"
-export WIKITEXT_LABEL_FILE="${WIKITEXT_RESULT_ROOT}/labels/${WIKITEXT_LABEL_RUN_ID}_delta_nll_greedy_set_labels.jsonl"
+export WIKITEXT_LABEL_FILE="${WIKITEXT_RESULT_ROOT}/labels/${WIKITEXT_LABEL_RUN_ID}_delta_nll_${label_search_file_tag}_set_labels.jsonl"
 export WIKITEXT_VALCKPT_ROOT="${WIKITEXT_VALCKPT_ROOT:-${REPO_DIR}/policy_ckpts/wikitext2_public_lm_val_ckpt/${WIKITEXT_RUN_ID}}"
 export WIKITEXT_LOSS_DIR_TAG="${WIKITEXT_SET_LOSS_TYPE}"
 export WIKITEXT_VALCKPT_DIR="${WIKITEXT_VALCKPT_ROOT}/prefix_hk_raw_attn_${WIKITEXT_LOSS_DIR_TAG}"

@@ -34,7 +34,7 @@ from wikitext_opal_utils import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build WikiText-2 forward-greedy skip-set labels with final Delta_NLL objective."
+        description="Build WikiText-2 skip-set labels with final Delta_NLL objective."
     )
     parser.add_argument("--teacher_model", required=True)
     parser.add_argument("--split", default="train")
@@ -54,6 +54,8 @@ def parse_args():
     parser.add_argument("--output", required=True)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--candidate_batch_size", type=int, default=1)
+    parser.add_argument("--search", choices=["forward_greedy", "beam"], default="forward_greedy")
+    parser.add_argument("--beam_width", type=int, default=1)
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -176,6 +178,112 @@ def greedy_skip_set(
     return selected, skip_mask, keep_mask, steps
 
 
+def beam_skip_set(
+    model,
+    input_ids,
+    attention_mask,
+    labels,
+    full_stats,
+    num_layers: int,
+    allowed_layers,
+    skip_count: int,
+    candidate_batch_size: int,
+    beam_width: int,
+):
+    beam_width = max(1, int(beam_width))
+    full_nll = float(full_stats["nll"])
+    full_ppl = float(full_stats["ppl"])
+    beam = [
+        {
+            "skipped_layers": tuple(),
+            "objective_loss": 0.0,
+            "NLL_skip": full_nll,
+            "PPL_skip": full_ppl,
+            "Delta_NLL": 0.0,
+            "Delta_PPL": 0.0,
+        }
+    ]
+    steps = []
+
+    for step_idx in range(int(skip_count)):
+        candidate_payloads = []
+        seen = set()
+        for item in beam:
+            selected = set(int(idx) for idx in item["skipped_layers"])
+            for layer_idx in allowed_layers:
+                layer_idx = int(layer_idx)
+                if layer_idx in selected:
+                    continue
+                candidate = tuple(sorted(selected | {layer_idx}))
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidate_payloads.append(list(candidate))
+
+        scored = []
+        for start in range(0, len(candidate_payloads), max(1, int(candidate_batch_size))):
+            chunk = candidate_payloads[start : start + max(1, int(candidate_batch_size))]
+            rows = evaluate_candidate_batch(
+                model,
+                input_ids,
+                attention_mask,
+                labels,
+                num_layers=num_layers,
+                candidates=chunk,
+            )
+            for skipped_layers, stats in zip(chunk, rows):
+                delta_nll = float(stats["nll"]) - full_nll
+                delta_ppl = float(stats["ppl"]) - full_ppl
+                scored.append(
+                    {
+                        "skipped_layers": tuple(int(idx) for idx in skipped_layers),
+                        "objective_loss": delta_nll,
+                        "NLL_skip": float(stats["nll"]),
+                        "PPL_skip": float(stats["ppl"]),
+                        "Delta_NLL": delta_nll,
+                        "Delta_PPL": delta_ppl,
+                    }
+                )
+
+        if not scored:
+            break
+        scored.sort(key=lambda row: (float(row["objective_loss"]), tuple(row["skipped_layers"])))
+        beam = scored[:beam_width]
+        best = beam[0]
+        steps.append(
+            {
+                "step": step_idx + 1,
+                "selected_layers": [int(idx) for idx in best["skipped_layers"]],
+                "candidate_count": int(len(candidate_payloads)),
+                "beam_width": int(beam_width),
+                "kept_beam_count": int(len(beam)),
+                "objective": "Delta_NLL",
+                "objective_loss": float(best["objective_loss"]),
+                "NLL_skip": float(best["NLL_skip"]),
+                "PPL_skip": float(best["PPL_skip"]),
+                "Delta_NLL": float(best["Delta_NLL"]),
+                "Delta_PPL": float(best["Delta_PPL"]),
+                "beam": [
+                    {
+                        "skipped_layers": [int(idx) for idx in item["skipped_layers"]],
+                        "objective_loss": float(item["objective_loss"]),
+                        "NLL_skip": float(item["NLL_skip"]),
+                        "PPL_skip": float(item["PPL_skip"]),
+                        "Delta_NLL": float(item["Delta_NLL"]),
+                        "Delta_PPL": float(item["Delta_PPL"]),
+                    }
+                    for item in beam
+                ],
+            }
+        )
+
+    selected = [int(idx) for idx in beam[0]["skipped_layers"]] if beam else []
+    skip_set = set(selected)
+    skip_mask = [1 if idx in skip_set else 0 for idx in range(int(num_layers))]
+    keep_mask = [0 if value == 1 else 1 for value in skip_mask]
+    return selected, skip_mask, keep_mask, steps
+
+
 def main():
     args = parse_args()
     if int(args.router_prefix_tokens) >= int(args.seq_len):
@@ -253,17 +361,35 @@ def main():
                 attention_mask = batch_attention_mask[row_pos : row_pos + 1]
                 labels = batch_labels[row_pos : row_pos + 1]
                 full_stats = forward_nll_rows(model, input_ids, attention_mask, labels, layer_mask=None)[0]
-                skipped_layers, skip_mask, keep_mask, steps = greedy_skip_set(
-                    model=model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    full_stats=full_stats,
-                    num_layers=num_layers,
-                    allowed_layers=allowed_layers,
-                    skip_count=skip_count,
-                    candidate_batch_size=args.candidate_batch_size,
-                )
+                if args.search == "beam":
+                    skipped_layers, skip_mask, keep_mask, steps = beam_skip_set(
+                        model=model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        full_stats=full_stats,
+                        num_layers=num_layers,
+                        allowed_layers=allowed_layers,
+                        skip_count=skip_count,
+                        candidate_batch_size=args.candidate_batch_size,
+                        beam_width=args.beam_width,
+                    )
+                    search_name = f"beam{max(1, int(args.beam_width))}"
+                    step_key = "beam_steps"
+                else:
+                    skipped_layers, skip_mask, keep_mask, steps = greedy_skip_set(
+                        model=model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        full_stats=full_stats,
+                        num_layers=num_layers,
+                        allowed_layers=allowed_layers,
+                        skip_count=skip_count,
+                        candidate_batch_size=args.candidate_batch_size,
+                    )
+                    search_name = "forward_greedy"
+                    step_key = "greedy_steps"
                 final_step = steps[-1] if steps else {
                     "objective_loss": 0.0,
                     "NLL_skip": float(full_stats["nll"]),
@@ -276,7 +402,7 @@ def main():
                     "window_start": int(window_starts[row_pos]),
                     "objective": "Delta_NLL",
                     "supervision_type": "skip_set",
-                    "search": "forward_greedy",
+                    "search": search_name,
                     "dataset": "wikitext-2-raw-v1",
                     "split": args.split,
                     "seq_len": int(args.seq_len),
@@ -299,7 +425,7 @@ def main():
                     "objective_loss": float(final_step["objective_loss"]),
                     "Delta_NLL": float(final_step["Delta_NLL"]),
                     "Delta_PPL": float(final_step["Delta_PPL"]),
-                    "greedy_steps": steps,
+                    step_key: steps,
                     "metadata": {
                         "teacher_model": args.teacher_model,
                         "teacher_model_class": type(model).__name__,
@@ -346,7 +472,8 @@ def main():
             "scored_tokens_per_full_window": int(args.seq_len) - int(args.router_prefix_tokens),
             "objective": "Delta_NLL",
             "supervision_type": "skip_set",
-            "search": "forward_greedy",
+            "search": f"beam{max(1, int(args.beam_width))}" if args.search == "beam" else "forward_greedy",
+            "beam_width": int(max(1, int(args.beam_width))) if args.search == "beam" else 1,
             "num_layers": int(num_layers),
             "skip_rate": float(args.skip_rate),
             "skip_count": int(skip_count),
@@ -360,7 +487,7 @@ def main():
         }
         metadata_path = output_path.with_suffix(output_path.suffix + ".metadata.json")
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        print(f"Wrote {len(rows)} WikiText-2 Delta_NLL greedy skip-set rows to {output_path}")
+        print(f"Wrote {len(rows)} WikiText-2 Delta_NLL skip-set rows to {output_path}")
         print(f"Wrote metadata to {metadata_path}")
 
 

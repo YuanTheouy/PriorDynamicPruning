@@ -29,7 +29,7 @@ The server generated these report files on 2026-06-05:
 |---|---:|---|
 | `docs/WIKITEXT2_QWEN3_PREF1024_SANITY_RESULTS.md` | 2.5K | generated on server |
 | `docs/WIKITEXT2_QWEN3_PREF1024_RELATED_RESULTS.md` | 36K | generated on server |
-| `docs/WIKITEXT2_QWEN3_PREF1024_EXACTK_LOSS_RESULTS.md` | 1.8K | generated on server; valckpt rows missing before label-sample fix |
+| `docs/WIKITEXT2_QWEN3_PREF1024_EXACTK_LOSS_RESULTS.md` | 1.8K before fix; updated after fix | generated on server |
 
 ## Final-Checkpoint PPL
 
@@ -48,7 +48,7 @@ Readout:
 - Prefix1024 improves final OPAL PPL by `1.7451` versus prefix256: `20.7827 -> 19.0376`.
 - Prefix1024 therefore helps both dynamic routers, but final Raw still beats final OPAL by `0.2865` PPL.
 
-## Missing Valckpt Rows
+## Validation-Selected Rows
 
 The first prefix1024 valckpt attempt failed before training/evaluation because the label file had fewer rows than the requested sample count:
 
@@ -64,23 +64,34 @@ The label builder wrote the actual available 1625 rows.
 The valckpt scripts were still checking WIKITEXT_LABEL_SAMPLES=2000.
 ```
 
-The missing rows in `docs/WIKITEXT2_QWEN3_PREF1024_EXACTK_LOSS_RESULTS.md` were:
-
-| method | loss | status before fix |
-|---|---|---|
-| Raw best-on-val | BCE | missing |
-| OPAL best-on-val | BCE | missing |
-| Raw best-on-val | Exact-K CE | missing |
-| OPAL best-on-val | Exact-K CE | missing |
-
-Fix command: rerun only those four valckpt jobs with:
+The fix was to rerun only the valckpt jobs with:
 
 ```bash
 export WIKITEXT_LABEL_SAMPLES=1625
 ```
 
-Do not regenerate the prefix1024 label/final/related artifacts just for this fix.
+The fixed validation-selected results are:
+
+| method | loss | epoch | val NLL | val PPL | val unique | test NLL | test PPL | test unique | exact-K |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Raw best-on-val | BCE | 3 | 2.9361 | 18.8423 | 11 | 2.8783 | 17.7837 | 13 | 1.000 |
+| OPAL best-on-val | BCE | 1 | 2.9287 | 18.7030 | 1 | 2.8643 | 17.5360 | 1 | 1.000 |
+| Raw best-on-val | Exact-K CE | 3 | 2.9388 | 18.8939 | 10 | 2.8806 | 17.8252 | 11 | 1.000 |
+| OPAL best-on-val | Exact-K CE | 2 | 2.9293 | 18.7138 | 2 | 2.8645 | 17.5403 | 2 | 1.000 |
+
+Source JSONs:
+
+- Raw BCE best: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed42_skip0p25_K9_raw_valckpt/raw_best_val_epoch003_test.json`
+- OPAL BCE best: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed42_skip0p25_K9_valckpt/opal_best_val_epoch001_test.json`
+- Raw Exact-K CE best: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed42_skip0p25_K9_raw_exactk_valckpt/raw_best_val_epoch003_test.json`
+- OPAL Exact-K CE best: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed42_skip0p25_K9_opal_exactk_valckpt/opal_best_val_epoch002_test.json`
 
 ## Current Conclusion
 
-Prefix1024 is a real rescue axis because it substantially improves both Raw and OPAL final PPL. However, based on the completed final rows only, it does not yet rescue OPAL over Raw. The decisive comparison still requires the four best-on-val rows after the `WIKITEXT_LABEL_SAMPLES=1625` fix.
+Prefix1024 is a real rescue axis. It substantially improves both Raw and OPAL final PPL, and validation checkpoint selection makes OPAL beat Raw on seed42:
+
+- OPAL BCE best beats Raw BCE best by `0.2477` PPL: `17.5360` vs `17.7837`.
+- OPAL Exact-K CE best beats Raw Exact-K CE best by `0.2849` PPL: `17.5403` vs `17.8252`.
+- OPAL BCE best is the best row among this prefix1024 seed42 table, slightly ahead of OPAL Exact-K CE.
+
+Caveat: the selected OPAL masks are still low-diversity (`unique_masks=1` for BCE, `2` for Exact-K CE). This is a promising seed42 rescue, not yet a three-seed claim.

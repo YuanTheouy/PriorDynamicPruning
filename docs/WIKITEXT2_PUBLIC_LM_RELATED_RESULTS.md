@@ -524,14 +524,20 @@ Qwen3 prefix1024 rescue status:
 
 Detailed note: `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`.
 
-| setting | method | test PPL | unique_masks | status |
-|---|---|---:|---:|---|
-| seq1024/prefix256 | Raw final BCE | 20.3915 | 224 | baseline |
-| seq1024/prefix256 | OPAL final BCE | 20.7827 | 247 | baseline |
-| seq1536/prefix1024 | Raw final BCE | 18.7511 | 177 | completed |
-| seq1536/prefix1024 | OPAL final BCE | 19.0376 | 180 | completed |
+This is not a beam2 teacher run. It changes the context setting from `seq1024/prefix256` to `seq1536/prefix1024`; because the longer window produced only `1625` clean train labels, the successful valckpt rerun used `WIKITEXT_LABEL_SAMPLES=1625`.
 
-Prefix1024 improves both final Raw and final OPAL substantially, but final Raw still beats final OPAL by `0.2865` PPL. The prefix1024 best-on-val rows are not available yet because `seq_len=1536` produced only `1625` clean label rows while the first valckpt attempt checked for `2000`. Rerun only the four valckpt jobs with `WIKITEXT_LABEL_SAMPLES=1625`.
+| setting | method | loss | epoch | val PPL | test PPL | unique_masks | status |
+|---|---|---|---:|---:|---:|---:|---|
+| seq1024/prefix256 | Raw final | BCE | final | NA | 20.3915 | 224 | baseline |
+| seq1024/prefix256 | OPAL final | BCE | final | NA | 20.7827 | 247 | baseline |
+| seq1536/prefix1024 | Raw final | BCE | final | NA | 18.7511 | 177 | completed |
+| seq1536/prefix1024 | OPAL final | BCE | final | NA | 19.0376 | 180 | completed |
+| seq1536/prefix1024 | Raw best-on-val | BCE | 3 | 18.8423 | 17.7837 | 13 | completed |
+| seq1536/prefix1024 | OPAL best-on-val | BCE | 1 | 18.7030 | 17.5360 | 1 | completed |
+| seq1536/prefix1024 | Raw best-on-val | Exact-K CE | 3 | 18.8939 | 17.8252 | 11 | completed |
+| seq1536/prefix1024 | OPAL best-on-val | Exact-K CE | 2 | 18.7138 | 17.5403 | 2 | completed |
+
+Prefix1024 improves both final Raw and final OPAL substantially. Final Raw still beats final OPAL by `0.2865` PPL, but validation-selected OPAL beats validation-selected Raw on seed42: BCE `17.5360` vs `17.7837`, and Exact-K CE `17.5403` vs `17.8252`. Caveat: OPAL best-on-val is nearly static-like (`unique_masks=1` for BCE, `2` for Exact-K CE), and this is not yet a three-seed result.
 
 ## Commands
 

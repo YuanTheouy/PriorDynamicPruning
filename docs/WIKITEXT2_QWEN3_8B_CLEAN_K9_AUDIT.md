@@ -282,17 +282,25 @@ Detailed prefix1024 note: `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`.
 
 This is not a beam2 teacher run. It changes the context setting from `seq1024/prefix256` to `seq1536/prefix1024`, so the router sees a longer prompt and PPL is scored on the last `512` suffix tokens.
 
-| setting | method | loss | test NLL | test PPL | unique_masks | exact-K |
-|---|---|---|---:|---:|---:|---:|
-| seq1024/prefix256 | Raw final | BCE | 3.0151 | 20.3915 | 224 | 1.000 |
-| seq1024/prefix256 | OPAL final | BCE | 3.0341 | 20.7827 | 247 | 1.000 |
-| seq1536/prefix1024 | Raw final | BCE | 2.9313 | 18.7511 | 177 | 1.000 |
-| seq1536/prefix1024 | OPAL final | BCE | 2.9464 | 19.0376 | 180 | 1.000 |
+The prefix1024 label file contains `1625` clean train rows, not `2000`, because longer `seq_len=1536` yields fewer WikiText-2 train windows. The successful validation-checkpoint rerun used `WIKITEXT_LABEL_SAMPLES=1625`.
+
+| setting | method | loss | epoch | val PPL | test PPL | test unique | exact-K |
+|---|---|---|---:|---:|---:|---:|---:|
+| seq1024/prefix256 | Raw final | BCE | final | NA | 20.3915 | 224 | 1.000 |
+| seq1024/prefix256 | OPAL final | BCE | final | NA | 20.7827 | 247 | 1.000 |
+| seq1536/prefix1024 | Raw final | BCE | final | NA | 18.7511 | 177 | 1.000 |
+| seq1536/prefix1024 | OPAL final | BCE | final | NA | 19.0376 | 180 | 1.000 |
+| seq1536/prefix1024 | Raw best-on-val | BCE | 3 | 18.8423 | 17.7837 | 13 | 1.000 |
+| seq1536/prefix1024 | OPAL best-on-val | BCE | 1 | 18.7030 | 17.5360 | 1 | 1.000 |
+| seq1536/prefix1024 | Raw best-on-val | Exact-K CE | 3 | 18.8939 | 17.8252 | 11 | 1.000 |
+| seq1536/prefix1024 | OPAL best-on-val | Exact-K CE | 2 | 18.7138 | 17.5403 | 2 | 1.000 |
 
 Readout:
 
 - Prefix1024 improves Raw final PPL from `20.3915` to `18.7511`.
 - Prefix1024 improves OPAL final PPL from `20.7827` to `19.0376`.
 - Final Raw still beats final OPAL by `0.2865` PPL under prefix1024.
+- Validation-selected OPAL BCE beats validation-selected Raw BCE by `0.2477` PPL: `17.5360` vs `17.7837`.
+- Validation-selected OPAL Exact-K CE beats validation-selected Raw Exact-K CE by `0.2849` PPL: `17.5403` vs `17.8252`.
 
-The first prefix1024 valckpt attempt failed because `seq_len=1536` yielded only `1625` clean label rows, while the valckpt scripts checked against `WIKITEXT_LABEL_SAMPLES=2000`. The fix is to rerun only Raw/OPAL BCE and Exact-K CE valckpt with `WIKITEXT_LABEL_SAMPLES=1625`; do not regenerate label/final/related artifacts.
+Updated prefix1024 conclusion: this is the strongest current Qwen3 rescue signal, but it is only seed42 and the selected OPAL checkpoints are low-diversity (`unique_masks=1` for BCE, `2` for Exact-K CE). Do not phrase it as a three-seed win yet.

@@ -275,3 +275,24 @@ Readout:
 Updated Qwen3 conclusion:
 
 > On clean Qwen3-8B WikiText-2 with 25% layer skipping (K=9), dynamic routers beat fixed and candidate-library baselines, but validation-selected Raw BCE remains the best skip method among the BCE/Exact-K CE loss ablation. OPAL Exact-K CE gives a small OPAL-side improvement but remains low-diversity and does not establish an OPAL-over-Raw win.
+
+## Prefix1024 Rescue Attempt
+
+Detailed prefix1024 note: `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`.
+
+This is not a beam2 teacher run. It changes the context setting from `seq1024/prefix256` to `seq1536/prefix1024`, so the router sees a longer prompt and PPL is scored on the last `512` suffix tokens.
+
+| setting | method | loss | test NLL | test PPL | unique_masks | exact-K |
+|---|---|---|---:|---:|---:|---:|
+| seq1024/prefix256 | Raw final | BCE | 3.0151 | 20.3915 | 224 | 1.000 |
+| seq1024/prefix256 | OPAL final | BCE | 3.0341 | 20.7827 | 247 | 1.000 |
+| seq1536/prefix1024 | Raw final | BCE | 2.9313 | 18.7511 | 177 | 1.000 |
+| seq1536/prefix1024 | OPAL final | BCE | 2.9464 | 19.0376 | 180 | 1.000 |
+
+Readout:
+
+- Prefix1024 improves Raw final PPL from `20.3915` to `18.7511`.
+- Prefix1024 improves OPAL final PPL from `20.7827` to `19.0376`.
+- Final Raw still beats final OPAL by `0.2865` PPL under prefix1024.
+
+The first prefix1024 valckpt attempt failed because `seq_len=1536` yielded only `1625` clean label rows, while the valckpt scripts checked against `WIKITEXT_LABEL_SAMPLES=2000`. The fix is to rerun only Raw/OPAL BCE and Exact-K CE valckpt with `WIKITEXT_LABEL_SAMPLES=1625`; do not regenerate label/final/related artifacts.

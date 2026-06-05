@@ -520,6 +520,19 @@ Exact-K CE gives OPAL a small improvement over OPAL BCE best (`19.0405` vs `19.0
 
 Updated Qwen3 conclusion: cite Qwen3 as valid but diagnostically mixed. Dynamic BCE routers beat static/candidate baselines, while the best validation-selected Raw BCE router remains ahead of OPAL under both BCE and Exact-K CE variants.
 
+Qwen3 prefix1024 rescue status:
+
+Detailed note: `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`.
+
+| setting | method | test PPL | unique_masks | status |
+|---|---|---:|---:|---|
+| seq1024/prefix256 | Raw final BCE | 20.3915 | 224 | baseline |
+| seq1024/prefix256 | OPAL final BCE | 20.7827 | 247 | baseline |
+| seq1536/prefix1024 | Raw final BCE | 18.7511 | 177 | completed |
+| seq1536/prefix1024 | OPAL final BCE | 19.0376 | 180 | completed |
+
+Prefix1024 improves both final Raw and final OPAL substantially, but final Raw still beats final OPAL by `0.2865` PPL. The prefix1024 best-on-val rows are not available yet because `seq_len=1536` produced only `1625` clean label rows while the first valckpt attempt checked for `2000`. Rerun only the four valckpt jobs with `WIKITEXT_LABEL_SAMPLES=1625`.
+
 ## Commands
 
 Run related baselines:

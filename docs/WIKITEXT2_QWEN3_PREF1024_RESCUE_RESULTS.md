@@ -98,6 +98,9 @@ Detailed three-seed note: `docs/WIKITEXT2_QWEN3_PREF1024_3SEED_RESULTS.md`.
 | OPAL BCE best | 3 | 17.5974 | 0.0870 | 4.67 | `[17.5360, 17.7205, 17.5358]` |
 | Raw Exact-K CE best | 3 | 17.7481 | 0.0587 | 30.67 | `[17.8252, 17.7361, 17.6830]` |
 | OPAL Exact-K CE best | 3 | 17.6131 | 0.0630 | 10.67 | `[17.5403, 17.6940, 17.6049]` |
+| PuDDing-style | 3 | 23.0576 | 1.0998 | 3.67 | `[23.5776, 21.5282, 24.0670]` |
+| IG-style | 3 | 22.7616 | 1.1255 | 1.33 | `[23.2062, 21.2157, 23.8629]` |
+| layerwise_hidden_router | 3 | 20.0723 | 0.1662 | 170.33 | `[20.3070, 19.9446, 19.9653]` |
 
 ## Current Conclusion
 
@@ -105,6 +108,7 @@ Prefix1024 is a real three-seed rescue axis for validation-selected OPAL on Qwen
 
 - OPAL BCE best beats Raw BCE best on all three seeds, with mean PPL `17.5974` vs `17.7729`.
 - OPAL Exact-K CE best beats Raw Exact-K CE best on all three seeds, with mean PPL `17.6131` vs `17.7481`.
-- OPAL BCE best is the best mean-PPL row among the prefix1024 router rows.
+- OPAL BCE best beats PuDDing-style, IG-style, and layerwise_hidden_router by mean PPL. The strongest related-work baseline here is layerwise_hidden_router with mean PPL `20.0723`.
+- OPAL BCE best is the best mean-PPL row among the prefix1024 router rows and related-work baselines.
 
 Caveat: final checkpoints do not show the same OPAL-over-Raw win, and OPAL BCE best remains low-diversity (`unique_masks=[1, 11, 2]`). Phrase this as a validation-selected prefix1024 OPAL rescue, not as evidence that high dynamic mask diversity is the winning factor.

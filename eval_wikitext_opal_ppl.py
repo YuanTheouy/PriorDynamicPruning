@@ -1180,6 +1180,22 @@ def train_router(args):
         param.requires_grad = False
     num_layers = detect_num_layers(model)
     hidden_size = int(model.config.hidden_size)
+    label_num_layers = int(label_metadata.get("num_layers") or 0)
+    if label_num_layers and label_num_layers != int(num_layers):
+        raise ValueError(
+            "Risk label/model layer-count mismatch: "
+            f"label_file={args.risk_label_file} has num_layers={label_num_layers}, "
+            f"but model={args.teacher_model} has num_layers={int(num_layers)}. "
+            "Unset stale WIKITEXT_LABEL_RUN_ID/WIKITEXT_RUN_ID or rebuild labels for this model."
+        )
+    skip_mask_lengths = sorted({len(row.get("skip_mask", [])) for row in label_rows})
+    if skip_mask_lengths != [int(num_layers)]:
+        raise ValueError(
+            "Risk label skip_mask width mismatch: "
+            f"label_file={args.risk_label_file} has skip_mask lengths={skip_mask_lengths}, "
+            f"but model={args.teacher_model} has num_layers={int(num_layers)}. "
+            "Unset stale WIKITEXT_LABEL_RUN_ID/WIKITEXT_RUN_ID or rebuild labels for this model."
+        )
     skip_count = int(label_metadata.get("skip_count") or resolve_skip_budget(num_layers, args.skip_rate, args.skip_count)[0])
     keep_count = int(num_layers) - skip_count
     allowed_layers = label_metadata.get("allowed_layers") or allowed_layers_from_policy(
@@ -1215,7 +1231,7 @@ def train_router(args):
                     "protected_tail": int(args.protected_tail),
                     "allowed_layers": [int(idx) for idx in allowed_layers],
                     "label_rows": len(label_rows),
-                    "covered_rows": len(selected_window_ids),
+                    "covered_rows": len(dataset),
                     "seq_len": int(args.seq_len),
                     "router_prefix_tokens": int(args.router_prefix_tokens),
                     "set_loss_type": args.set_loss_type,

@@ -17,6 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import time
 from typing import Callable, Optional, Union
 
 import torch
@@ -276,6 +277,111 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def _repeat_for_beams(self, values: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if values.size(0) == batch_size:
+            return values
+        if values.size(0) > 0 and batch_size % values.size(0) == 0:
+            return values.repeat_interleave(batch_size // values.size(0), dim=0)
+        return values
+
+    def _layer_values_from_payload(self, payload, layer_idx: int, hidden_states: torch.Tensor, dtype) -> Optional[torch.Tensor]:
+        if payload is None:
+            return None
+        batch_size = hidden_states.shape[0]
+        if isinstance(payload, torch.Tensor):
+            tensor = payload.to(device=hidden_states.device)
+            if tensor.dim() == 1 and layer_idx < tensor.numel():
+                values = torch.full((batch_size,), tensor[layer_idx].item(), device=hidden_states.device, dtype=dtype)
+            elif tensor.dim() == 2 and layer_idx < tensor.size(1):
+                values = tensor[:, layer_idx].to(dtype=dtype)
+                values = self._repeat_for_beams(values, batch_size)
+            else:
+                return None
+            return values
+        if isinstance(payload, list) and payload:
+            if isinstance(payload[0], list):
+                values = [row[layer_idx] for row in payload if layer_idx < len(row)]
+                if not values:
+                    return None
+                tensor = torch.tensor(values, device=hidden_states.device, dtype=dtype)
+                return self._repeat_for_beams(tensor, batch_size)
+            if layer_idx < len(payload):
+                return torch.full((batch_size,), float(payload[layer_idx]), device=hidden_states.device, dtype=dtype)
+        return None
+
+    def _layer_actions(self, layer_idx: int, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        actions = self._layer_values_from_payload(
+            getattr(self.self_attn.config, "custom_layer_actions", None),
+            layer_idx,
+            hidden_states,
+            torch.long,
+        )
+        if actions is not None:
+            return actions.long()
+        return None
+
+    def _compensation_gates(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
+        config = getattr(self.self_attn.config, "custom_compensation_config", {}) or {}
+        gates = config.get("gates")
+        gate_values = self._layer_values_from_payload(gates, layer_idx, hidden_states, hidden_states.dtype)
+        if gate_values is None:
+            gate_values = torch.full(
+                (hidden_states.shape[0],),
+                float(config.get("static_gate", 1.0)),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        return gate_values.clamp(0.0, 1.0).view(-1, 1, 1)
+
+    def _ghost_compensate(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        config = getattr(self.self_attn.config, "custom_compensation_config", {}) or {}
+        mode = str(config.get("mode", "none"))
+        rank = int(config.get("rank", 0))
+        if mode == "none" or rank <= 0:
+            return hidden_states
+        adapter = getattr(self.self_attn.config, "custom_compensation_adapter", None)
+        if mode == "learned_lowrank" and adapter is not None:
+            start = time.perf_counter()
+            compensated = adapter(hidden_states, layer_idx)
+            stats = getattr(self.self_attn.config, "custom_compensation_runtime_stats", None)
+            if isinstance(stats, dict):
+                stats["calls"] = int(stats.get("calls", 0)) + 1
+                stats["total_sec"] = float(stats.get("total_sec", 0.0)) + (time.perf_counter() - start)
+            return compensated
+        rank = max(0, min(rank, hidden_states.shape[-1]))
+        if rank <= 0:
+            return hidden_states
+        start = time.perf_counter()
+        normed = self.post_attention_layernorm(hidden_states)
+        basis = normed[..., :rank].mean(dim=-1, keepdim=True)
+        residual = torch.zeros_like(hidden_states)
+        residual[..., :rank] = basis.expand(*basis.shape[:-1], rank) / max(1, rank)
+        compensated = hidden_states + residual
+        stats = getattr(self.self_attn.config, "custom_compensation_runtime_stats", None)
+        if isinstance(stats, dict):
+            stats["calls"] = int(stats.get("calls", 0)) + 1
+            stats["total_sec"] = float(stats.get("total_sec", 0.0)) + (time.perf_counter() - start)
+        return compensated
+
+    def _apply_layer_actions(
+        self,
+        original_hidden_states: torch.Tensor,
+        computed_hidden_states: torch.Tensor,
+        actions: Optional[torch.Tensor],
+        layer_idx: int,
+    ) -> torch.Tensor:
+        if actions is None:
+            return computed_hidden_states
+        action_view = actions.view(-1, 1, 1)
+        compensated = self._ghost_compensate(original_hidden_states, layer_idx)
+        gates = self._compensation_gates(layer_idx, original_hidden_states)
+        compensated = original_hidden_states + gates * (compensated - original_hidden_states)
+        return torch.where(
+            action_view == 1,
+            computed_hidden_states,
+            torch.where(action_view == 2, compensated, original_hidden_states),
+        )
+
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -288,6 +394,47 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        original_hidden_states = hidden_states
+        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
+            layer_idx = self.self_attn.layer_idx
+            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
+            layer_actions = self._layer_actions(layer_idx, hidden_states)
+
+            skip_layer = False
+            if layer_actions is not None:
+                skip_layer = bool(torch.all(layer_actions != 1).item())
+            elif custom_layer_mask is not None and isinstance(custom_layer_mask, list) and layer_idx < len(custom_layer_mask):
+                if isinstance(custom_layer_mask[layer_idx], list):
+                    pass
+                elif float(custom_layer_mask[layer_idx]) == 0.0:
+                    skip_layer = True
+
+            if layer_actions is None and custom_layer_mask is not None and isinstance(custom_layer_mask, list) and len(custom_layer_mask) > 0 and isinstance(custom_layer_mask[0], list):
+                if all(float(mask_row[layer_idx]) == 0.0 for mask_row in custom_layer_mask):
+                    skip_layer = True
+
+            if skip_layer:
+                if use_cache and past_key_values is not None:
+                    batch_size = hidden_states.shape[0]
+                    seq_len = hidden_states.shape[1]
+                    num_kv_heads = self.self_attn.config.num_key_value_heads
+                    head_dim = self.self_attn.head_dim
+                    ghost_k = torch.zeros(
+                        (batch_size, num_kv_heads, seq_len, head_dim),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    ghost_v = torch.zeros(
+                        (batch_size, num_kv_heads, seq_len, head_dim),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    cos, sin = position_embeddings
+                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                    past_key_values.update(ghost_k, ghost_v, layer_idx, cache_kwargs)
+
+                return self._apply_layer_actions(original_hidden_states, hidden_states, layer_actions, layer_idx)
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -308,6 +455,27 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        if hasattr(self.self_attn, "layer_idx") and hasattr(self.self_attn, "config"):
+            layer_idx = self.self_attn.layer_idx
+            custom_layer_mask = getattr(self.self_attn.config, "custom_layer_mask", None)
+            layer_actions = self._layer_actions(layer_idx, hidden_states)
+            if layer_actions is not None:
+                return self._apply_layer_actions(original_hidden_states, hidden_states, layer_actions, layer_idx)
+            if custom_layer_mask is not None and isinstance(custom_layer_mask, list) and len(custom_layer_mask) > 0 and isinstance(custom_layer_mask[0], list):
+                batch_mask = [float(row[layer_idx]) for row in custom_layer_mask]
+                layer_mask_i = torch.tensor(batch_mask, device=hidden_states.device, dtype=hidden_states.dtype).view(-1, 1, 1)
+                if hidden_states.size(0) != layer_mask_i.size(0):
+                    num_beams = hidden_states.size(0) // layer_mask_i.size(0)
+                    layer_mask_i = layer_mask_i.repeat_interleave(num_beams, dim=0)
+                hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
+            elif custom_layer_mask is not None and isinstance(custom_layer_mask, torch.Tensor):
+                if layer_idx < custom_layer_mask.size(1):
+                    layer_mask_i = custom_layer_mask[:, layer_idx].view(-1, 1, 1).to(
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
+                    hidden_states = layer_mask_i * hidden_states + (1.0 - layer_mask_i) * original_hidden_states
         return hidden_states
 
 

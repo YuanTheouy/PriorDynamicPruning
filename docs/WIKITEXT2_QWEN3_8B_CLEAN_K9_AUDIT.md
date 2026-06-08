@@ -276,9 +276,12 @@ Updated Qwen3 conclusion:
 
 > On clean Qwen3-8B WikiText-2 with 25% layer skipping (K=9), dynamic routers beat fixed and candidate-library baselines, but validation-selected Raw BCE remains the best skip method among the BCE/Exact-K CE loss ablation. OPAL Exact-K CE gives a small OPAL-side improvement but remains low-diversity and does not establish an OPAL-over-Raw win.
 
-## Prefix1024 Rescue Attempt
+## Prefix1024 Three-Seed Rescue
 
-Detailed prefix1024 note: `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`.
+Detailed prefix1024 notes:
+
+- `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`
+- `docs/WIKITEXT2_QWEN3_PREF1024_3SEED_RESULTS.md`
 
 This is not a beam2 teacher run. It changes the context setting from `seq1024/prefix256` to `seq1536/prefix1024`, so the router sees a longer prompt and PPL is scored on the last `512` suffix tokens.
 
@@ -295,7 +298,7 @@ The prefix1024 label file contains `1625` clean train rows, not `2000`, because 
 | seq1536/prefix1024 | Raw best-on-val | Exact-K CE | 3 | 18.8939 | 17.8252 | 11 | 1.000 |
 | seq1536/prefix1024 | OPAL best-on-val | Exact-K CE | 2 | 18.7138 | 17.5403 | 2 | 1.000 |
 
-Readout:
+Seed42 readout:
 
 - Prefix1024 improves Raw final PPL from `20.3915` to `18.7511`.
 - Prefix1024 improves OPAL final PPL from `20.7827` to `19.0376`.
@@ -303,4 +306,15 @@ Readout:
 - Validation-selected OPAL BCE beats validation-selected Raw BCE by `0.2477` PPL: `17.5360` vs `17.7837`.
 - Validation-selected OPAL Exact-K CE beats validation-selected Raw Exact-K CE by `0.2849` PPL: `17.5403` vs `17.8252`.
 
-Updated prefix1024 conclusion: this is the strongest current Qwen3 rescue signal, but it is only seed42 and the selected OPAL checkpoints are low-diversity (`unique_masks=1` for BCE, `2` for Exact-K CE). Do not phrase it as a three-seed win yet.
+Three-seed prefix1024 mean/std:
+
+| method | test PPL mean | test PPL std | unique_masks mean | PPL values |
+|---|---:|---:|---:|---|
+| Raw BCE final | 19.0347 | 0.2370 | 156.33 | `[18.7511, 19.0220, 19.3311]` |
+| OPAL BCE final | 19.2485 | 0.2213 | 180.67 | `[19.0376, 19.5543, 19.1537]` |
+| Raw BCE best | 17.7729 | 0.0251 | 28.67 | `[17.7837, 17.7967, 17.7382]` |
+| OPAL BCE best | 17.5974 | 0.0870 | 4.67 | `[17.5360, 17.7205, 17.5358]` |
+| Raw Exact-K CE best | 17.7481 | 0.0587 | 30.67 | `[17.8252, 17.7361, 17.6830]` |
+| OPAL Exact-K CE best | 17.6131 | 0.0630 | 10.67 | `[17.5403, 17.6940, 17.6049]` |
+
+Updated prefix1024 conclusion: this is now a three-seed Qwen3 rescue signal for validation-selected OPAL. OPAL BCE best beats Raw BCE best on all three seeds, and OPAL Exact-K CE best beats Raw Exact-K CE best on all three seeds. Caveat: final checkpoints still favor Raw on mean PPL, and OPAL BCE best remains low-diversity (`unique_masks=[1, 11, 2]`), so the safe claim is validation-selected prefix1024 OPAL rescue rather than high-diversity dynamic-mask superiority.

@@ -522,7 +522,10 @@ Updated Qwen3 conclusion: cite Qwen3 as valid but diagnostically mixed. Dynamic 
 
 Qwen3 prefix1024 rescue status:
 
-Detailed note: `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`.
+Detailed notes:
+
+- `docs/WIKITEXT2_QWEN3_PREF1024_RESCUE_RESULTS.md`
+- `docs/WIKITEXT2_QWEN3_PREF1024_3SEED_RESULTS.md`
 
 This is not a beam2 teacher run. It changes the context setting from `seq1024/prefix256` to `seq1536/prefix1024`; because the longer window produced only `1625` clean train labels, the successful valckpt rerun used `WIKITEXT_LABEL_SAMPLES=1625`.
 
@@ -537,7 +540,18 @@ This is not a beam2 teacher run. It changes the context setting from `seq1024/pr
 | seq1536/prefix1024 | Raw best-on-val | Exact-K CE | 3 | 18.8939 | 17.8252 | 11 | completed |
 | seq1536/prefix1024 | OPAL best-on-val | Exact-K CE | 2 | 18.7138 | 17.5403 | 2 | completed |
 
-Prefix1024 improves both final Raw and final OPAL substantially. Final Raw still beats final OPAL by `0.2865` PPL, but validation-selected OPAL beats validation-selected Raw on seed42: BCE `17.5360` vs `17.7837`, and Exact-K CE `17.5403` vs `17.8252`. Caveat: OPAL best-on-val is nearly static-like (`unique_masks=1` for BCE, `2` for Exact-K CE), and this is not yet a three-seed result.
+Three-seed prefix1024 summary:
+
+| method | test PPL mean | test PPL std | unique_masks mean | PPL values |
+|---|---:|---:|---:|---|
+| Raw BCE final | 19.0347 | 0.2370 | 156.33 | `[18.7511, 19.0220, 19.3311]` |
+| OPAL BCE final | 19.2485 | 0.2213 | 180.67 | `[19.0376, 19.5543, 19.1537]` |
+| Raw BCE best | 17.7729 | 0.0251 | 28.67 | `[17.7837, 17.7967, 17.7382]` |
+| OPAL BCE best | 17.5974 | 0.0870 | 4.67 | `[17.5360, 17.7205, 17.5358]` |
+| Raw Exact-K CE best | 17.7481 | 0.0587 | 30.67 | `[17.8252, 17.7361, 17.6830]` |
+| OPAL Exact-K CE best | 17.6131 | 0.0630 | 10.67 | `[17.5403, 17.6940, 17.6049]` |
+
+Prefix1024 improves both final Raw and final OPAL substantially, but final Raw still beats final OPAL on mean PPL. The validation-selected result is stronger: OPAL BCE best beats Raw BCE best on all three seeds and by mean PPL (`17.5974` vs `17.7729`); OPAL Exact-K CE best also beats Raw Exact-K CE best on all three seeds (`17.6131` vs `17.7481`). Caveat: OPAL BCE best remains low-diversity (`unique_masks=[1, 11, 2]`), so cite this as a validation-selected prefix1024 OPAL rescue rather than a high-diversity dynamic-mask win.
 
 ## Commands
 

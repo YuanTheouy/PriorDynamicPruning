@@ -1,6 +1,6 @@
 # Qwen3-8B WikiText-2 Prefix1024 Rescue Results
 
-Last updated: 2026-06-05
+Last updated: 2026-06-08
 
 ## Setup
 
@@ -8,7 +8,7 @@ Last updated: 2026-06-05
 |---|---|
 | model | `/workspace/Models/Qwen3-8B` |
 | dataset | `/workspace/datasets/wikitext/wikitext-2-raw-v1` |
-| seed | `42` |
+| seeds | `42`, `13`, `3407` |
 | seq_len / router_prefix_tokens | `1536` / `1024` |
 | scored suffix tokens | `512` |
 | requested label_samples | `2000` |
@@ -17,7 +17,7 @@ Last updated: 2026-06-05
 | skip_rate / skip_count | `0.25` / `9` |
 | protected_head / protected_tail | `4` / `2` |
 | teacher | clean `final Delta_NLL` greedy set labels |
-| label/run id | `wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed42_skip0p25_K9` |
+| label/run id pattern | `wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed{seed}_skip0p25_K9` |
 
 This is not a beam2 teacher run. It only changes the context setting from `seq1024/prefix256` to `seq1536/prefix1024`.
 
@@ -86,12 +86,25 @@ Source JSONs:
 - Raw Exact-K CE best: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed42_skip0p25_K9_raw_exactk_valckpt/raw_best_val_epoch003_test.json`
 - OPAL Exact-K CE best: `results/wikitext2_public_lm_sanity/val_ckpt_metrics/wikitext2_Qwen3-8B_maskcfg_auto_qwen3_k9_pref1024_seq1536_pref1024_m2000_seed42_skip0p25_K9_opal_exactk_valckpt/opal_best_val_epoch002_test.json`
 
+## Three-Seed Summary
+
+Detailed three-seed note: `docs/WIKITEXT2_QWEN3_PREF1024_3SEED_RESULTS.md`.
+
+| method | seeds | test PPL mean | test PPL std | unique_masks mean | PPL values |
+|---|---:|---:|---:|---:|---|
+| Raw BCE final | 3 | 19.0347 | 0.2370 | 156.33 | `[18.7511, 19.0220, 19.3311]` |
+| OPAL BCE final | 3 | 19.2485 | 0.2213 | 180.67 | `[19.0376, 19.5543, 19.1537]` |
+| Raw BCE best | 3 | 17.7729 | 0.0251 | 28.67 | `[17.7837, 17.7967, 17.7382]` |
+| OPAL BCE best | 3 | 17.5974 | 0.0870 | 4.67 | `[17.5360, 17.7205, 17.5358]` |
+| Raw Exact-K CE best | 3 | 17.7481 | 0.0587 | 30.67 | `[17.8252, 17.7361, 17.6830]` |
+| OPAL Exact-K CE best | 3 | 17.6131 | 0.0630 | 10.67 | `[17.5403, 17.6940, 17.6049]` |
+
 ## Current Conclusion
 
-Prefix1024 is a real rescue axis. It substantially improves both Raw and OPAL final PPL, and validation checkpoint selection makes OPAL beat Raw on seed42:
+Prefix1024 is a real three-seed rescue axis for validation-selected OPAL on Qwen3-8B. It substantially improves both Raw and OPAL, and validation checkpoint selection makes OPAL beat Raw across seeds:
 
-- OPAL BCE best beats Raw BCE best by `0.2477` PPL: `17.5360` vs `17.7837`.
-- OPAL Exact-K CE best beats Raw Exact-K CE best by `0.2849` PPL: `17.5403` vs `17.8252`.
-- OPAL BCE best is the best row among this prefix1024 seed42 table, slightly ahead of OPAL Exact-K CE.
+- OPAL BCE best beats Raw BCE best on all three seeds, with mean PPL `17.5974` vs `17.7729`.
+- OPAL Exact-K CE best beats Raw Exact-K CE best on all three seeds, with mean PPL `17.6131` vs `17.7481`.
+- OPAL BCE best is the best mean-PPL row among the prefix1024 router rows.
 
-Caveat: the selected OPAL masks are still low-diversity (`unique_masks=1` for BCE, `2` for Exact-K CE). This is a promising seed42 rescue, not yet a three-seed claim.
+Caveat: final checkpoints do not show the same OPAL-over-Raw win, and OPAL BCE best remains low-diversity (`unique_masks=[1, 11, 2]`). Phrase this as a validation-selected prefix1024 OPAL rescue, not as evidence that high dynamic mask diversity is the winning factor.

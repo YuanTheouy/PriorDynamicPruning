@@ -503,6 +503,23 @@ def make_dataset_for_split(args, tokenizer, selected_window_ids=None, max_window
         dataset_path=getattr(args, "dataset_path", "wikitext"),
         dataset_name=getattr(args, "dataset_name", "wikitext-2-raw-v1"),
     )
+    if selected_window_ids is not None:
+        available_windows = max(0, (len(token_ids) - int(args.seq_len)) // int(args.seq_len) + 1)
+        requested_ids = [int(idx) for idx in selected_window_ids]
+        selected_window_ids = [idx for idx in requested_ids if 0 <= idx < available_windows]
+        dropped = len(requested_ids) - len(selected_window_ids)
+        if dropped:
+            print(
+                "Warning: dropped "
+                f"{dropped} selected WikiText window ids outside [0, {available_windows}) "
+                f"for split={args.split}. This usually means the label file was built at the "
+                "tokenization/window-count boundary; remaining rows are still train-only labels."
+            )
+        if not selected_window_ids:
+            raise ValueError(
+                f"No valid selected WikiText window ids remain for split={args.split}; "
+                f"available_windows={available_windows}, requested={len(requested_ids)}"
+            )
     dataset = WikitextWindowDataset(
         token_ids,
         seq_len=args.seq_len,

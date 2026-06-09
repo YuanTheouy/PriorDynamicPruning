@@ -597,6 +597,10 @@ Three-seed prefix1024 summary:
 
 Prefix1024 improves both final Raw and final OPAL substantially, but final Raw still beats final OPAL on mean PPL. The validation-selected result is stronger: OPAL BCE best beats Raw BCE best on all three seeds and by mean PPL (`17.5974` vs `17.7729`); OPAL Exact-K CE best also beats Raw Exact-K CE best on all three seeds (`17.6131` vs `17.7481`). The completed prefix1024 related-work rows show OPAL BCE best also beats PuDDing-style (`23.0576`), IG-style (`22.7616`), and layerwise_hidden_router (`20.0723`) by three-seed mean PPL. Caveat: OPAL BCE best remains low-diversity (`unique_masks=[1, 11, 2]`), so cite this as a validation-selected prefix1024 OPAL rescue rather than a high-diversity dynamic-mask win.
 
+## Speed Note
+
+Corrected timing-breakdown speed results are recorded in `docs/WIKITEXT2_LAYER_SKIP_SPEED_TIMING_BREAKDOWN.md`. With physical prefix-path skipping enabled, OPAL achieves wall-clock speedup over Full on both Qwen3-8B and Llama3.1-8B-Instruct. The measured router/mask overhead is about 9%-12% per window. On Qwen3-8B, OPAL best-on-val reaches about `1.16x-1.18x` speedup; on Llama3.1-8B-Instruct, it reaches about `1.15x-1.16x` in batch1/grouped settings and about `1.04x-1.05x` under naive mixed batching. This supports a quality/speed tradeoff claim, not a claim that OPAL is the fastest possible skipping implementation.
+
 ## Commands
 
 Run related baselines:

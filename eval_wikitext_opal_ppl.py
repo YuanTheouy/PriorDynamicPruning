@@ -106,11 +106,11 @@ def layerwise_hidden_state(model, input_ids, attention_mask, num_layers: int):
 
 def teacher_prefix_hidden_state(model, input_ids, attention_mask, num_layers: int, prefix_depth: int):
     prefix_depth = max(0, min(int(prefix_depth), int(num_layers)))
-    prefix_mask = torch.tensor(
-        [[1 if idx < prefix_depth else 0 for idx in range(int(num_layers))]] * input_ids.size(0),
-        dtype=torch.float32,
-        device=input_ids.device,
-    )
+    # Use a shared one-dimensional mask so patched decoder layers can return
+    # before attention/MLP for layers >= prefix_depth. A batched tensor mask is
+    # semantically correct, but it is applied after layer compute and would make
+    # OPAL's prefix H^k extraction look much slower than its intended FLOPs.
+    prefix_mask = [1 if idx < prefix_depth else 0 for idx in range(int(num_layers))]
     set_custom_policy(model, prefix_mask)
     try:
         with torch.no_grad():

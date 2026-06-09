@@ -147,6 +147,24 @@ def masks_for_batch(runtime, model, batch, router_prefix_tokens: int, num_layers
     return [[int(v) for v in mask] for mask in keep_masks]
 
 
+def attach_timing_breakdown(
+    row: Dict[str, object],
+    mask_inference_durations: Sequence[float],
+    forward_durations: Sequence[float],
+) -> Dict[str, object]:
+    mask_sec = float(sum(mask_inference_durations))
+    forward_sec = float(sum(forward_durations))
+    total_sec = float(row.get("total_sec", mask_sec + forward_sec))
+    num_windows = max(1, int(row.get("num_windows", 0)))
+    row["mask_inference_sec"] = mask_sec
+    row["model_forward_sec"] = forward_sec
+    row["mask_inference_ms_per_window"] = float(1000.0 * mask_sec / num_windows)
+    row["model_forward_ms_per_window"] = float(1000.0 * forward_sec / num_windows)
+    row["mask_inference_pct"] = float(mask_sec / total_sec) if total_sec > 0 else 0.0
+    row["model_forward_pct"] = float(forward_sec / total_sec) if total_sec > 0 else 0.0
+    return row
+
+
 def run_batch1_mode(args, model, spec, runtime, batches, num_layers: int) -> Dict[str, object]:
     sample_batches = []
     for batch in batches:
@@ -159,6 +177,8 @@ def run_batch1_mode(args, model, spec, runtime, batches, num_layers: int) -> Dic
             )
     sample_batches = sample_batches[: int(args.batch1_windows or args.num_windows)]
     durations: List[float] = []
+    mask_inference_durations: List[float] = []
+    forward_durations: List[float] = []
     masks: List[List[int]] = []
 
     def run_one(sample_batch, record: bool) -> None:
@@ -166,17 +186,22 @@ def run_batch1_mode(args, model, spec, runtime, batches, num_layers: int) -> Dic
             elapsed, _ = timed(lambda: forward_once(model, sample_batch["input_ids"], sample_batch["attention_mask"]))
             if record:
                 durations.append(elapsed)
+                mask_inference_durations.append(0.0)
+                forward_durations.append(elapsed)
                 masks.append([1] * num_layers)
             return
 
-        def work():
-            keep_masks = masks_for_batch(runtime, model, sample_batch, args.router_prefix_tokens, num_layers)
-            forward_once(model, sample_batch["input_ids"], sample_batch["attention_mask"], keep_masks[0])
-            return keep_masks[0]
-
-        elapsed, keep_mask = timed(work)
+        mask_elapsed, keep_masks = timed(
+            lambda: masks_for_batch(runtime, model, sample_batch, args.router_prefix_tokens, num_layers)
+        )
+        forward_elapsed, _ = timed(
+            lambda: forward_once(model, sample_batch["input_ids"], sample_batch["attention_mask"], keep_masks[0])
+        )
+        keep_mask = keep_masks[0]
         if record:
-            durations.append(elapsed)
+            durations.append(mask_elapsed + forward_elapsed)
+            mask_inference_durations.append(mask_elapsed)
+            forward_durations.append(forward_elapsed)
             masks.append(keep_mask)
 
     for sample_batch in sample_batches[: int(args.warmup_windows)]:
@@ -184,29 +209,37 @@ def run_batch1_mode(args, model, spec, runtime, batches, num_layers: int) -> Dic
     for sample_batch in sample_batches:
         run_one(sample_batch, record=True)
 
-    return summarize_speed_row(args, spec, "batch1_true_skip", durations, masks, num_layers)
+    row = summarize_speed_row(args, spec, "batch1_true_skip", durations, masks, num_layers)
+    return attach_timing_breakdown(row, mask_inference_durations, forward_durations)
 
 
 def run_mixed_batch_mode(args, model, spec, runtime, batches, num_layers: int) -> Dict[str, object]:
     durations: List[float] = []
+    mask_inference_durations: List[float] = []
+    forward_durations: List[float] = []
     masks: List[List[int]] = []
 
     def run_one(batch, record: bool) -> None:
         if spec["method"] == "full":
             elapsed, _ = timed(lambda: forward_once(model, batch["input_ids"], batch["attention_mask"]))
             keep_masks = [[1] * num_layers for _ in range(batch["input_ids"].size(0))]
+            mask_elapsed = 0.0
+            forward_elapsed = elapsed
         else:
-            def work():
-                keep_masks_inner = masks_for_batch(runtime, model, batch, args.router_prefix_tokens, num_layers)
-                mask_payload = keep_masks_inner
-                if all(mask == keep_masks_inner[0] for mask in keep_masks_inner):
-                    mask_payload = keep_masks_inner[0]
-                forward_once(model, batch["input_ids"], batch["attention_mask"], mask_payload)
-                return keep_masks_inner
-
-            elapsed, keep_masks = timed(work)
+            mask_elapsed, keep_masks = timed(
+                lambda: masks_for_batch(runtime, model, batch, args.router_prefix_tokens, num_layers)
+            )
+            mask_payload = keep_masks
+            if all(mask == keep_masks[0] for mask in keep_masks):
+                mask_payload = keep_masks[0]
+            forward_elapsed, _ = timed(
+                lambda: forward_once(model, batch["input_ids"], batch["attention_mask"], mask_payload)
+            )
+            elapsed = mask_elapsed + forward_elapsed
         if record:
             durations.append(elapsed)
+            mask_inference_durations.append(mask_elapsed)
+            forward_durations.append(forward_elapsed)
             masks.extend(keep_masks)
 
     for batch in batches[: int(args.warmup_batches)]:
@@ -214,7 +247,8 @@ def run_mixed_batch_mode(args, model, spec, runtime, batches, num_layers: int) -
     for batch in batches:
         run_one(batch, record=True)
 
-    return summarize_speed_row(args, spec, "mixed_batch_naive", durations, masks, num_layers)
+    row = summarize_speed_row(args, spec, "mixed_batch_naive", durations, masks, num_layers)
+    return attach_timing_breakdown(row, mask_inference_durations, forward_durations)
 
 
 def run_grouped_mode(args, model, spec, runtime, batches, num_layers: int) -> Dict[str, object]:
@@ -268,7 +302,7 @@ def run_grouped_mode(args, model, spec, runtime, batches, num_layers: int) -> Di
 
     total_durations = mask_inference_durations + forward_durations
     row = summarize_speed_row(args, spec, "grouped_by_mask", total_durations, all_masks, num_layers)
-    row["mask_inference_sec"] = float(sum(mask_inference_durations))
+    attach_timing_breakdown(row, mask_inference_durations, forward_durations)
     row["grouped_forward_sec"] = float(sum(forward_durations))
     row["group_count"] = int(len(groups))
     row["group_forward_batches"] = int(len(group_batches))
@@ -348,21 +382,24 @@ def write_markdown(path: str, payload: Dict[str, object]) -> None:
         "Important: `batch1_true_skip` and `grouped_by_mask` measure real skipped compute. "
         "`mixed_batch_naive` is diagnostic because per-sample-different masks only skip a layer when all rows in the batch skip it.",
         "",
-        "| mode | method | PPL ref | windows/s | tok/s | latency/window ms | speedup | avg kept | unique masks | exact-K |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| mode | method | PPL ref | windows/s | tok/s | latency/window ms | router ms/win | forward ms/win | router % | speedup | avg kept | unique masks | exact-K |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     order = {"batch1_true_skip": 0, "grouped_by_mask": 1, "mixed_batch_naive": 2}
     for row in sorted(rows, key=lambda r: (order.get(r["mode"], 99), r["method_slug"])):
         ppl = row.get("reference_ppl")
         speedup = row.get("speedup_vs_full_same_mode")
         lines.append(
-            "| {mode} | {method} | {ppl} | {wps:.4f} | {tps:.1f} | {lat:.2f} | {speedup} | {kept:.2f} | {uniq} | {exact:.3f} |".format(
+            "| {mode} | {method} | {ppl} | {wps:.4f} | {tps:.1f} | {lat:.2f} | {router:.2f} | {forward:.2f} | {router_pct:.1f}% | {speedup} | {kept:.2f} | {uniq} | {exact:.3f} |".format(
                 mode=row["mode"],
                 method=row["method_label"],
                 ppl="NA" if ppl is None else f"{float(ppl):.4f}",
                 wps=float(row["windows_per_sec"]),
                 tps=float(row["input_tokens_per_sec"]),
                 lat=1000.0 * float(row["latency_sec_per_window"]),
+                router=float(row.get("mask_inference_ms_per_window", 0.0)),
+                forward=float(row.get("model_forward_ms_per_window", 0.0)),
+                router_pct=100.0 * float(row.get("mask_inference_pct", 0.0)),
                 speedup="NA" if speedup is None else f"{float(speedup):.3f}x",
                 kept=float(row["average_kept_layers"]),
                 uniq=int(row["unique_masks"]),

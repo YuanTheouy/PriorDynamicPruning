@@ -52,20 +52,23 @@ def main() -> None:
                 f"- windows / batch size: `{payload['num_windows']}` / `{payload['batch_size']}`",
                 f"- skip_count / keep_count: `{payload['skip_count']}` / `{payload['keep_count']}`",
                 "",
-                "| mode | method | PPL ref | windows/s | tok/s | latency/window ms | speedup | avg kept | unique masks | exact-K |",
-                "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| mode | method | PPL ref | windows/s | tok/s | latency/window ms | router ms/win | forward ms/win | router % | speedup | avg kept | unique masks | exact-K |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         mode_order = {"batch1_true_skip": 0, "grouped_by_mask": 1, "mixed_batch_naive": 2}
         for row in sorted(rows, key=lambda x: (mode_order.get(x["mode"], 99), x["method_slug"])):
             lines.append(
-                "| {mode} | {method} | {ppl} | {wps} | {tps} | {lat} | {speedup} | {kept} | {uniq} | {exact} |".format(
+                "| {mode} | {method} | {ppl} | {wps} | {tps} | {lat} | {router} | {forward} | {router_pct}% | {speedup} | {kept} | {uniq} | {exact} |".format(
                     mode=row["mode"],
                     method=row["method_label"],
                     ppl=fmt(row.get("reference_ppl"), 4),
                     wps=fmt(row.get("windows_per_sec"), 4),
                     tps=fmt(row.get("input_tokens_per_sec"), 1),
                     lat=fmt(1000.0 * float(row.get("latency_sec_per_window", 0.0)), 2),
+                    router=fmt(row.get("mask_inference_ms_per_window"), 2),
+                    forward=fmt(row.get("model_forward_ms_per_window"), 2),
+                    router_pct=fmt(100.0 * float(row.get("mask_inference_pct", 0.0)), 1),
                     speedup="NA"
                     if row.get("speedup_vs_full_same_mode") is None
                     else f"{float(row['speedup_vs_full_same_mode']):.3f}x",

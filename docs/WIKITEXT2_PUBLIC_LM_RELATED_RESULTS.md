@@ -1,6 +1,6 @@
 # WikiText-2 Public LM Related Baseline Results
 
-Last updated: 2026-06-02
+Last updated: 2026-06-09
 
 ## Setup
 
@@ -65,6 +65,47 @@ Required judgments:
 - OPAL best-on-val unique masks: `[1, 2, 1]`; mean `1.3333`
 - PuDDing-style / IG-style both select `ends_heavy` for all 289 test windows on every seed.
 - Caveat: this is a validation-selected static-like OPAL checkpoint result, not evidence of dynamic mask-diversity superiority.
+
+## Llama3.1-8B-Instruct Prefix1024 Supplement
+
+Fixed three-seed result document:
+
+- `docs/WIKITEXT2_LLAMA31_PREF1024_3SEED_RESULTS.md`
+
+Setup:
+
+- model path: `/workspace/Models/Llama-3.1-8B-Instruct`
+- dataset: `/workspace/datasets/wikitext/wikitext-2-raw-v1`
+- seeds: `42`, `13`, `3407`
+- seq_len / router_prefix_tokens: `1536` / `1024`
+- skip_rate / skip_count: `0.25` / `8`
+- protected_head / protected_tail: `4` / `2`
+- teacher: clean `final Delta_NLL` forward-greedy set labels
+- search: greedy, not beam2
+
+Three-seed headline:
+
+| method | PPL mean ↓ | PPL std | unique_masks mean | key note |
+|---|---:|---:|---:|---|
+| OPAL Exact-K CE best-on-val | 16.0387 | 0.1418 | 8.00 | best mean-PPL skipping row; wins Raw Exact-K on every seed |
+| OPAL BCE best-on-val | 16.0948 | 0.1238 | 11.00 | wins Raw BCE by mean PPL, loses seed13 |
+| Raw Exact-K CE best-on-val | 16.1966 | 0.0627 | 26.67 | strongest Raw loss ablation |
+| Raw BCE best-on-val | 16.2121 | 0.0247 | 18.67 | validation-selected raw baseline |
+| Raw BCE final epoch | 16.5592 | 0.1242 | 79.67 | final Raw still beats final OPAL |
+| OPAL BCE final epoch | 17.1170 | 0.1977 | 108.00 | dynamic but worse than Raw final |
+| layerwise_hidden_router | 17.3994 | 0.3013 | 137.00 | stronger-access related baseline |
+| IG-style | 24.3045 | 2.4773 | 1.67 | related baseline |
+| PuDDing-style | 24.4955 | 2.4254 | 4.33 | related baseline |
+
+Required judgments:
+
+- OPAL Exact-K CE best-on-val wins Raw Exact-K CE best-on-val by three-seed mean PPL: `True`
+- OPAL Exact-K CE best-on-val wins Raw Exact-K CE best-on-val on every seed: `[(42, True), (13, True), (3407, True)]`
+- OPAL BCE best-on-val wins Raw BCE best-on-val by three-seed mean PPL: `True`
+- OPAL BCE best-on-val wins Raw BCE best-on-val per seed: `[(42, True), (13, False), (3407, True)]`
+- OPAL Exact-K CE best-on-val wins `layerwise_hidden_router`, PuDDing-style, and IG-style by mean PPL: `True`
+- Caveat: this is still a validation-selected checkpoint result; final OPAL BCE loses to final Raw BCE. The best OPAL Exact-K CE checkpoints remain low-diversity (`[19, 2, 3]` unique masks).
+- Speed has not yet been filled in here; use `docs/WIKITEXT2_LAYER_SKIP_SPEED_RESULTS.md` after running the latency/throughput benchmark.
 
 ## Original WikiText Bad Result
 

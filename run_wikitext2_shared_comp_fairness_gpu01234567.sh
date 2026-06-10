@@ -29,6 +29,8 @@ export WIKITEXT_SKIP_COUNT="${WIKITEXT_SKIP_COUNT:-7}"
 export WIKITEXT_PROTECTED_HEAD="${WIKITEXT_PROTECTED_HEAD:-4}"
 export WIKITEXT_PROTECTED_TAIL="${WIKITEXT_PROTECTED_TAIL:-2}"
 export WIKITEXT_PREFIX_DEPTH="${WIKITEXT_PREFIX_DEPTH:-4}"
+export WIKITEXT_LABEL_SEARCH="${WIKITEXT_LABEL_SEARCH:-greedy}"
+export WIKITEXT_LABEL_BEAM_WIDTH="${WIKITEXT_LABEL_BEAM_WIDTH:-1}"
 export WIKITEXT_PRECISION="${WIKITEXT_PRECISION:-bf16}"
 export WIKITEXT_EVAL_BATCH_SIZE="${WIKITEXT_EVAL_BATCH_SIZE:-1}"
 export WIKITEXT_COMP_TRAIN_BATCH_SIZE="${WIKITEXT_COMP_TRAIN_BATCH_SIZE:-1}"
@@ -50,7 +52,33 @@ mkdir -p "$SHARED_COMP_OUTPUT_ROOT" "$(dirname "$SHARED_COMP_REPORT_MD")"
 
 model_tag="$(basename "$WIKITEXT_MODEL_PATH" | tr ' ./:' '____')"
 skip_tag="$(printf "%s" "$WIKITEXT_SKIP_RATE" | tr "." "p")"
-label_run_id="wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}"
+WIKITEXT_RESOLVED_SKIP_COUNT="${WIKITEXT_RESOLVED_SKIP_COUNT:-$(
+python3 - "$WIKITEXT_MODEL_PATH" "$WIKITEXT_SKIP_RATE" "$WIKITEXT_SKIP_COUNT" <<'PY'
+import sys
+
+from transformers import AutoConfig
+
+model_path, skip_rate_raw, skip_count_raw = sys.argv[1:]
+skip_count = int(skip_count_raw)
+if skip_count > 0:
+    print(skip_count)
+    raise SystemExit(0)
+config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+num_layers = getattr(config, "num_hidden_layers", None)
+if num_layers is None and getattr(config, "text_config", None) is not None:
+    num_layers = getattr(config.text_config, "num_hidden_layers", None)
+if num_layers is None:
+    raise SystemExit(f"Could not resolve num_hidden_layers from {model_path}")
+print(max(0, min(int(num_layers), int(round(int(num_layers) * float(skip_rate_raw))))))
+PY
+)}"
+skip_budget_tag="_K${WIKITEXT_RESOLVED_SKIP_COUNT}"
+label_search_run_tag=""
+if [ "$WIKITEXT_LABEL_SEARCH" = "beam" ]; then
+  label_search_run_tag="_beam${WIKITEXT_LABEL_BEAM_WIDTH}"
+fi
+default_label_run_id="wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${WIKITEXT_SEED}_skip${skip_tag}${skip_budget_tag}${label_search_run_tag}"
+label_run_id="${WIKITEXT_RUN_ID:-${WIKITEXT_LABEL_RUN_ID:-$default_label_run_id}}"
 
 metric_dir="${SHARED_COMP_OUTPUT_ROOT}/metrics/seed${WIKITEXT_SEED}"
 adapter_dir="${SHARED_COMP_OUTPUT_ROOT}/adapter/seed${WIKITEXT_SEED}"
@@ -65,7 +93,7 @@ val_root="${REPO_DIR}/policy_ckpts/wikitext2_public_lm_val_ckpt"
 val_metric_root="${REPO_DIR}/results/wikitext2_public_lm_sanity/val_ckpt_metrics"
 
 pudding_ckpt="${related_ckpt_root}/pudding_candidate_quality/candidate_router.pt"
-ig_artifact="${related_ckpt_root}/ig_prefix_k8.pt"
+ig_artifact="${WIKITEXT_IG_ARTIFACT:-${related_ckpt_root}/ig_prefix_k${WIKITEXT_IG_CLUSTERS:-8}.pt}"
 layerwise_ckpt="${related_ckpt_root}/layerwise_hidden_bce/risk_router.pt"
 raw_best_json="${val_metric_root}/${label_run_id}_raw_valckpt/best_validation_checkpoint.json"
 opal_best_json="${val_metric_root}/${label_run_id}_valckpt/best_validation_checkpoint.json"

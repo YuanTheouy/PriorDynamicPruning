@@ -43,6 +43,7 @@ export WIKITEXT_PRECISION="${WIKITEXT_PRECISION:-bf16}"
 export WIKITEXT_EVAL_BATCH_SIZE="${WIKITEXT_EVAL_BATCH_SIZE:-1}"
 export WIKITEXT_DATASET_CACHE_DIR="${WIKITEXT_DATASET_CACHE_DIR:-}"
 export WIKITEXT_MASK_IMPL_TAG="${WIKITEXT_MASK_IMPL_TAG:-maskcfg}"
+export WIKITEXT_LABEL_RUN_ID_TEMPLATE="${WIKITEXT_LABEL_RUN_ID_TEMPLATE:-}"
 default_wikitext_comp_output_root="${REPO_DIR}/results/wikitext2_compensated_ppl/${COMP_TAG}"
 default_wikitext_comp_report_md="${REPO_DIR}/docs/WIKITEXT2_COMPENSATED_PPL_RESULTS.md"
 if [ "$COMP_FORCE_OUTPUT_ROOTS" = "1" ]; then
@@ -74,6 +75,7 @@ export LLMEVAL_PREFETCH_LIMIT="${LLMEVAL_PREFETCH_LIMIT:-1}"
 export LLMEVAL_COMPENSATION_MODE="${LLMEVAL_COMPENSATION_MODE:-$COMPENSATION_MODE}"
 export LLMEVAL_COMPENSATION_RANK="${LLMEVAL_COMPENSATION_RANK:-$COMPENSATION_RANK}"
 export LLMEVAL_COMPENSATION_STATIC_GATE="${LLMEVAL_COMPENSATION_STATIC_GATE:-$COMPENSATION_STATIC_GATE}"
+export LLMEVAL_LABEL_RUN_ID_TEMPLATE="${LLMEVAL_LABEL_RUN_ID_TEMPLATE:-$WIKITEXT_LABEL_RUN_ID_TEMPLATE}"
 default_llmeval_output_root="${REPO_DIR}/results/llmeval_downstream_compensated/${COMP_TAG}"
 default_llmeval_report_md="${REPO_DIR}/docs/LLMEVAL_COMPENSATED_DOWNSTREAM_RESULTS.md"
 if [ "$COMP_FORCE_OUTPUT_ROOTS" = "1" ]; then
@@ -255,10 +257,17 @@ echo "LLMEVAL_OUTPUT_ROOT=${LLMEVAL_OUTPUT_ROOT}"
 echo "LLMEVAL_REPORT_MD=${LLMEVAL_REPORT_MD}"
 echo "COMP_FORCE_OUTPUT_ROOTS=${COMP_FORCE_OUTPUT_ROOTS}"
 echo "COMP_REQUIRE_FINAL_ROUTERS=${COMP_REQUIRE_FINAL_ROUTERS}"
+echo "WIKITEXT_LABEL_RUN_ID_TEMPLATE=${WIKITEXT_LABEL_RUN_ID_TEMPLATE}"
+echo "LLMEVAL_LABEL_RUN_ID_TEMPLATE=${LLMEVAL_LABEL_RUN_ID_TEMPLATE}"
 
 for seed in $WIKITEXT_SEEDS; do
   echo "=== WikiText compensated PPL seed ${seed}: resolve existing artifacts ==="
-  label_run_id="wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${seed}_skip${skip_tag}"
+  if [ -n "$WIKITEXT_LABEL_RUN_ID_TEMPLATE" ]; then
+    label_run_id="${WIKITEXT_LABEL_RUN_ID_TEMPLATE//\{seed\}/$seed}"
+  else
+    label_run_id="wikitext2_${model_tag}_${WIKITEXT_MASK_IMPL_TAG}_seq${WIKITEXT_SEQ_LEN}_pref${WIKITEXT_ROUTER_PREFIX_TOKENS}_m${WIKITEXT_LABEL_SAMPLES}_seed${seed}_skip${skip_tag}"
+  fi
+  echo "Seed ${seed}: label_run_id=${label_run_id}"
   sanity_ckpt_root="${REPO_DIR}/policy_ckpts/wikitext2_public_lm_sanity/${label_run_id}"
   related_ckpt_root="${REPO_DIR}/policy_ckpts/wikitext2_public_lm_related/${label_run_id}"
   val_root="${REPO_DIR}/policy_ckpts/wikitext2_public_lm_val_ckpt"

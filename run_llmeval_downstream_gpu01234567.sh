@@ -38,6 +38,7 @@ export LLMEVAL_PROTECTED_TAIL="${LLMEVAL_PROTECTED_TAIL:-2}"
 export LLMEVAL_PREFIX_DEPTH="${LLMEVAL_PREFIX_DEPTH:-4}"
 export LLMEVAL_LABEL_SAMPLES="${LLMEVAL_LABEL_SAMPLES:-2000}"
 export LLMEVAL_MASK_IMPL_TAG="${LLMEVAL_MASK_IMPL_TAG:-maskcfg}"
+export LLMEVAL_LABEL_RUN_ID_TEMPLATE="${LLMEVAL_LABEL_RUN_ID_TEMPLATE:-}"
 export LLMEVAL_OUTPUT_ROOT="${LLMEVAL_OUTPUT_ROOT:-${REPO_DIR}/results/llmeval_downstream}"
 export LLMEVAL_REPORT_MD="${LLMEVAL_REPORT_MD:-${REPO_DIR}/docs/LLMEVAL_DOWNSTREAM_RESULTS.md}"
 export LLMEVAL_LIMIT="${LLMEVAL_LIMIT:-0}"
@@ -445,6 +446,7 @@ echo "LLMEVAL_COMPENSATION_MODE=${LLMEVAL_COMPENSATION_MODE}"
 echo "LLMEVAL_COMPENSATION_RANK=${LLMEVAL_COMPENSATION_RANK}"
 echo "LLMEVAL_COMPENSATION_STATIC_GATE=${LLMEVAL_COMPENSATION_STATIC_GATE}"
 echo "LLMEVAL_COMPENSATION_ADAPTER_CKPT=${LLMEVAL_COMPENSATION_ADAPTER_CKPT}"
+echo "LLMEVAL_LABEL_RUN_ID_TEMPLATE=${LLMEVAL_LABEL_RUN_ID_TEMPLATE}"
 echo "HF_ENDPOINT=${HF_ENDPOINT}"
 echo "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}"
 echo "Evaluator=lm-evaluation-harness simple_evaluate"
@@ -456,7 +458,12 @@ fi
 
 for seed in $LLMEVAL_SEEDS; do
   echo "=== Seed ${seed}: resolve existing WikiText artifacts ==="
-  label_run_id="wikitext2_${model_tag}_${LLMEVAL_MASK_IMPL_TAG}_seq${LLMEVAL_MAX_LENGTH}_pref${LLMEVAL_ROUTER_PREFIX_TOKENS}_m${LLMEVAL_LABEL_SAMPLES}_seed${seed}_skip${skip_tag}"
+  if [ -n "$LLMEVAL_LABEL_RUN_ID_TEMPLATE" ]; then
+    label_run_id="${LLMEVAL_LABEL_RUN_ID_TEMPLATE//\{seed\}/$seed}"
+  else
+    label_run_id="wikitext2_${model_tag}_${LLMEVAL_MASK_IMPL_TAG}_seq${LLMEVAL_MAX_LENGTH}_pref${LLMEVAL_ROUTER_PREFIX_TOKENS}_m${LLMEVAL_LABEL_SAMPLES}_seed${seed}_skip${skip_tag}"
+  fi
+  echo "Seed ${seed}: label_run_id=${label_run_id}"
   sanity_ckpt_root="${REPO_DIR}/policy_ckpts/wikitext2_public_lm_sanity/${label_run_id}"
   related_ckpt_root="${REPO_DIR}/policy_ckpts/wikitext2_public_lm_related/${label_run_id}"
   val_root="${REPO_DIR}/policy_ckpts/wikitext2_public_lm_val_ckpt"
